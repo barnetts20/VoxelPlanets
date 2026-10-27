@@ -134,7 +134,8 @@ void APlanetActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChanged
     if (MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereSeed)
         || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereType)
         || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereSet)
-        || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereTerrainHeight))
+        || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereTerrainHeight)
+        || MemberName == GET_MEMBER_NAME_CHECKED(APlanetActor, AtmosphereRiverWater))
     {
         if (!bInteractive)
         {
@@ -519,7 +520,7 @@ void APlanetActor::ConfigureAtmosphereSurface()
     if (!AtmosphereActor) return;
     const FVoxelLandBake* Bake = Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid() && AtmosphereTerrainHeight > 0.0f
         ? LandBake.Get() : nullptr;
-    const uint32 Key = Bake ? (HashCombine(Bake->Key, GetTypeHash(AtmosphereTerrainHeight)) | 1u) : 0u;
+    const uint32 Key = Bake ? (HashCombine(HashCombine(Bake->Key, GetTypeHash(AtmosphereTerrainHeight)), AtmosphereSurfaceWaterHash()) | 1u) : 0u;
     if (Key == LastSurfaceMapKey && (Key == 0u) == (AtmosphereActor->GetSurfaceMap() == nullptr)) return;
     LastSurfaceMapKey = Key;
     if (!Bake)
@@ -531,7 +532,10 @@ void APlanetActor::ConfigureAtmosphereSurface()
     // sin(latitude) in the planet's frame (Z the spin axis, longitude 0 on +X), row 0 the south.
     // 512 x 256 (the sim's grid at resolution 128; coarser grids average it), each texel the
     // mean of 4 x 4 points over its span: the elevation above sea level over the terrain height
-    // (the sea's floor counts as the sea's level), and the land's share (not sea-connected).
+    // (the sea's floor counts as the sea's level), and the land's share (not sea-connected), less
+    // the land's surface water: a kept lake whole, a river by its drainage (AtmosphereRiverWater).
+    // A river's channel is a cell wide and the points are a few cells apart, so a point takes the
+    // largest drainage of its cell and the four beside it.
     const double StartSeconds = FPlatformTime::Seconds();
     constexpr int32 Width = 512;
     constexpr int32 Height = 256;
@@ -539,7 +543,13 @@ void APlanetActor::ConfigureAtmosphereSurface()
     TArray<FVector2f> Cells;
     Cells.SetNumZeroed(Width * Height);
     const bool bAttr = Bake->Attr.Num() == Bake->NumCells();
+    const bool bFlow = Bake->Flow.Num() == Bake->NumCells() && AtmosphereRiverWater > 0.0f;
     const float InvHeight = 1.0f / AtmosphereTerrainHeight;
+    const int32 Side = Bake->Side();
+    // The river ramp, log2 of the drainage (m^2): RiverMinArea (km^2) to 50 times it.
+    const float RiverStart = (float)FMath::Log2(FMath::Max(TerrestrialSettings.RiverMinArea, 1.0) * 1.0e6);
+    const float RiverFull = RiverStart + (float)FMath::Log2(50.0);
+    const float RiverWater = FMath::Clamp(AtmosphereRiverWater, 0.0f, 1.0f);
     ParallelFor(Height, [&](int32 J)
         {
             for (int32 I = 0; I < Width; I++)
@@ -558,7 +568,21 @@ void APlanetActor::ConfigureAtmosphereSurface()
                         const float H = Bake->Height[Index];
                         const bool bSea = bAttr ? (Bake->Attr[Index] & FVoxelLandBake::SeaBit) != 0 : H <= 0.0f;
                         Elevation += FMath::Clamp(H * InvHeight, 0.0f, 1.0f);
-                        Land += bSea ? 0.0f : 1.0f;
+                        if (bSea) continue;
+                        float Water = 0.0f;
+                        if (bAttr && (Bake->Attr[Index] & FVoxelLandBake::LakeBit) != 0)
+                        {
+                            Water = 1.0f;
+                        }
+                        else if (bFlow)
+                        {
+                            // The bake's cells keep a pad of at least one around each face's interior.
+                            const float Flow = FMath::Max(FMath::Max((float)Bake->Flow[Index], FMath::Max((float)Bake->Flow[Index - 1], (float)Bake->Flow[Index + 1])),
+                                FMath::Max((float)Bake->Flow[Index - Side], (float)Bake->Flow[Index + Side]));
+                            const float T = FMath::Clamp((Flow - RiverStart) / (RiverFull - RiverStart), 0.0f, 1.0f);
+                            Water = RiverWater * T * T * (3.0f - 2.0f * T);
+                        }
+                        Land += 1.0f - Water;
                     }
                 }
                 Cells[J * Width + I] = FVector2f(Elevation / (Sub * Sub), Land / (Sub * Sub));
@@ -635,7 +659,18 @@ FVoxelPlanetClimate APlanetActor::ClimateAtLocal(const FVector& Dir, const FVect
 
 FVoxelLandClimatePointResult APlanetActor::LandClimatePointAt(const FVector& LocalM, const FVector& NormalLocal) const
 {
-    return VoxelLandClimate::PointAt(ClimateShown, LandClimate, ClimateLapseRate, LocalM, NormalLocal, GetActorScale3D().GetMax() * 0.01);
+    // The drainage there for the riparian wetting (the bake's cell; the material's is the land
+    // node's, interpolated).
+    float Flow = 0.0f;
+    const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Ground = TerrainBake();
+    if (Generator == EVoxelSurfaceGenerator::Terrestrial && Ground.IsValid() && Ground->Flow.Num() == Ground->NumCells() && !LocalM.IsNearlyZero())
+        Flow = (float)Ground->Flow[VoxelPlanetClimate::BakeCellOf(*Ground, LocalM.GetSafeNormal())];
+    return VoxelLandClimate::PointAt(ClimateShown, LandClimate, ClimateLapseRate, LocalM, NormalLocal, GetActorScale3D().GetMax() * 0.01, Flow);
+}
+
+uint32 APlanetActor::AtmosphereSurfaceWaterHash() const
+{
+    return HashCombine(GetTypeHash(AtmosphereRiverWater), GetTypeHash(TerrestrialSettings.RiverMinArea));
 }
 
 void APlanetActor::LogClimate()
@@ -747,7 +782,7 @@ bool APlanetActor::UpdateClimateCapture()
     uint32 Key = HashCombine(ClimateBaseKey, GetTypeHash((uint8)LandClimate.Source));
     if (bSnapshot)
         Key = HashCombine(Key, HashCombine(HashCombine(GetTypeHash(GetAtmosphereSeed()), GetTypeHash((uint8)AtmosphereType)),
-            GetTypeHash(AtmosphereTerrainHeight)));
+            HashCombine(GetTypeHash(AtmosphereTerrainHeight), AtmosphereSurfaceWaterHash())));
     if (Key == ClimateCaptureKey && ClimateCaptureState == EVoxelPlanetClimateCapture::Captured) return true;
 
     const double Now = FPlatformTime::Seconds();

@@ -8,7 +8,8 @@
 //
 // Custom node (Include File Paths: /Plugin/VoxelPlanets/Private/VoxelLandClimateMaterial.ush;
 // Output Type CMOT Float 3; Additional Outputs Climate and Cover, CMOT Float 4):
-//   return VoxelLandClimateMaterial(Parameters, ClimateTex, OriginHigh, OriginLow, AxisX, AxisY, AxisZ, NormalWS, BaseColor, ClimateParams, ClimateShape, ClimateTint, Climate, Cover);
+//   return VoxelLandClimateMaterial(Parameters, ClimateTex, OriginHigh, OriginLow, AxisX, AxisY, AxisZ, NormalWS, Fields, BaseColor, ClimateParams, ClimateShape, ClimateTint, Climate, Cover);
+// (The call without Fields still compiles: no riparian green.)
 //
 // Inputs:
 //   ClimateTex      the VoxelLandClimate texture parameter (a Texture Object);
@@ -16,6 +17,8 @@
 //                   (the same parameters; the axes' low parts aren't needed here);
 //   NormalWS        the surface's world normal: the land node's NormalWS (or any normal the graph
 //                   lights with, e.g. after its own detail normals);
+//   Fields          the land node's Fields output (x the drainage, log2 m^2): the river's wetting
+//                   greens the ground along rivers (VOXEL_LAND_CLIMATE_RIPARIAN_*);
 //   BaseColor       the graph's base colour before the climate;
 //   ClimateParams   the VoxelLandClimateParams vector parameter: x 1 on (+ 2 x the debug view,
 //                   voxel.Debug.LandClimate), y the sea's radius (m), z the lapse rate (C/km),
@@ -144,8 +147,8 @@ float3 VoxelLandClimateView(FVoxelLandClimatePoint P, FVoxelLandClimateCell Cell
 }
 
 float3 VoxelLandClimateMaterial(FMaterialPixelParameters Parameters, Texture2D ClimateTex, float3 OriginHigh, float3 OriginLow,
-    float3 AxisX, float3 AxisY, float3 AxisZ, float3 NormalWS, float3 BaseColor, float4 ClimateParams, float4 ClimateShape, float4 ClimateTint,
-    out float4 Climate, out float4 Cover)
+    float3 AxisX, float3 AxisY, float3 AxisZ, float3 NormalWS, float4 Fields, float3 BaseColor, float4 ClimateParams, float4 ClimateShape,
+    float4 ClimateTint, out float4 Climate, out float4 Cover)
 {
     Climate = float4(0.0f, 0.0f, 0.0f, 0.0f);
     Cover = float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -176,7 +179,7 @@ float3 VoxelLandClimateMaterial(FMaterialPixelParameters Parameters, Texture2D C
     Look.BreakupAmplitude = ClimateShape.y;
     Look.BreakupScale = ClimateShape.z;
     Look.SnowWidth = ClimateShape.w;
-    const FVoxelLandClimatePoint P = VoxelLandClimateAt(Cell, Look, Local, Up, NormalLocal, Radius - ClimateParams.y);
+    const FVoxelLandClimatePoint P = VoxelLandClimateAt(Cell, Look, Local, Up, NormalLocal, Radius - ClimateParams.y, Fields.x);
     Climate = float4(P.Temperature, P.Precipitation, P.Aridity, P.Summer);
     Cover = float4(P.Snow, P.Glacier, P.Desert, P.Vegetation);
     if (View != 0u) return VoxelLandClimateView(P, Cell, View);
@@ -189,4 +192,14 @@ float3 VoxelLandClimateMaterial(FMaterialPixelParameters Parameters, Texture2D C
     C = VoxelLandClimateTintOf(C, float3(0.50f, 0.66f, 0.78f), P.Glacier * ClimateTint.y, 0.5f);
     C = VoxelLandClimateTintOf(C, float3(0.80f, 0.82f, 0.86f), P.Snow * ClimateTint.x, 0.3f);
     return C;
+}
+
+// The call without the land node's Fields (materials wired before the riparian term): no river
+// wetting.
+float3 VoxelLandClimateMaterial(FMaterialPixelParameters Parameters, Texture2D ClimateTex, float3 OriginHigh, float3 OriginLow,
+    float3 AxisX, float3 AxisY, float3 AxisZ, float3 NormalWS, float3 BaseColor, float4 ClimateParams, float4 ClimateShape, float4 ClimateTint,
+    out float4 Climate, out float4 Cover)
+{
+    return VoxelLandClimateMaterial(Parameters, ClimateTex, OriginHigh, OriginLow, AxisX, AxisY, AxisZ, NormalWS, float4(0.0f, 0.0f, 0.0f, 0.0f),
+        BaseColor, ClimateParams, ClimateShape, ClimateTint, Climate, Cover);
 }

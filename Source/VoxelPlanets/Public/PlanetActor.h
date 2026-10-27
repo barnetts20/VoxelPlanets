@@ -247,6 +247,14 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Atmosphere", meta = (EditCondition = "bEnableAtmosphere", ClampMin = "0.0", UIMax = "12000.0"))
     float AtmosphereTerrainHeight = 6000.0f;
 
+    /** The land's surface water in the weather sim's moisture (its surface map's land share; the
+     *  sim's land evaporates less than water): a kept lake counts as water, and a river's cells
+     *  as this share of water, from none at the bake's RiverMinArea to all of it at 50 times that
+     *  drainage. 0: only the sea. The terrain material's riparian green along rivers doesn't
+     *  depend on it (VoxelLandClimate.ush). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Planet|Atmosphere", meta = (EditCondition = "bEnableAtmosphere", ClampMin = "0.0", ClampMax = "1.0"))
+    float AtmosphereRiverWater = 0.5f;
+
     // --- Climate (stage A11: GetClimateAt) ---
 
     /** The mean temperature at the equator and at the poles at sea level (degrees C), between
@@ -536,6 +544,9 @@ private:
      *  the ice sheets on or off). */
     bool IsLandClimateFieldStale() const;
     uint32 DuneClimateHash() const;
+    /** What the surface map's land water comes from (AtmosphereRiverWater, RiverMinArea), for the
+     *  surface map's and the climate capture's keys. */
+    uint32 AtmosphereSurfaceWaterHash() const;
     /** The land climate's point (VoxelLandClimate::PointAt) at a planet-frame point (m). */
     FVoxelLandClimatePointResult LandClimatePointAt(const FVector& LocalM, const FVector& NormalLocal) const;
     /** The A11 climate filled in, and the land climate's at LocalM with NormalLocal if it's there. */

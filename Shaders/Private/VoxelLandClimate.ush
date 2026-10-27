@@ -68,6 +68,15 @@
 #define VOXEL_LAND_CLIMATE_GREEN_DRY 2.5f
 #define VOXEL_LAND_CLIMATE_GREEN_COLD 0.0f
 #define VOXEL_LAND_CLIMATE_GREEN_WARM 10.0f
+// Riparian ground: water from upstream wets the land along rivers whatever the rain (the Nile's
+// valley through the Sahara). From the drainage at the point (the bake's, log2 of the area in m^2:
+// the land node's Fields.x), by a ramp from the default RiverMinArea's 200 km^2 to 10,000 km^2; at
+// full it takes 2^6 off the PET ratio (aridity, log2), which turns the driest desert humid. The
+// drainage falls off within about a bake cell of a channel, larger rivers' less steeply, so the
+// green band is about a cell wide and wider along large rivers.
+#define VOXEL_LAND_CLIMATE_RIPARIAN_START 27.575f
+#define VOXEL_LAND_CLIMATE_RIPARIAN_FULL 33.219f
+#define VOXEL_LAND_CLIMATE_RIPARIAN_WETTING 6.0f
 // T5e, the ice shelf's heights (m about the sea): it shows from a little under the waterline (the
 // map's share blends over a cell at the zone's edge: the sea floor stays bare) to well above its
 // top (ground higher than that is the mountains through it: their own climate).
@@ -113,6 +122,7 @@ struct FVoxelLandClimatePoint
     float Desert;         // 0..1: bare dry ground
     float Vegetation;     // 0..1: plant cover
     float Breakup;        // C: the breakup noise's offset
+    float Riparian;       // 0..1: the river's wetting (VOXEL_LAND_CLIMATE_RIPARIAN_*), already in Aridity
 };
 
 /** A smooth ramp, 0 at E0 to 1 at E1 (either order). */
@@ -248,10 +258,10 @@ VOXEL_FUNC FVoxelLandClimateShelf VoxelLandClimateShelfOf(FVoxelLandClimateCell 
 }
 
 /** The climate at a point: its cell, the look, its planet-frame position (m; for the breakup),
- *  its up (the unit radial direction) and surface normal (planet frame, unit), and its height
- *  above sea level (m). */
+ *  its up (the unit radial direction) and surface normal (planet frame, unit), its height above
+ *  sea level (m), and the drainage there (log2 of the area, m^2; 0 none): the riparian wetting. */
 VOXEL_FUNC FVoxelLandClimatePoint VoxelLandClimateAt(FVoxelLandClimateCell Cell, FVoxelLandClimateLook Look, float3 PositionM, float3 Up,
-    float3 Normal, float ElevationM)
+    float3 Normal, float ElevationM, float Flow)
 {
     FVoxelLandClimatePoint Out;
 
@@ -278,8 +288,9 @@ VOXEL_FUNC FVoxelLandClimatePoint VoxelLandClimateAt(FVoxelLandClimateCell Cell,
     Out.Now = Out.Temperature + Swing * cos(3.14159265f * saturate(Look.Season)) * SeasonSign;
     Out.Precipitation = max(Cell.Precipitation, 0.0f);
 
-    // Holdridge's PET ratio.
-    Out.Aridity = VoxelLandClimateAridity(Out.Temperature, Swing, Out.Precipitation);
+    // Holdridge's PET ratio, less the river's wetting.
+    Out.Riparian = VoxelLandClimateRamp(VOXEL_LAND_CLIMATE_RIPARIAN_START, VOXEL_LAND_CLIMATE_RIPARIAN_FULL, Flow);
+    Out.Aridity = VoxelLandClimateAridity(Out.Temperature, Swing, Out.Precipitation) - VOXEL_LAND_CLIMATE_RIPARIAN_WETTING * Out.Riparian;
 
     // Snow and ice by Ohmura's line, over SnowWidth either side; the season's snow needs some
     // precipitation (a cold desert's winter stays bare).

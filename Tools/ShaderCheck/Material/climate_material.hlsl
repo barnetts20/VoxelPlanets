@@ -25,6 +25,9 @@ float4 main(float4 Pos : SV_Position, float3 TW : TEXCOORD0, float3 N : TEXCOORD
     float H; float3 NW; float3 NT; float4 F; float4 T; float M;
     const float3 C = VoxelLandMaterialCached(P, HeightT, FieldT, ConstT, NoiseT, CH, CS, CF, CSt, OHigh, OLow, AX, AY, AZ, AXL, AYL, AZL, Prm, H, NW, NT, F, T, M);
     float4 Climate; float4 Cover;
-    const float3 B = VoxelLandClimateMaterial(P, ClimateT, OHigh, OLow, AX, AY, AZ, NW, lerp(Base, C, M), CPrm, CShape, CTint, Climate, Cover);
-    return float4(B + Cover.xyz, Climate.x + Climate.w + Cover.w + H);
+    const float3 B = VoxelLandClimateMaterial(P, ClimateT, OHigh, OLow, AX, AY, AZ, NW, F, lerp(Base, C, M), CPrm, CShape, CTint, Climate, Cover);
+    // The call without Fields (materials wired before the riparian term).
+    float4 Climate0; float4 Cover0;
+    const float3 B0 = VoxelLandClimateMaterial(P, ClimateT, OHigh, OLow, AX, AY, AZ, NW, Base, CPrm, CShape, CTint, Climate0, Cover0);
+    return float4(B + B0 + Cover.xyz + Cover0.xyz, Climate.x + Climate.w + Cover.w + H + Climate0.z);
 }

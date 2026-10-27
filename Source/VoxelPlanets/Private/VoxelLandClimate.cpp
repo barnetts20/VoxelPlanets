@@ -284,7 +284,7 @@ float VoxelLandClimate::ErgThreshold(float Frequency, float Coverage)
 }
 
 FVoxelLandClimatePointResult VoxelLandClimate::PointAt(const FVoxelLandClimateMap& Map, const FVoxelLandClimateSettings& Settings, float LapseRate,
-    const FVector& LocalM, const FVector& NormalLocal, double SeaRadiusM)
+    const FVector& LocalM, const FVector& NormalLocal, double SeaRadiusM, float Flow)
 {
     using namespace VoxelShader;
     FVoxelLandClimatePointResult Out;
@@ -306,7 +306,7 @@ FVoxelLandClimatePointResult VoxelLandClimate::PointAt(const FVoxelLandClimateMa
     Look.SnowWidth = Settings.SnowWidth;
     const FVector Normal = NormalLocal.IsNearlyZero() ? Up : NormalLocal.GetSafeNormal();
     const FVoxelLandClimatePoint P = VoxelLandClimateAt(Cell, Look, float3((float)LocalM.X, (float)LocalM.Y, (float)LocalM.Z),
-        float3((float)Up.X, (float)Up.Y, (float)Up.Z), float3((float)Normal.X, (float)Normal.Y, (float)Normal.Z), (float)(Radius - SeaRadiusM));
+        float3((float)Up.X, (float)Up.Y, (float)Up.Z), float3((float)Normal.X, (float)Normal.Y, (float)Normal.Z), (float)(Radius - SeaRadiusM), Flow);
     Out.Temperature = P.Temperature;
     Out.Summer = P.Summer;
     Out.Now = P.Now;

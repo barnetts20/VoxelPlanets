@@ -60,7 +60,7 @@ static float SnowLine(const FVoxelLandClimateCell& C, const float3& Up, double R
     for (float H = 0.0f; H <= 9000.0f; H += 10.0f)
     {
         const float3 P = Up * (float)(RadiusM + H);
-        if (VoxelLandClimateAt(C, L, P, Up, Up, H).Glacier >= 0.5f) return H;
+        if (VoxelLandClimateAt(C, L, P, Up, Up, H, 0.0f).Glacier >= 0.5f) return H;
     }
     return 9999.0f;
 }
@@ -95,13 +95,13 @@ int main()
         {
             const float3 Up = Dir(Lat, 30.0);
             const FVoxelLandClimateCell C = Cell(27.0f - 52.0f * (float)std::pow(std::fabs(std::sin(Lat * 3.14159265 / 180.0)), 4.0), 900.0f, 6.0f);
-            FVoxelLandClimatePoint Prev = VoxelLandClimateAt(C, L, Up * (float)R, Up, Up, 0.0f);
+            FVoxelLandClimatePoint Prev = VoxelLandClimateAt(C, L, Up * (float)R, Up, Up, 0.0f, 0.0f);
             for (float H = 1.0f; H <= 8000.0f; H += 1.0f)
             {
                 // Along the ground too (a metre a step: the breakup's octaves are 60 and 18.6 m).
                 const float3 Side = normalize(cross(Up, float3(0.0f, 0.0f, 1.0f)) + float3(1e-3f, 0.0f, 0.0f));
                 const float3 P = Up * (float)(R + H) + Side * H;
-                const FVoxelLandClimatePoint Q = VoxelLandClimateAt(C, L, P, Up, Up, H);
+                const FVoxelLandClimatePoint Q = VoxelLandClimateAt(C, L, P, Up, Up, H, 0.0f);
                 MaxStep = std::max(MaxStep, std::fabs(Q.Snow - Prev.Snow));
                 MaxStep = std::max(MaxStep, std::fabs(Q.Glacier - Prev.Glacier));
                 MaxStep = std::max(MaxStep, std::fabs(Q.Desert - Prev.Desert));
@@ -121,7 +121,7 @@ int main()
         auto At = [&](float Deg)
         {
             const float A = Deg * 3.14159265f / 180.0f;
-            return VoxelLandClimateAt(C, L, Up * 1.0e6f, Up, Up * std::cos(A) + East * std::sin(A), 0.0f);
+            return VoxelLandClimateAt(C, L, Up * 1.0e6f, Up, Up * std::cos(A) + East * std::sin(A), 0.0f, 0.0f);
         };
         CHECK(At(30.0f).Snow > 0.99f && At(56.0f).Snow < 0.01f, "snow slope: %f %f", At(30.0f).Snow, At(56.0f).Snow);
         CHECK(At(45.0f).Glacier > 0.99f && At(66.0f).Glacier < 0.01f, "ice slope: %f %f", At(45.0f).Glacier, At(66.0f).Glacier);
@@ -136,8 +136,8 @@ int main()
             const float3 Up = Dir(45.0 * Hemisphere, 0.0);
             const float3 North = normalize(float3(0.0f, 0.0f, 1.0f) - Up * Up.z);
             const float A = 30.0f * 3.14159265f / 180.0f;
-            const float TNorth = VoxelLandClimateAt(C, L, Up * 1.0e6f, Up, Up * std::cos(A) + North * std::sin(A), 0.0f).Temperature;
-            const float TSouth = VoxelLandClimateAt(C, L, Up * 1.0e6f, Up, Up * std::cos(A) - North * std::sin(A), 0.0f).Temperature;
+            const float TNorth = VoxelLandClimateAt(C, L, Up * 1.0e6f, Up, Up * std::cos(A) + North * std::sin(A), 0.0f, 0.0f).Temperature;
+            const float TSouth = VoxelLandClimateAt(C, L, Up * 1.0e6f, Up, Up * std::cos(A) - North * std::sin(A), 0.0f, 0.0f).Temperature;
             const float Equatorward = Hemisphere > 0 ? TSouth - TNorth : TNorth - TSouth;
             CHECK(std::fabs(Equatorward - 2.0f) < 0.01f, "facing (hemisphere %d): %f", Hemisphere, Equatorward);
         }
@@ -279,7 +279,7 @@ int main()
                 double DX, DY, DZ;
                 VoxelLandClimateGrid::CellDirection(I, J, W, H, DX, DY, DZ);
                 const float3 Up((float)DX, (float)DY, (float)DZ);
-                const FVoxelLandClimatePoint Q = VoxelLandClimateAt(X, DefaultLook(), Up * (float)R, Up, Up, 0.0f);
+                const FVoxelLandClimatePoint Q = VoxelLandClimateAt(X, DefaultLook(), Up * (float)R, Up, Up, 0.0f, 0.0f);
                 Sum += X.SeaTemperature; N += 1.0; P.push_back(X.Precipitation);
                 Desert += Q.Desert > 0.5f ? 1.0 : 0.0; Plants += Q.Vegetation;
                 // The snow line's cells: the coast-most and the most inland near the band's centre.
@@ -381,7 +381,7 @@ int main()
                     {
                         const FVoxelLandClimateCell C = Cell(T, P, A);
                         const float3 Up = Dir(45.0, 10.0);
-                        const FVoxelLandClimatePoint Pt = VoxelLandClimateAt(C, L, Up * 1.0e6f, Up, Up, Hm);
+                        const FVoxelLandClimatePoint Pt = VoxelLandClimateAt(C, L, Up * 1.0e6f, Up, Up, Hm, 0.0f);
                         const float M = VoxelLandClimateGlacierMargin(C, L.LapseRate, Hm, 0.0f);
                         const float W = std::max(L.SnowWidth, 0.05f);
                         Worst = std::max(Worst, (double)std::fabs(Pt.Glacier - VoxelLandClimateRamp(-W, W, M)));
@@ -569,7 +569,7 @@ int main()
             // Its slope against a difference.
             const float D = (VoxelLandClimateShelfOf(Zone, 200.5f).Share - VoxelLandClimateShelfOf(Zone, 199.5f).Share);
             const float S = VoxelLandClimateShelfOf(Zone, 200.0f).Slope;
-            const FVoxelLandClimatePoint P = VoxelLandClimateAt(Zone, DefaultLook(), Dir(80.0, 0.0) * 1.0e6f, Dir(80.0, 0.0), Dir(80.0, 0.0), 60.0f);
+            const FVoxelLandClimatePoint P = VoxelLandClimateAt(Zone, DefaultLook(), Dir(80.0, 0.0) * 1.0e6f, Dir(80.0, 0.0), Dir(80.0, 0.0), 60.0f, 0.0f);
             std::printf("shelf share: on it %.2f, sea floor %.2f, at 600 m %.2f, outside the zone %.2f; slope %.5f (difference %.5f); the material's snow %.2f\n",
                 OnShelf, Floor, High, Outside, S, D, P.Snow);
             CHECK(OnShelf == 1.0f && Floor == 0.0f && High == 0.0f && Outside == 0.0f, "the shelf's share by height and zone");
@@ -628,6 +628,31 @@ int main()
                 std::printf("look: shelf_cap.ppm (the north polar cap to 60 degrees: sea blue, shelf white, land green-brown)\n");
             }
         }
+    }
+
+    // The river's wetting (riparian ground): a hot desert's cell, dry without a river, humid and
+    // green along a large one, unchanged by drainage below RiverMinArea's default.
+    {
+        const FVoxelLandClimateCell Dry = Cell(25.0f, 50.0f, 8.0f);
+        const FVoxelLandClimateLook L = DefaultLook();
+        const float3 Up = float3(1.0f, 0.0f, 0.0f);
+        const auto At = [&](float Flow) { return VoxelLandClimateAt(Dry, L, Up * 6.0e6f, Up, Up, 200.0f, Flow); };
+        const float Log2Km2 = 19.9316f;   // log2 of 1e6 (m^2 a km^2)
+        const FVoxelLandClimatePoint None = At(0.0f);
+        const FVoxelLandClimatePoint Hill = At(Log2Km2 + 6.64f);      // 100 km^2: a hillslope's own
+        const FVoxelLandClimatePoint Stream = At(Log2Km2 + 9.97f);    // 1,000 km^2
+        const FVoxelLandClimatePoint River = At(Log2Km2 + 13.29f);    // 10,000 km^2
+        const FVoxelLandClimatePoint Large = At(Log2Km2 + 20.0f);     // a continent's river
+        std::printf("riparian: aridity %.2f none, %.2f at 100 km^2, %.2f at 1,000, %.2f at 10,000, %.2f beyond; plants %.2f / %.2f / %.2f, desert %.2f / %.2f\n",
+            None.Aridity, Hill.Aridity, Stream.Aridity, River.Aridity, Large.Aridity, None.Vegetation, Stream.Vegetation, River.Vegetation,
+            None.Desert, River.Desert);
+        CHECK(None.Desert > 0.99f && None.Vegetation < 0.01f, "the desert's cell is desert without a river");
+        CHECK(Hill.Aridity == None.Aridity && Hill.Riparian == 0.0f, "no wetting below RiverMinArea's default");
+        CHECK(Stream.Riparian > 0.0f && Stream.Riparian < 1.0f && Stream.Aridity < None.Aridity, "a small river wets a little");
+        CHECK(River.Riparian == 1.0f && std::fabs(River.Aridity - (None.Aridity - 6.0f)) < 1e-4f, "a large river takes 2^6 off the PET ratio");
+        CHECK(River.Desert == 0.0f && River.Vegetation > 0.6f, "green along a large river through the desert");
+        CHECK(Large.Aridity == River.Aridity, "the wetting is capped");
+        CHECK(River.Temperature == None.Temperature && River.Snow == None.Snow, "the wetting changes nothing else");
     }
 
     std::printf("\n%s (%d failures)\n", Failures == 0 ? "ALL OK" : "FAILED", Failures);

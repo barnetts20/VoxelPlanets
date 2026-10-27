@@ -233,7 +233,8 @@ namespace VoxelLandClimate
         const FVoxelLandClimateField& Field, const FVoxelTerrestrialSettings& Settings);
 
     /** The climate at a planet-frame point (m from the centre) with a surface normal (planet frame,
-     *  unit): the material's own computation (VoxelLandClimateAt), breakup included. */
+     *  unit): the material's own computation (VoxelLandClimateAt), breakup included. Flow: the
+     *  drainage there (log2 of the area, m^2; 0 none), for the riparian wetting. */
     VOXELPLANETS_API FVoxelLandClimatePointResult PointAt(const FVoxelLandClimateMap& Map, const FVoxelLandClimateSettings& Settings, float LapseRate,
-        const FVector& LocalM, const FVector& NormalLocal, double SeaRadiusM);
+        const FVector& LocalM, const FVector& NormalLocal, double SeaRadiusM, float Flow = 0.0f);
 }
