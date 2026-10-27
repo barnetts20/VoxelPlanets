@@ -1,0 +1,135 @@
+Ocean harnesses (stages O1-O4, O6a, O6b, O7, O8, O9a-O9c). Plain C++20; no engine. Each file's head comment says what it checks.
+
+  ocean_tiles_harness.cpp   the selection and tile geometry of VoxelOceanTiles.h, compiled unchanged:
+                            balance, morph chains, seams and cracks under test waves, rays; O9c: the same
+                            with the split bias near shores on a synthetic coast by each camera (args:
+                            cameras per factor, morph start fraction, bias cameras)
+      g++ -O2 -std=c++20 -DVOT_HEADER='"<VoxelPlanets>/Source/VoxelPlanets/Public/VoxelOceanTiles.h"' -I. ocean_tiles_harness.cpp -o ocean_tiles_harness
+      (several minutes; expected_tiles_o4.txt is the O4 run's output)
+  ocean_pages_stats.cpp     pages, slots and triangles per frame (same -DVOT_HEADER and -I.)
+  waves_check.cpp           O4: the wave hook's maths (normal, Jacobian, velocity), the CPU query's
+                            convergence, the shader's float height against the query, the underwater exit
+  underwater_check.cpp      O3b: VoxelUnderwater.ush's float maths against double references
+  ray_check.cpp             O3b: the underwater pass's ray from the depth buffer
+  normal_check.cpp          O2b: VoxelOceanPixel's normal against finite differences
+      g++ -O2 -std=c++20 <file>.cpp -o <name>
+
+  spectrum_check.cpp        O6a: the FFT cascades' shared code (VoxelOceanSpectrum.ush) and CPU side
+                            (VoxelOceanSpectrum.h): spreading, Hs per wind, band split, exact dispersion,
+                            the GPU passes emulated in float against a direct DFT, variance, time loop,
+                            the 128^2 query cascades, fp16, folding, detiling, determinism, CPU cost
+  spectrum_view.cpp         O6a: pictures of the sea from the emulated cascades (perspective from an
+                            altitude, top-down relief), with or without detiling
+  ocean_fft_emulation.h     VoxelOceanFFT.usf's passes in float, shared by the two above (and eq_check)
+  godot_match.cpp           W4a: our foam against GodotOceanWaves' at its demo's defaults: its foamy cascades emulated as
+                            it runs them (1024^2, whole spectra, chop 1, at its height: sqrt(8) the spectrum's), their
+                            coverage, and the whitecap thresholds giving ours the same at the spectrum's height and at
+                            Godot's (the preset's defaults). Informational; about 3 minutes.
+      g++ -O2 -std=c++20 -ffp-contract=off $(<VoxelPlanets>/Tools/include_flags.sh)
+          -I. godot_match.cpp -o godot_match
+  spray_check.cpp           W3x: the spray's maths (VoxelOceanSpray.ush, GodotOceanWaves' sea spray): the
+                            birth's thresholds and sizes, the rise, the splash's shape, the fade, the
+                            dissolve, a storm's budget against the ring
+      g++ -O2 -std=c++20 $(<VoxelPlanets>/Tools/include_flags.sh) spray_check.cpp -o spray_check
+  cubic_check.cpp           W3u: the cubic B-spline lookups' taps (VoxelOceanCubic.ush): four bilinear taps
+                            against the 16-texel sum (wrapped too), the weights, a ramp reproduced, C2
+                            across texel edges, the share toward the cubic by magnification
+      g++ -O2 -std=c++20 $(<VoxelPlanets>/Tools/include_flags.sh) cubic_check.cpp -o cubic_check
+  eq_check.cpp              W3k: the wave equalizer: its gain against a double reference, the GPU slot
+                            table's unpacking bit for bit, the statistics' scaling, the emulated field
+      g++ -O2 -std=c++20 -ffp-contract=off $(<VoxelPlanets>/Tools/include_flags.sh)
+          -I. spectrum_check.cpp -o spectrum_check     (same for spectrum_view)
+      ./spectrum_view <wind> persp|top <altitude or extent m> <detile cell m, 0 off> <detiled bands> out.ppm
+
+  chart_check.cpp           O6b: the waves' charts (VoxelOceanCharts.ush/.h): the table, coverage, continuity
+                            across face edges and corners, the GPU's lookup precision against the CPU's,
+                            the wind turn
+      g++ -O2 -std=c++20 -ffp-contract=off $(<VoxelPlanets>/Tools/include_flags.sh)
+          chart_check.cpp -o chart_check
+  hook_check.cpp            O6b, O7: the wave hook's FFT path (ported from VoxelOceanWaves.ush, over
+                            emulated textures and the weather's table) against the FFT model
+                            (VoxelOceanWavesFFT.cpp compiled unchanged) in the procedural weather at a
+                            stormy key: drawn against queried waves (settled and turning), continuity,
+                            the query's inversion, the underwater waterline, detiling off, storm against
+                            calm seas, no jump between keys, the reach, the model's cost
+      g++ -O2 -std=c++20 -ffp-contract=off -IUEStandIn $(<VoxelPlanets>/Tools/include_flags.sh)
+          -I. hook_check.cpp
+          <VoxelPlanets>/Source/VoxelPlanets/Private/VoxelOceanWavesFFT.cpp <VoxelPlanets>/Source/VoxelPlanets/Private/VoxelOceanWeather.cpp
+          <VoxelPlanets>/Source/VoxelPlanets/Private/VoxelOceanWeatherTable.cpp -o hook_check
+  hook_view.cpp             O6b: a top-down relief image of the hook's sea around a cube corner (seams)
+  underwater_map_check.cpp  O6b: the underwater pass's surface map (VoxelUnderwaterMap.ush/.h) against
+                            the exact search it replaces: heights by level, the waterline, continuity
+                            across levels, normals, exits; O9c: the foam map's reads and the map pass's
+                            surface point; optional wind argument (default 12 m/s)
+      (both built as hook_check, with their own .cpp)
+  weather_check.cpp         O7: the procedural weather (VoxelOceanWeather.cpp) and its table
+                            (VoxelOceanWeatherTable.cpp, read through VoxelOceanSeaState.ush): bands,
+                            storms (cyclonic, drifting), swell, smoothness, determinism, the field against
+                            the source and across face edges, the headings' steps, the key's cost
+      (built as hook_check, with weather_check.cpp)
+  weather_view.cpp          O7: a map of the planet's weather (wind speed, wind strokes, storms)
+      g++ -O2 -std=c++20 -IUEStandIn $(<VoxelPlanets>/Tools/include_flags.sh)
+          -I. weather_view.cpp <VoxelPlanets>/Source/VoxelPlanets/Private/VoxelOceanWeather.cpp -o weather_view
+      ./weather_view <weather time s> out.ppm
+  shore_check.cpp           O8: the land bake's sea-connected flood (VoxelLandSea.h) and the shore field (VoxelOceanShore.ush,
+                            VoxelOceanShoreBuild.ush through VoxelOceanShoreCore.h) on a synthetic planet with an inland
+                            basin: the flood's rule, the jump flooding against exact distances (the gradient near the
+                            coast), directions, slopes, the smoothing passes, the texels' packing, sampling across face edges and corners;
+                            O9c: the coastline (the split bias's segments) against the field's zero line; the shoaling maths (VoxelOceanShoal.ush:
+                            dispersion, the warp integral, gains, breaking, the fade, the lookup transform)
+      g++ -O2 -std=c++20 -ffp-contract=off $(<VoxelPlanets>/Tools/include_flags.sh)
+          shore_check.cpp -o shore_check
+      ./shore_check [N]   (cells per face edge, default 96)
+  shore_hook_check.cpp      O8: the shoaled hook (hook_emulation.h) against the model near a round continent's coast,
+                            a wind sea and a swell: the field's direction and distance along the coast at a fixed
+                            distance (the wobble), drawn against queried waves, the shoaling and the warp at work,
+                            the surf (drawn against queried from the beach out, the swash wetting and drying the beach),
+                            shorter waves toward the coast, no seams (the texel-space expansion near the camera), the
+                            underwater waterline against the query, the reach
+      (built as hook_check, with shore_hook_check.cpp and -pthread)
+  surf_check.cpp            O9i: the shore's waves (VoxelOceanSurf.ush) from a coastal field integrated along straight rays
+                            on uniform beaches: the composition (cutoff, ramp, the FFT's floor, cover, reach), the crests'
+                            spacing against the exact wavelength, the gradient and rate against finite differences,
+                            continuity (depth, the still level, the clock's wrap), the swash and its fade on land by the
+                            mesh, the trains' fade by the mesh, the bores' least front, the foam, the bound
+      g++ -O2 -std=c++20 -ffp-contract=off $(<VoxelPlanets>/Tools/include_flags.sh)
+          surf_check.cpp -o surf_check
+  foam_check.cpp            W3v-W3z: the open sea's foam (VoxelOceanFoam.ush: GodotOceanWaves' rule, its cap of 1 and drawing)
+                            on the emulated cascades with the runtime's layout (why on the clipmap, coverage and trails at the
+                            ramp, a coarse texel's mean source against the fine surface's (3c), the fine foam in the shortest
+                            band's own 512^2 tile) and the surf's foam
+                            (VoxelOceanSurf.ush: bores, no step at the trough, the mean unresolved, the swash's edge, off)
+      g++ -O2 -std=c++20 -ffp-contract=off $(<VoxelPlanets>/Tools/include_flags.sh)
+          -I. foam_check.cpp -o foam_check
+  coast_check.cpp           O9h: the coastal travel-time field (VoxelOceanCoastCore.h's plan, solve and packing,
+                            VoxelOceanCoast.ush's sampling) on a planet of known depths: the budget, the crests' spacing
+                            against the exact local wavenumber, the rays' direction, continuity along the coast across
+                            tiles and face edges, the texels against the solve, up the beach, the channel behind an island
+      g++ -O2 -std=c++20 -ffp-contract=off $(<VoxelPlanets>/Tools/include_flags.sh)
+          coast_check.cpp -o coast_check
+  clip_check.cpp            W1: the wave clipmap's levels (VoxelOceanClipmap.h, unchanged) and the shader's
+                            camera-relative projection in float: precision from 2 m to 20,000 km up, a descent
+                            from orbit and a flight along the sea with the static layer's strips and the waves'
+                            staggering simulated texel by texel (every sample finds its own texel), edit rectangles
+      g++ -O2 -std=c++20 -IClipStandIn $(<VoxelPlanets>/Tools/include_flags.sh) clip_check.cpp -o clip_check
+  shading_check.cpp         W3: the ocean's light model (VoxelOceanShading.ush) as C++: the sun glitter's reflectance
+                            against mirror facets drawn from its slopes, Smith's Lambda fit against erfc, the mean
+                            Fresnel fit against the facets the eye sees, the water's single scattering against a march
+      g++ -O2 -std=c++20 $(<VoxelPlanets>/Tools/include_flags.sh) shading_check.cpp -o shading_check
+  lace_check.cpp            W3f: the foam's structure (VoxelOceanFoamLace.ush) as C++: the patterns' distributions and
+                            the thresholds' tables (--fit writes Shaders/Private/VoxelOceanFoamLaceFit.ush), the structure
+                            keeping the density at every footprint, previews (PNG) near and far
+      g++ -O2 -std=c++20 $(<VoxelPlanets>/Tools/include_flags.sh) lace_check.cpp -o lace_check
+  foam_set_check.cpp        W3g: a foam texture set (.vxnt; Tools/NoiseTileTool/foam_tile.py makes one) with the
+                            plugin's thresholds (VoxelOceanFoamTable.h) and the shader's cover (VoxelOceanFoamTex.ush,
+                            ported, trilinear sampling emulated): the thresholds rise, the lace's, streaks' and
+                            whitecaps' covers keep the density at every level drawn, previews near and far (PNG)
+      g++ -O2 -std=c++20 $(<VoxelPlanets>/Tools/include_flags.sh) foam_set_check.cpp
+          -o foam_set_check
+      ./foam_set_check <set.vxnt> [preview folder] [tile m, default 12]
+  ClipStandIn/              stand-ins for the engine types VoxelOceanClipmap.h uses
+  UEStandIn/                stand-ins for the few engine types the FFT model and the weather use
+
+CoreMinimal.h is a stand-in for the UE types VoxelOceanTiles.h uses. waves_check, underwater_check,
+ray_check and normal_check reimplement the test model and the shader maths in double/float; the
+FFT model (O6) should replace them with checks built on its shared HLSL/C++ code.

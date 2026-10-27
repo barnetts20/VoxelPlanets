@@ -1,0 +1,645 @@
+// VoxelLandSolve.usf - The land bake's erosion solve and final routing on the GPU
+// (VoxelLandSolve.cpp drives it). The per-cell work is VoxelLandSolve.ush; this file declares
+// its inputs and the entry points, and adds the GPU-only parts: the compaction of a domain into
+// slots (a deterministic scan, so slots are in cell order), the per-step residual (a fixed-order
+// reduction) with the done flag every step's passes check, and the normalisation's histograms.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelDensityCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
+
+// Grid and the plate model's fields.
+uint SolveN;
+uint SolvePad;
+float SolveRadiusM;
+StructuredBuffer<float2> SolveTan;
+StructuredBuffer<float> BakeHeight;
+StructuredBuffer<float> BakeUp;
+StructuredBuffer<float> BakeCrust;
+StructuredBuffer<uint> BakeAttr;
+StructuredBuffer<uint> BakeForm;
+
+// The model.
+float SolvePlainsUplift;
+float SolveRampWidth;
+float SolveUpliftTime;
+float SolveKdt;
+float SolveDt;
+float SolveEps;
+uint SolveSeed;
+float SolveFactor;
+float SolveReliefKnee;
+float SolveReliefTop;
+float SolveMinLakeDepth;
+float SolveMinLakeArea;
+uint SolveMaxLakes;
+uint SolveErode;
+// The T1 model (Design/SurfaceLook.md; VoxelLandSolve.ush lists them).
+float SolveJitter;
+float SolveRouteNoise;
+float SolveSpreadCells;
+float SolveUpliftVariation;
+float SolveErodibilityVariation;
+float SolveVariationWavelength;
+float SolveRoughness;
+float SolveReliefScale;
+uint SolveFillDepressions;
+uint SolveModel;
+float SolvePlainsRelief;
+float SolveUndulation;
+float SolveLandformErosion;
+float SolveIncision;
+// T3g: the channel heads and the hillslopes' threshold (VoxelLandSolve.ush).
+float SolveChannelCells;
+float SolveChannelVariation;
+float SolveChannelWavelength;
+uint SolveChannelOctaves;
+float SolveHillslope;
+float SolveChannelCharacter;
+
+// Per cell.
+RWStructuredBuffer<float> SolveH;
+RWStructuredBuffer<float> SolveW;
+RWStructuredBuffer<float> SolveWater;
+RWStructuredBuffer<uint> SolveRec;
+RWStructuredBuffer<uint> SolveSlot;
+RWStructuredBuffer<uint> SolveLabel;
+
+// Per slot.
+RWStructuredBuffer<uint> SlotCell;
+RWStructuredBuffer<float> SlotU;
+RWStructuredBuffer<float> SlotK;
+RWStructuredBuffer<float> SlotAc;
+RWStructuredBuffer<float> SlotArea;
+RWStructuredBuffer<float> SlotDist;
+RWStructuredBuffer<float> SlotH0;
+RWStructuredBuffer<float> SlotA;
+RWStructuredBuffer<float> SlotAOut;
+RWStructuredBuffer<float> SlotWOut;
+RWStructuredBuffer<float> JumpX;
+RWStructuredBuffer<float> JumpXOut;
+RWStructuredBuffer<uint> JumpY;
+RWStructuredBuffer<uint> JumpYOut;
+RWStructuredBuffer<uint> JumpP;
+RWStructuredBuffer<uint> JumpPOut;
+RWStructuredBuffer<uint> SolveFlags;     // [0] something changed, [1] error bits
+RWStructuredBuffer<uint> AccHi;          // S1: the exact accumulation's high words
+RWStructuredBuffer<uint> AccHiOut;
+float SolveAccUnit;
+
+// Lakes and outputs.
+RWStructuredBuffer<uint> LakeArea;
+RWStructuredBuffer<uint> LakeDepth;
+RWStructuredBuffer<uint> LakeOutlet;
+RWStructuredBuffer<uint> LakeCount;
+RWStructuredBuffer<uint> LakeList;
+RWStructuredBuffer<float> OutHeight;
+RWStructuredBuffer<uint> OutFlow;         // halves, two cells a word
+RWStructuredBuffer<float> OutWater;
+RWStructuredBuffer<uint> OutAttr;
+RWStructuredBuffer<uint> OutForm;
+RWStructuredBuffer<uint> OutRec;
+
+// GPU-only: dispatch, compaction, the steps' state, the histograms.
+uint GroupsX;
+uint NumSlots;
+uint SolveDomain;
+uint PassMode;
+uint GateOnDone;                         // 1: a step's pass, skipped once the solve is done
+uint NumScanGroups;
+uint SolveMaxSteps;
+uint SolveMinSteps;
+float SolveTolerance;
+float HistogramMax;                      // m: the histograms' range
+RWStructuredBuffer<uint> GroupCounts;    // per group of 64 cells: in the domain, then its first slot
+RWStructuredBuffer<uint> SolveCounts;    // [0] slots in the domain
+RWStructuredBuffer<uint> SolveState;     // [0] done, [1] steps run
+RWStructuredBuffer<float> Partials;      // per group of 64 slots: sum |dh|, sum U
+RWStructuredBuffer<float> ResidualLog;   // per step
+RWStructuredBuffer<uint> Histogram;      // 2 x VOXEL_SOLVE_BINS: solved relief, target relief
+
+#include "/Plugin/VoxelPlanets/Private/VoxelLandSolve.ush"
+
+#define VOXEL_SOLVE_BINS 4096u           // VoxelLandSolveDetail::HistogramBins
+
+uint ThreadIndex(uint3 GroupId, uint GroupThread)
+{
+    return (GroupId.y * GroupsX + GroupId.x) * 64u + GroupThread;
+}
+
+uint GroupIndex(uint3 GroupId)
+{
+    return GroupId.y * GroupsX + GroupId.x;
+}
+
+bool Skipped()
+{
+    return GateOnDone != 0u && SolveState[0] != 0u;
+}
+
+// --- Compaction: CountCS, ScanCS, ScatterCS ------------------------------------------------
+
+groupshared uint GroupFlags[64];
+
+[numthreads(64, 1, 1)]
+void CountCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint Cell = ThreadIndex(GroupId, GroupThread);
+    uint Flag = 0u;
+    if (Cell < VoxelSolveNumCells())
+        Flag = VoxelSolveInDomain(Cell, SolveDomain) ? 1u : 0u;
+    GroupFlags[GroupThread] = Flag;
+    GroupMemoryBarrierWithGroupSync();
+    // The 2D grid's tail groups have no counts to write.
+    if (GroupThread != 0u || GroupIndex(GroupId) >= NumScanGroups) return;
+    uint Count = 0u;
+    for (uint k = 0u; k < 64u; k++)
+        Count += GroupFlags[k];
+    GroupCounts[GroupIndex(GroupId)] = Count;
+}
+
+groupshared uint ScanSums[1024];
+
+// One group: GroupCounts becomes each group's first slot (exclusive prefix sum), in order.
+[numthreads(1024, 1, 1)]
+void ScanCS(uint GroupThread : SV_GroupIndex)
+{
+    const uint PerThread = (NumScanGroups + 1023u) / 1024u;
+    const uint First = GroupThread * PerThread;
+    const uint Last = min(First + PerThread, NumScanGroups);
+    uint Sum = 0u;
+    for (uint g = First; g < Last; g++)
+        Sum += GroupCounts[g];
+    ScanSums[GroupThread] = Sum;
+    GroupMemoryBarrierWithGroupSync();
+    if (GroupThread == 0u)
+    {
+        uint Running = 0u;
+        for (uint t = 0u; t < 1024u; t++)
+        {
+            const uint S = ScanSums[t];
+            ScanSums[t] = Running;
+            Running += S;
+        }
+        SolveCounts[0] = Running;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint Running = ScanSums[GroupThread];
+    for (uint h = First; h < Last; h++)
+    {
+        const uint Count = GroupCounts[h];
+        GroupCounts[h] = Running;
+        Running += Count;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void ScatterCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint Cell = ThreadIndex(GroupId, GroupThread);
+    bool bIn = false;
+    if (Cell < VoxelSolveNumCells())
+        bIn = VoxelSolveInDomain(Cell, SolveDomain);
+    GroupFlags[GroupThread] = bIn ? 1u : 0u;
+    GroupMemoryBarrierWithGroupSync();
+    if (Cell >= VoxelSolveNumCells()) return;
+    if (!bIn)
+    {
+        SolveSlot[Cell] = VOXEL_SOLVE_NONE;
+        return;
+    }
+    uint Rank = 0u;
+    for (uint k = 0u; k < GroupThread; k++)
+        Rank += GroupFlags[k];
+    const uint Slot = GroupCounts[GroupIndex(GroupId)] + Rank;
+    SolveSlot[Cell] = Slot;
+    SlotCell[Slot] = Cell;
+}
+
+// --- Per-cell and per-slot passes ----------------------------------------------------------
+
+[numthreads(64, 1, 1)]
+void InitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveInitPass(ThreadIndex(GroupId, GroupThread));
+}
+
+// One thread: clears the change flag (SolveFlags[0]) before a counted iteration, or (PassMode
+// 1) the solve's state and error bits too.
+[numthreads(1, 1, 1)]
+void ResetCS()
+{
+    SolveFlags[0] = 0u;
+    if (PassMode == 1u)
+    {
+        SolveFlags[1] = 0u;
+        SolveState[0] = 0u;
+        SolveState[1] = 0u;
+    }
+}
+
+// --- The fill, by tiles (S1) ----------------------------------------------------------------
+//
+// Planchon-Darboux from above (VoxelSolveFillInPlacePass's update), a tile of a face a group:
+// each pass loads its tile's levels into groupshared memory and iterates them there with the
+// neighbours outside the tile held at their levels as the pass found them, then writes them
+// back. A level travels across a whole tile in one pass instead of a cell, so a fill that
+// needed one pass per cell of its longest path needs one per tile of it. The same least surface
+// whatever the order (a fixed point reached from above), so the result is reproducible.
+// SolveFlags[0] is set when a cell changed. PassMode 1: with the descent (SolveEps), else none
+// (the lake levels).
+
+#define VOXEL_SOLVE_FILL_TILE 16u
+#define VOXEL_SOLVE_FILL_LOCAL 24u     // iterations a pass (a fixed count: no exit on a shared value around the barriers)
+#define VOXEL_SOLVE_FILL_OUTSIDE 0xffffu
+
+groupshared float FillTileW[VOXEL_SOLVE_FILL_TILE * VOXEL_SOLVE_FILL_TILE];
+
+[numthreads(16, 16, 1)]
+void FillTiledCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThreadID, uint GroupThread : SV_GroupIndex)
+{
+    const uint TilesPerFace = (SolveN + VOXEL_SOLVE_FILL_TILE - 1u) / VOXEL_SOLVE_FILL_TILE;
+    const uint Tile = GroupIndex(GroupId);
+    // A group past the last tile runs the barriers with nothing to do (no return before them).
+    const bool bTile = Tile < 6u * TilesPerFace * TilesPerFace;
+    const float Eps = PassMode == 1u ? SolveEps : 0.0f;
+    const uint Face = Tile / (TilesPerFace * TilesPerFace);
+    const uint Rest = Tile - Face * TilesPerFace * TilesPerFace;
+    const uint TJ = Rest / TilesPerFace;
+    const uint TI = Rest - TJ * TilesPerFace;
+    const int I = int(TI * VOXEL_SOLVE_FILL_TILE + GroupThreadId.x);
+    const int J = int(TJ * VOXEL_SOLVE_FILL_TILE + GroupThreadId.y);
+    const bool bCell = bTile && I < int(SolveN) && J < int(SolveN);
+    const uint Cell = bCell ? VoxelSolveEncode(Face, I, J) : 0u;
+    const bool bSlot = bCell && SolveSlot[Cell] != VOXEL_SOLVE_NONE;
+    const float W0 = bCell ? SolveW[Cell] : VOXEL_SOLVE_INF;
+    const float H = bSlot ? SolveH[Cell] : 0.0f;
+    FillTileW[GroupThread] = W0;
+    // The neighbours: in the tile (their groupshared index), or outside (their level now); and
+    // the descent from each.
+    uint Local[8];
+    float Outside[8];
+    float Descent[8];
+    const bool bRandom = VoxelSolveRandomFill(Eps);
+    const float Factor = bSlot ? VoxelSolveFillFactor(Cell, Eps) : 0.0f;
+    for (uint c = 0u; c < 8u; c++)
+    {
+        Local[c] = VOXEL_SOLVE_FILL_OUTSIDE;
+        Outside[c] = VOXEL_SOLVE_INF;
+        Descent[c] = bRandom ? VoxelSolveFillDescent(Factor, c) : Eps;
+        if (!bSlot) continue;
+        const uint N = VoxelSolveNeighbour(Cell, c);
+        if (N == VOXEL_SOLVE_NONE) continue;
+        const FVoxelSolveCell P = VoxelSolveDecode(N);
+        const int LI = P.I - int(TI * VOXEL_SOLVE_FILL_TILE);
+        const int LJ = P.J - int(TJ * VOXEL_SOLVE_FILL_TILE);
+        if (P.Face == Face && LI >= 0 && LJ >= 0 && LI < int(VOXEL_SOLVE_FILL_TILE) && LJ < int(VOXEL_SOLVE_FILL_TILE))
+            Local[c] = uint(LJ) * VOXEL_SOLVE_FILL_TILE + uint(LI);
+        else
+            Outside[c] = SolveW[N];
+    }
+    float W = W0;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint k = 0u; k < VOXEL_SOLVE_FILL_LOCAL; k++)
+    {
+        float Lowest = VOXEL_SOLVE_INF;
+        for (uint c2 = 0u; c2 < 8u; c2++)
+        {
+            // (Both sides of ?: may be evaluated: the index stays in the tile.)
+            const float WN = Local[c2] != VOXEL_SOLVE_FILL_OUTSIDE ? FillTileW[min(Local[c2], VOXEL_SOLVE_FILL_TILE * VOXEL_SOLVE_FILL_TILE - 1u)] : Outside[c2];
+            Lowest = min(Lowest, WN + Descent[c2]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        const float Candidate = max(H, Lowest);
+        if (bSlot && Candidate < W)
+        {
+            W = Candidate;
+            FillTileW[GroupThread] = W;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (bSlot && W < W0)
+    {
+        SolveW[Cell] = W;
+        InterlockedOr(SolveFlags[0], 1u);
+    }
+}
+
+[numthreads(64, 1, 1)]
+void FillJacobiCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveFillJacobiPass(ThreadIndex(GroupId, GroupThread), NumSlots, SolveEps);
+}
+
+[numthreads(64, 1, 1)]
+void FillCopyCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveFillCopyPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void UndrainedCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveUndrainedPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void ReceiversCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveReceiversPass(ThreadIndex(GroupId, GroupThread), NumSlots, PassMode == 1u);
+}
+
+[numthreads(64, 1, 1)]
+void AccumulateJacobiCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveAccumulateJacobiPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void RouteTreeInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveRouteTreeInitPass(ThreadIndex(GroupId, GroupThread), NumSlots, PassMode == 1u ? SolveEps : 0.0f);
+}
+
+[numthreads(64, 1, 1)]
+void AccJumpInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveAccJumpInitPass(ThreadIndex(GroupId, GroupThread), NumSlots, PassMode);
+}
+
+[numthreads(64, 1, 1)]
+void AccJumpCopyCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveAccJumpCopyPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void AccJumpAddCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveAccJumpAddPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void AccJumpFinishCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveAccJumpFinishPass(ThreadIndex(GroupId, GroupThread), NumSlots, PassMode);
+}
+
+[numthreads(64, 1, 1)]
+void SpreadInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveSpreadInitPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void SpreadCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveSpreadPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void TreeFillInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveTreeFillInitPass(ThreadIndex(GroupId, GroupThread), NumSlots, SolveEps);
+}
+
+[numthreads(64, 1, 1)]
+void TreeFillJumpCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveTreeFillJumpPass(ThreadIndex(GroupId, GroupThread), NumSlots, SolveEps);
+}
+
+[numthreads(64, 1, 1)]
+void TreeFillFinishCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveTreeFillFinishPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void ImplicitInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveImplicitInitPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void ImplicitJumpCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveImplicitJumpPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+groupshared float ReduceA[64];
+groupshared float ReduceB[64];
+
+// Per group, the sums of |dh| and of the uplift (a fixed-order tree), for the residual. Every
+// thread of the group calls it (it has barriers).
+void WritePartials(uint3 GroupId, uint GroupThread, bool bSkip, float Change, float Uplift)
+{
+    ReduceA[GroupThread] = Change;
+    ReduceB[GroupThread] = Uplift;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint Stride = 32u; Stride > 0u; Stride >>= 1u)
+    {
+        if (GroupThread < Stride)
+        {
+            ReduceA[GroupThread] += ReduceA[GroupThread + Stride];
+            ReduceB[GroupThread] += ReduceB[GroupThread + Stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (GroupThread == 0u && !bSkip && GroupIndex(GroupId) < (NumSlots + 63u) / 64u)
+    {
+        const uint G = GroupIndex(GroupId);
+        Partials[G * 2u] = ReduceA[0];
+        Partials[G * 2u + 1u] = ReduceB[0];
+    }
+}
+
+// The new heights, and the residual's partials (the slope cap's finish writes them again when
+// the channel heads are on).
+[numthreads(64, 1, 1)]
+void ImplicitFinishCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    // No early return: the barriers below must be reached by every thread.
+    const bool bSkip = Skipped();
+    const uint Slot = ThreadIndex(GroupId, GroupThread);
+    // if, not ?: (HLSL evaluates both sides of ?:, and the pass writes).
+    float Change = 0.0f;
+    float Uplift = 0.0f;
+    if (!bSkip)
+    {
+        Change = VoxelSolveImplicitFinishPass(Slot, NumSlots);
+        if (Slot < NumSlots)
+            Uplift = SlotU[Slot];
+    }
+    WritePartials(GroupId, GroupThread, bSkip, Change, Uplift);
+}
+
+// T3g: the hillslopes' threshold after the implicit update.
+[numthreads(64, 1, 1)]
+void CapInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveCapInitPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void CapJumpCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    if (Skipped()) return;
+    VoxelSolveCapJumpPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void CapFinishCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const bool bSkip = Skipped();
+    const uint Slot = ThreadIndex(GroupId, GroupThread);
+    float Change = 0.0f;
+    float Uplift = 0.0f;
+    if (!bSkip)
+    {
+        Change = VoxelSolveCapFinishPass(Slot, NumSlots);
+        if (Slot < NumSlots)
+            Uplift = SlotU[Slot];
+    }
+    WritePartials(GroupId, GroupThread, bSkip, Change, Uplift);
+}
+
+// One group: the step's residual (mean |dh| over the mean uplift of the step), and whether the
+// solve is done (below SolveTolerance after SolveMinSteps, or SolveMaxSteps run).
+[numthreads(64, 1, 1)]
+void ResidualCS(uint GroupThread : SV_GroupIndex)
+{
+    const uint NumGroups = (NumSlots + 63u) / 64u;
+    float A = 0.0f;
+    float B = 0.0f;
+    for (uint g = GroupThread; g < NumGroups; g += 64u)
+    {
+        A += Partials[g * 2u];
+        B += Partials[g * 2u + 1u];
+    }
+    ReduceA[GroupThread] = A;
+    ReduceB[GroupThread] = B;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint Stride = 32u; Stride > 0u; Stride >>= 1u)
+    {
+        if (GroupThread < Stride)
+        {
+            ReduceA[GroupThread] += ReduceA[GroupThread + Stride];
+            ReduceB[GroupThread] += ReduceB[GroupThread + Stride];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (GroupThread != 0u || SolveState[0] != 0u) return;
+    const uint Steps = SolveState[1] + 1u;
+    const float Residual = ReduceA[0] / max(ReduceB[0] * SolveDt, 1.0e-30f);
+    if (Steps <= SolveMaxSteps)
+        ResidualLog[Steps - 1u] = Residual;
+    SolveState[1] = Steps;
+    SolveState[0] = ((Steps >= SolveMinSteps && Residual < SolveTolerance) || Steps >= SolveMaxSteps) ? 1u : 0u;
+}
+
+[numthreads(64, 1, 1)]
+void SettleMarkCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveSettleMarkPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void SettleInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveSettleInitPass(ThreadIndex(GroupId, GroupThread), NumSlots, SolveEps);
+}
+
+[numthreads(64, 1, 1)]
+void SettleCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveSettlePass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void OutletInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveOutletInitPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void OutletJumpCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveOutletJumpPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+uint HistogramBin(float Relief)
+{
+    return min(uint(max(Relief, 0.0f) / HistogramMax * float(VOXEL_SOLVE_BINS)), VOXEL_SOLVE_BINS - 1u);
+}
+
+[numthreads(64, 1, 1)]
+void HistogramCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint Slot = ThreadIndex(GroupId, GroupThread);
+    if (Slot >= NumSlots) return;
+    const FVoxelSolveRelief R = VoxelSolveReliefOf(Slot);
+    if (!R.bCounted) return;
+    InterlockedAdd(Histogram[HistogramBin(R.Solved)], 1u);
+    InterlockedAdd(Histogram[VOXEL_SOLVE_BINS + HistogramBin(R.Target)], 1u);
+}
+
+[numthreads(64, 1, 1)]
+void NormaliseCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint Cell = ThreadIndex(GroupId, GroupThread);
+    if (SolveErode == 0u)
+    {
+        // No solve: the plate model's heights.
+        if (Cell < VoxelSolveNumCells())
+            SolveH[Cell] = BakeHeight[Cell];
+        return;
+    }
+    VoxelSolveNormalisePass(Cell);
+}
+
+[numthreads(64, 1, 1)]
+void RouteInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveRouteInitPass(ThreadIndex(GroupId, GroupThread), PassMode);
+}
+
+[numthreads(64, 1, 1)]
+void LabelInitCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveLabelInitPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void LabelCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveLabelPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void LakeStatsCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveLakeStatsPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void LakeFinishCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveLakeFinishPass(ThreadIndex(GroupId, GroupThread), NumSlots);
+}
+
+[numthreads(64, 1, 1)]
+void OutputCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelSolveOutputPass(ThreadIndex(GroupId, GroupThread));
+}

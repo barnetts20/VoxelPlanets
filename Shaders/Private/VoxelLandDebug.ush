@@ -1,0 +1,107 @@
+// VoxelLandDebug.ush - The land debug views (voxel.Debug.LandView): a pass after the brick
+// mesher's (VoxelBrickMesherPasses.ush) that colours each vertex by a component of the
+// generator at its position, into float 25 of the vertex record (the colour as an exact
+// integer, 0xRRGGBB, linear). The pages copy it into the vertex colour stream
+// (VoxelBrickPageGPU.usf). GPU only; the palette is VoxelLandDebugPalette.ush.
+//
+// The colours are VoxelLandDebugColor.ush's (shared with the terrain material's per-pixel views),
+// from the density's land terms at the vertex (VoxelLandHeightDF); the elevation and slope views
+// show the mesh itself (the vertex's height about sea level and its normal), so they agree with
+// the bake views up to the clamp to the lattice range and the edits.
+//
+// Include after VoxelBrickMesherPasses.ush, VoxelLandPlates.ush, VoxelLandDebugPalette.ush and
+// VoxelLandDebugColor.ush, and after declaring (FVoxelLandDebugParameters, VoxelLandGPU.h):
+//   uint LandDebugMode;                  VOXEL_LAND_VIEW_*
+//   StructuredBuffer<uint> LandAttr;     the bake's attributes, two cells per word (low half
+//                                        first), in the bake's cell order
+//   float2 LandDebugSeaRadius;           cm, double-float; 0: the density's sea level
+//   StructuredBuffer<float> LandWater;   the bake's lake levels (m; the density's, VoxelLandParameters.ush, from R2)
+//   uint LandDebugHasHydro;              1 when the bake has them (eroded)
+
+#ifndef VOXEL_LAND_DEBUG_USH
+#define VOXEL_LAND_DEBUG_USH
+
+#include "VoxelLandAccess.ush"
+
+/** A display colour as the vertex colour stores it: linear (the material reads vertex colours
+ *  as stored, without the sRGB curve), 8 bits a channel, 0xRRGGBB. */
+uint VoxelLandDebugPack(float3 Color)
+{
+    const float3 Linear = pow(saturate(Color), 2.2f);
+    const uint3 Q = uint3(round(Linear * 255.0f));
+    return (Q.x << 16) | (Q.y << 8) | Q.z;
+}
+
+/** One vertex of the batch: its colour for LandDebugMode. */
+void VoxelLandDebugPass(uint Id)
+{
+    if (Id >= NumBricks * VertexCap) return;
+    const uint B = Id / VertexCap;
+    const uint V = Id - B * VertexCap;
+    if (V >= min(Counters[B * 4u + 1u], VertexCap)) return;
+    const uint Base = Id * VoxelMesherVertexStride;
+    const FVoxelMesherBrick Brick = Bricks[B];
+
+    // The vertex in the planet's frame (cm, double-float): the brick min's lattice index in
+    // half finest cells, plus the vertex's offset from it.
+    const float2 PX = VoxelDFAdd(VoxelDFMul(VoxelDFFromInt(Brick.MinIndex.x), HalfFinest), float2(Vertices[Base], 0.0f));
+    const float2 PY = VoxelDFAdd(VoxelDFMul(VoxelDFFromInt(Brick.MinIndex.y), HalfFinest), float2(Vertices[Base + 1u], 0.0f));
+    const float2 PZ = VoxelDFAdd(VoxelDFMul(VoxelDFFromInt(Brick.MinIndex.z), HalfFinest), float2(Vertices[Base + 2u], 0.0f));
+    const float2 Radius = VoxelDFSqrt(VoxelDFAdd(VoxelDFAdd(VoxelDFMul(PX, PX), VoxelDFMul(PY, PY)), VoxelDFMul(PZ, PZ)));
+    const float3 Dir = normalize(float3(PX.x, PY.x, PZ.x));
+    const float3 Normal = float3(Vertices[Base + 3u], Vertices[Base + 4u], Vertices[Base + 5u]);
+    const float Footprint = max(ldexp(FinestCell, Brick.Level), MinFootprint);
+    const float CellM = Footprint * 0.01f;
+    const float2 Sea = LandDebugSeaRadius.x > 0.0f ? LandDebugSeaRadius
+        : (LandMode != 0u ? VoxelDFAdd(PlanetRadius, LandHeightOffset) : PlanetRadius);
+    const float2 HeightDF = VoxelDFSub(Radius, Sea);
+    const float Elevation = (HeightDF.x + HeightDF.y) * 0.01f;
+
+    FVoxelLandDebugInput In;
+    In.Mode = LandDebugMode;
+    In.Elevation = Elevation;
+    const float LengthSq = dot(Normal, Normal);
+    const float Up = LengthSq > 1.0e-12f ? dot(Normal, Dir) / sqrt(LengthSq) : 1.0f;
+    In.SlopeDegrees = acos(clamp(Up, -1.0f, 1.0f)) * 57.2957795f;
+    In.CellM = CellM;
+    In.Warped = Dir;
+    In.Bake = 0.0f;
+    In.Gully = 0.0f;
+    In.GullyScale = 0.0f;
+    In.Hills = 0.0f;
+    In.Peaks = 0.0f;
+    In.PeakAmplitude = 0.0f;
+    In.DetailNorm = 0.0f;
+    In.bTerrestrial = LandMode != 0u && Radius.x > 1.0e-6f;
+    In.bHydro = LandDebugHasHydro != 0u;
+    if (In.bTerrestrial && LandDebugMode != VOXEL_LAND_VIEW_ELEVATION && LandDebugMode != VOXEL_LAND_VIEW_SLOPE)
+    {
+        // The density's land branch at the vertex's direction, on the sea-level sphere.
+        const float2 Scale = VoxelDFDiv(VoxelDFAdd(PlanetRadius, LandHeightOffset), Radius);
+        const float2 SPX = VoxelDFMul(PX, Scale);
+        const float2 SPY = VoxelDFMul(PY, Scale);
+        const float2 SPZ = VoxelDFMul(PZ, Scale);
+        if (LandDebugMode == VOXEL_LAND_VIEW_BAKE || LandDebugMode == VOXEL_LAND_VIEW_DETAIL || LandDebugMode == VOXEL_LAND_VIEW_GULLY
+            || LandDebugMode == VOXEL_LAND_VIEW_HILLS || LandDebugMode == VOXEL_LAND_VIEW_PEAKS || LandDebugMode == VOXEL_LAND_VIEW_PEAK_AREA)
+        {
+            const FVoxelLandHeight H = VoxelLandHeightDF(VOXEL_LAND_ARGS SPX, SPY, SPZ, Footprint, false);
+            In.Warped = H.Warped;
+            In.Bake = H.Bake;
+            In.Gully = H.Gully;
+            In.GullyScale = H.GullyScale;
+            In.Hills = H.Hills;
+            In.Peaks = H.Peaks;
+            In.PeakAmplitude = H.PeakAmplitudeM;
+            In.DetailNorm = LandDetailAmplitude > 0.0f ? H.Detail * 100.0f / LandDetailAmplitude : 0.0f;
+        }
+        else
+        {
+            const FVoxelLandWarp Warp = VoxelLandWarpDF(VOXEL_LAND_ARGS SPX, SPY, SPZ);
+            In.Warped = normalize(float3(Warp.QX.x, Warp.QY.x, Warp.QZ.x));
+        }
+    }
+    const float3 Color = VoxelLandDebugColor(VOXEL_LAND_ARGS In);
+    Vertices[Base + 25u] = float(VoxelLandDebugPack(Color));
+}
+
+#endif // VOXEL_LAND_DEBUG_USH

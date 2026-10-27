@@ -1,0 +1,80 @@
+// VoxelTerrestrialMesher.usf - The terrestrial density source's mesher passes
+// (FVoxelDensityGPUSource, VoxelDensityGPU.cpp; Design/PlanetPluginSplit.md, S1a): the sample pass
+// on the planet density (VoxelDensitySample.ush: the noise surface or the land chain) and the land
+// debug views' colour pass (VoxelLandDebug.ush). The engine's mesher (VoxelBrickMesherGPU.usf)
+// records every other pass.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelDensityCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDF64.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelBrickStitch.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelMesherCommon.ush"
+
+// Density (VoxelDensitySample.ush; HalfFinest is the mesher's).
+StructuredBuffer<FVoxelOctave> Octaves;
+uint ContinentOctaves;
+uint MountainOctaves;
+uint DetailOctaves;
+float2 InvNormContinent;
+float2 InvNormMountain;
+float2 InvNormDetail;
+float2 PlanetRadius;
+float2 NoiseAmplitude;
+float2 ContinentWeight;
+float2 MountainWeight;
+float2 MountainStart;
+float2 MountainBlend;
+float2 DetailWeight;
+float RidgeGain;
+float SlopeDamping;
+
+#include "/Plugin/VoxelPlugin/Private/VoxelCubeSphere.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelLandParameters.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelLandSample.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelLandGully.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelDensitySample.ush"
+
+// The mesher's density (VoxelMesherCommon.ush): the planet's, without the edits.
+float VoxelMesherSourceDensity(int X, int Y, int Z, float Footprint)
+{
+    return VoxelSampleDensityDF(X, Y, Z, Footprint);
+}
+
+#include "/Plugin/VoxelPlugin/Private/VoxelEditSample.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelBrickMesherPasses.ush"
+
+// The land debug views (VoxelLandDebug.ush; FVoxelLandDebugParameters): the view, the bake's
+// attributes, the sea radius, and the plate model's inputs (VoxelLandPlates.ush; the plates view
+// reads the plates and the seed). The drainage and the lake levels are the density's
+// (VoxelLandParameters.ush).
+uint LandDebugMode;
+StructuredBuffer<uint> LandAttr;
+float2 LandDebugSeaRadius;
+uint LandDebugHasHydro;
+StructuredBuffer<float> LandPlates;
+uint LandPlateCount;
+uint LandSeed;
+float LandRadiusM;
+float LandWidthScale;
+float LandReliefScale;
+float LandShelfDepth;
+float LandAbyssDepth;
+float LandCoastHeight;
+float LandInteriorHeight;
+
+#include "/Plugin/VoxelPlanets/Private/VoxelLandPlates.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelLandDebugPalette.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelLandDebugColor.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelLandDebug.ush"
+
+[numthreads(64, 1, 1)]
+void SampleCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelMesherSamplePass(ThreadIndex(GroupId, GroupThread), PassMode);
+}
+
+[numthreads(64, 1, 1)]
+void LandDebugCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    VoxelLandDebugPass(ThreadIndex(GroupId, GroupThread));
+}

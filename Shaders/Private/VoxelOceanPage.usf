@@ -1,0 +1,385 @@
+// VoxelOceanPage.usf - Writes ocean tiles into a page's buffer set (VoxelOceanPages.cpp), in the
+// page's compute run. A job is one tile slot: its vertices from the tile's upload and its
+// triangles from the fixed grid pattern, or its triangles cleared (degenerate) when the tile
+// left. Group 0 also writes the draw arguments: every slot up to the highest in use.
+//
+// Page format: position (page units from the page origin; the component carries the unit),
+// tangent and normal (snorm8 x4), and six texture coordinates as twelve words: the morph offset
+// (to the parent vertex the vertex collapses into) x, y | z, the depth the waves feel | the depth
+// at that target, the split bias's coast codes (stage O9c) | the target's own morph offset (toward the grandparent grid) x, y | z, the depth at
+// its target | the bed's slope codes (the vertex's, its target's, its target's target's:
+// VoxelOceanBedPack), the terrain's own depth at the vertex (stage O9b2). VoxelOcean.ush reads
+// them. Colour is the page's (voxel.Debug.LevelColor).
+//
+// The terrain depth of a vertex (cm, positive under water) is the planet density with the
+// terrain's edits at the lattice point nearest it (the terrain's VoxelDensitySample.ush and
+// VoxelEditSample.ush, unchanged): the density is about the height above the terrain, and
+// the vertex lies on the sea sphere. Each tile samples its own vertices once, into group
+// memory; a vertex's morph target and the target's target are vertices of the same tile, so
+// their depths are read from there and the depth morphs with the vertex. A triangle the land
+// stands above at every corner by more than the job's cull height (a margin plus the slope
+// bound times how far a morphed triangle reaches) is written degenerate: no part of it can be
+// above the terrain.
+//
+// THE LIFT (stage O9b2): a vertex's nearest lattice point lies up to 0.87 lattice steps off the
+// sea sphere, and the density there carries that offset on top of the depth: uncorrelated from
+// one vertex to the next, tens of centimetres at the terrain's usual precision. Every depth here
+// takes off the point's height over the sea sphere (VoxelOceanLatticeLift, in double-float).
+//
+// THE DEPTH THE WAVES FEEL (stage O9b2): the depth written for the vertices is the density at the
+// level's wave footprint, max(its nominal spacing, DepthFootprint): the terrain with features
+// narrower than about twice it left out. The surf's phase turns by tens of radians per metre of
+// depth on a gentle beach, so the terrain's fine detail scattered neighbouring vertices to
+// unrelated phases (spikes); waves don't feel features much shorter than themselves anyway. A
+// vertex's morph target and the target's target are sampled at their own levels' footprints (two
+// and four times the nominal spacing, or DepthFootprint), so a collapsed vertex carries exactly
+// what the coarser tile has there. The cull keeps the tile's own footprint (the land's real
+// height), and so does the depth written for the swash's foam. The depth probe and the queries
+// (FVoxelOceanWaveFrame::FillSites) feel the same depth.
+//
+// THE BED'S SLOPE (stage O9b2; VoxelOceanBedCode): the wave depth's fall toward the coast at each
+// of those footprints, over the footprint either side along the shore field's landward direction
+// and across it (stage O9e: the whole slope's steepness, VoxelOceanBedWhole; its direction the
+// pixel takes from the depth's derivatives).
+// The surf spaces its crests by the field's slope; where the bottom is steeper the waves are
+// shorter on the ground than that, flatter or rising longer (VoxelOceanSurf.ush). Unknown where
+// the field has no direction, the depth is far from any surf (under 100 m of land, past 60 m of
+// sea) or the footprint is past 1 km.
+//
+// THE SHORE FIELD (stage O8; VoxelOceanShore.ush): a vertex whose field distance is below minus
+// ShoreMarginM lies in an inland basin below sea level (not joined to the sea): its cull depth is
+// taken as land (VOXEL_OCEAN_BASIN_DEPTH), so its triangles are culled. Its waves' depth stays the
+// terrain's: the surface drains below the ground toward the basin (stage O9b3,
+// VoxelOceanSurfDrainOf), which also stills its waves.
+//
+// THE DEPTH PROBE (ProbeCS; VoxelOceanDepthProbe.h): the same waves' depth and bed slope (basins
+// keep the terrain's depth, as the vertices' waves), at the probe's lattice points with each level's spacing (or the depth footprint) as the
+// footprint, for the underwater pass.
+
+#include "/Engine/Public/Platform.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelDensityCore.ush"
+#include "/Plugin/VoxelPlugin/Private/VoxelDF64.ush"
+
+#define VOXEL_OCEAN_JOB_WORDS 6u          // VoxelOceanPagesDetail::JobWords
+#define VOXEL_OCEAN_VERTEX_WORDS 16u      // FVoxelOceanPages::VertexWords
+#define VOXEL_OCEAN_MAX_TILE_VERTICES 1089u   // (32 + 1)^2: TileQuads is at most 32
+#define VOXEL_OCEAN_BASE_WORDS 16u        // VoxelOceanPagesDetail::BaseWords (VoxelOceanDisplace.usf)
+
+static const uint TexCoordWords = 12u;
+
+// Per job: kind (0 write, 1 clear), slot, first word of the tile's vertices, density footprint
+// (float, cm), cull height (float, cm), the level's nominal spacing (float, cm; stage O9b2).
+StructuredBuffer<uint> Jobs;
+// Per vertex: position (3), morph offset (3), packed tangent, packed normal, target's morph
+// offset (3), lattice point (3 ints), tile indices of the target and of its target (16 bits each),
+// the split bias's coast codes (stage O9c: a float, to TexCoord 2 y).
+StructuredBuffer<uint> VertexWords;
+RWBuffer<float> OutPositions;
+RWBuffer<uint> OutTangents;          // two packed normals per vertex: tangent, normal
+RWBuffer<uint> OutTexCoords;         // TexCoordWords per vertex
+RWBuffer<uint> OutColors;
+RWBuffer<uint> OutIndices;
+RWBuffer<uint> OutArgs;
+// Stage O9j: with the waves in compute, each vertex's position and texture coordinate words also
+// go to the page's own buffer (VOXEL_OCEAN_BASE_WORDS a vertex), which the per-frame displacement
+// (VoxelOceanDisplace.usf) reads: it overwrites the position and texture coordinates 0 to 2.
+RWStructuredBuffer<uint> OutBase;
+uint BaseOn;
+uint NumJobs;
+uint TileQuads;
+uint DrawSlots;                      // slots drawn: up to the highest in use
+uint VertexCapacity;                 // page buffers
+uint TriangleCapacity;
+uint Color;
+uint StreamMask;                     // 1 tangents, 2 texture coordinates, 4 colours: streams the page has
+uint FlipWinding;
+
+// The terrain's depth: the density, the edits, the shore field and (stage O9m) the land
+// surface cache (VoxelOceanTerrainDepth.ush).
+#include "/Plugin/VoxelPlanets/Private/VoxelOceanTerrainDepth.ush"
+// Stage W5f: the felt depth at the coast (the probe's, as the wave hook's).
+#include "/Plugin/VoxelPlanets/Private/VoxelOceanFeltDepth.ush"
+
+// The job's depths per tile vertex: the waves' at the level's footprint, its parent's and its
+// grandparent's (a vertex may be another's target or target's target), the terrain's own at the
+// tile's footprint (the cull's, the swash foam's); the bed's slope codes at the three footprints
+// (bits 0-7, 8-15, 16-23).
+groupshared float TileDepth[VOXEL_OCEAN_MAX_TILE_VERTICES];
+groupshared float TileDepthParent[VOXEL_OCEAN_MAX_TILE_VERTICES];
+groupshared float TileDepthGrand[VOXEL_OCEAN_MAX_TILE_VERTICES];
+groupshared float TileLand[VOXEL_OCEAN_MAX_TILE_VERTICES];
+groupshared uint TileCodes[VOXEL_OCEAN_MAX_TILE_VERTICES];
+
+// One group per job; group 0 also writes FRHIDrawIndexedIndirectParameters (index count,
+// instances, first index, base vertex, first instance).
+[numthreads(64, 1, 1)]
+void WriteCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint N = TileQuads + 1u;
+    const uint TileVertices = min(N * N, VOXEL_OCEAN_MAX_TILE_VERTICES);
+    const uint TileTriangles = 2u * TileQuads * TileQuads;
+    const uint Job = GroupId.x;
+    if (Job == 0u && GroupThread == 0u)
+    {
+        OutArgs[0] = min(DrawSlots * TileTriangles, TriangleCapacity) * 3u;
+        OutArgs[1] = 1u;
+        OutArgs[2] = 0u;
+        OutArgs[3] = 0u;
+        OutArgs[4] = 0u;
+    }
+    // Groups past the jobs (group 0 when there are none) do nothing more; no early return, so
+    // the barrier below stays in uniform flow for every compiler.
+    const bool bActive = Job < NumJobs;
+    bool bWrite = false;
+    uint Slot = 0u;
+    uint Source = 0u;
+    float Footprint = 0.0f;
+    float CullHeight = 0.0f;
+    float Nominal = 0.0f;
+    if (bActive)
+    {
+        const uint W = Job * VOXEL_OCEAN_JOB_WORDS;
+        bWrite = Jobs[W] == 0u;
+        Slot = Jobs[W + 1u];
+        Source = Jobs[W + 2u];
+        Footprint = asfloat(Jobs[W + 3u]);
+        CullHeight = asfloat(Jobs[W + 4u]);
+        Nominal = asfloat(Jobs[W + 5u]);
+    }
+    const uint BaseVertex = Slot * TileVertices;
+    const uint BaseTriangle = Slot * TileTriangles;
+
+    // The depths at every vertex of the tile: the terrain's own (the cull's), and the waves' at
+    // this level's footprint, its parent's and its grandparent's (all DepthFootprint where the
+    // levels are finer than it).
+    const float WaveFootprint = max(Nominal, DepthFootprint);
+    const float ParentFootprint = max(2.0f * Nominal, DepthFootprint);
+    const float GrandFootprint = max(4.0f * Nominal, DepthFootprint);
+    if (bWrite)
+    {
+        [loop]
+        for (uint I = GroupThread; I < TileVertices; I += 64u)
+        {
+            const uint Src = Source + I * VOXEL_OCEAN_VERTEX_WORDS;
+            const int X = asint(VertexWords[Src + 11u]);
+            const int Y = asint(VertexWords[Src + 12u]);
+            const int Z = asint(VertexWords[Src + 13u]);
+            const FVoxelOceanPointShore Shore = VoxelOceanPointShoreAt(X, Y, Z);
+            // In an inland basin the cull's depth is land wherever either depth would hold water;
+            // the waves' depths stay the terrain's (stage O9b3: the surface drains below the ground
+            // toward the basin, VoxelOceanSurfDrainOf, so no wall of water stands at its edge).
+            float Land = VoxelOceanDepthAt(X, Y, Z, Footprint, false);
+            const FVoxelOceanWaveDepth Wave = VoxelOceanWaveDepthAt(X, Y, Z, WaveFootprint, Shore, false);
+            if (Shore.bBasin && (Land > 0.0f || Wave.Depth > 0.0f))
+                Land = VOXEL_OCEAN_BASIN_DEPTH;
+            FVoxelOceanWaveDepth Parent = Wave;
+            if (ParentFootprint > WaveFootprint)
+                Parent = VoxelOceanWaveDepthAt(X, Y, Z, ParentFootprint, Shore, false);
+            FVoxelOceanWaveDepth Grand = Parent;
+            if (GrandFootprint > ParentFootprint)
+                Grand = VoxelOceanWaveDepthAt(X, Y, Z, GrandFootprint, Shore, false);
+            TileLand[I] = Land;
+            TileDepth[I] = Wave.Depth;
+            TileDepthParent[I] = Parent.Depth;
+            TileDepthGrand[I] = Grand.Depth;
+            TileCodes[I] = Wave.Code | (Parent.Code << 8u) | (Grand.Code << 16u);
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (bWrite)
+    {
+        [loop]
+        for (uint I = GroupThread; I < TileVertices && BaseVertex + I < VertexCapacity; I += 64u)
+        {
+            const uint Src = Source + I * VOXEL_OCEAN_VERTEX_WORDS;
+            const uint Dst = BaseVertex + I;
+            OutPositions[Dst * 3u] = asfloat(VertexWords[Src]);
+            OutPositions[Dst * 3u + 1u] = asfloat(VertexWords[Src + 1u]);
+            OutPositions[Dst * 3u + 2u] = asfloat(VertexWords[Src + 2u]);
+            if ((StreamMask & 1u) != 0u)
+            {
+                OutTangents[Dst * 2u] = VertexWords[Src + 6u];
+                OutTangents[Dst * 2u + 1u] = VertexWords[Src + 7u];
+            }
+            const uint Gather = VertexWords[Src + 14u];
+            const uint Target = min(Gather & 0xffffu, TileVertices - 1u);
+            const uint Grand = min(Gather >> 16u, TileVertices - 1u);
+            uint Tex[12];
+            Tex[0] = VertexWords[Src + 3u];
+            Tex[1] = VertexWords[Src + 4u];
+            Tex[2] = VertexWords[Src + 5u];
+            Tex[3] = asuint(TileDepth[I]);
+            Tex[4] = asuint(TileDepthParent[Target]);
+            Tex[5] = VertexWords[Src + 15u];    // the coast codes (stage O9c)
+            Tex[6] = VertexWords[Src + 8u];
+            Tex[7] = VertexWords[Src + 9u];
+            Tex[8] = VertexWords[Src + 10u];
+            Tex[9] = asuint(TileDepthGrand[Grand]);
+            // The bed's slope codes (stage O9b2): the vertex's at its level's footprint, its
+            // target's at the parent's, the target's target's at the grandparent's.
+            Tex[10] = asuint(VoxelOceanBedPack(TileCodes[I] & 255u, (TileCodes[Target] >> 8u) & 255u, (TileCodes[Grand] >> 16u) & 255u));
+            Tex[11] = asuint(TileLand[I]);
+            if ((StreamMask & 2u) != 0u)
+            {
+                const uint T = Dst * TexCoordWords;
+                [unroll]
+                for (uint K = 0u; K < 12u; K++)
+                    OutTexCoords[T + K] = Tex[K];
+            }
+            if (BaseOn != 0u)
+            {
+                const uint Bw = Dst * VOXEL_OCEAN_BASE_WORDS;
+                OutBase[Bw] = VertexWords[Src];
+                OutBase[Bw + 1u] = VertexWords[Src + 1u];
+                OutBase[Bw + 2u] = VertexWords[Src + 2u];
+                [unroll]
+                for (uint K = 0u; K < 12u; K++)
+                    OutBase[Bw + 3u + K] = Tex[K];
+                OutBase[Bw + 15u] = 0u;
+            }
+            if ((StreamMask & 4u) != 0u)
+                OutColors[Dst] = Color;
+        }
+    }
+
+    [loop]
+    for (uint T = GroupThread; bActive && T < TileTriangles && BaseTriangle + T < TriangleCapacity; T += 64u)
+    {
+        const uint Dst = (BaseTriangle + T) * 3u;
+        uint3 Tri = uint3(0u, 0u, 0u);
+        if (bWrite)
+        {
+            // VoxelOceanTiles::QuadTriangles: quad (A, B), split along V00 - V11.
+            const uint Quad = T >> 1u;
+            const uint A = Quad % TileQuads;
+            const uint B = Quad / TileQuads;
+            const uint V00 = B * N + A;
+            const uint V10 = V00 + 1u;
+            const uint V01 = V00 + N;
+            const uint V11 = V01 + 1u;
+            uint3 Local;
+            if ((T & 1u) == 0u)
+                Local = FlipWinding != 0u ? uint3(V00, V10, V11) : uint3(V00, V11, V10);
+            else
+                Local = FlipWinding != 0u ? uint3(V00, V11, V01) : uint3(V00, V01, V11);
+            // Under land at every corner, by more than the cull height: degenerate.
+            const float Highest = max(TileLand[Local.x], max(TileLand[Local.y], TileLand[Local.z]));
+            Tri = Highest < -CullHeight ? uint3(BaseVertex, BaseVertex, BaseVertex) : Local + BaseVertex;
+        }
+        OutIndices[Dst] = Tri.x;
+        OutIndices[Dst + 1u] = Tri.y;
+        OutIndices[Dst + 2u] = Tri.z;
+    }
+}
+
+// The depth probe: one thread per point (VoxelOceanDepthProbe.h's order: level by level).
+StructuredBuffer<int> ProbePoints;      // 3 ints a point: the lattice point
+RWStructuredBuffer<float> ProbeOut;
+uint ProbeCount;
+uint ProbeLevelPoints;                  // points per level
+float4 ProbeFootprint;                  // per level (cm)
+
+[numthreads(64, 1, 1)]
+void ProbeCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    const uint I = DispatchThreadId.x;
+    if (I >= ProbeCount) return;
+    const uint Level = min(I / max(ProbeLevelPoints, 1u), 3u);
+    const float Footprint = Level == 0u ? ProbeFootprint.x : (Level == 1u ? ProbeFootprint.y : (Level == 2u ? ProbeFootprint.z : ProbeFootprint.w));
+    // The depth the waves feel and the bed's slope (as the vertices'): the depths first, then the
+    // slopes (ProbeCount each; VOXEL_OCEAN_BED_UNKNOWN unknown).
+    const int X = ProbePoints[I * 3u];
+    const int Y = ProbePoints[I * 3u + 1u];
+    const int Z = ProbePoints[I * 3u + 2u];
+    const FVoxelOceanPointShore Shore = VoxelOceanPointShoreAt(X, Y, Z);
+    const float WaveFootprint = max(Footprint, DepthFootprint);
+    const FVoxelOceanWaveDepth Wave = VoxelOceanWaveDepthAt(X, Y, Z, WaveFootprint, Shore, false);
+    // Stage W5f: felt (VoxelOceanFeltDepth.ush), with the terrain's own depth at the level's
+    // footprint (an inland basin's as land, as the clipmap's static layer has it), so the underwater
+    // pass's surface runs on to the terrain's waterline as the drawn one does (stage W5e). The wave
+    // hook takes it as it is there (no bed depth with it: VoxelOceanSurfFeltDepth leaves it).
+    float Land = VoxelOceanDepthAt(X, Y, Z, Footprint, false);
+    if (Shore.bBasin && (Land > 0.0f || Wave.Depth > 0.0f))
+        Land = VOXEL_OCEAN_BASIN_DEPTH;
+    ProbeOut[I] = VoxelOceanSurfFeltDepth(Wave.Depth, Land, 100.0f * VOXEL_OCEAN_SURF_FELT_BLEND);
+    ProbeOut[ProbeCount + I] = VoxelOceanBedSlopeOf(Wave.Code);
+}
+
+// The coastal field's depths (stage O9h; FVoxelOceanPages::SampleCoastDepths, VoxelOceanCoastCore.h):
+// one thread per fine cell of the coast's tiles, Count of them from First (tile by tile, rows of
+// R), the terrain's depth at the cell's centre (cm; an inland basin's cells as land) at the cell's
+// footprint (the depth the waves feel at that footprint, without the bed's slope).
+StructuredBuffer<int> CoastTiles;       // 3 ints a tile: face, bake cell i, j
+RWStructuredBuffer<float> CoastOut;
+uint CoastFirst;
+uint CoastCount;
+uint CoastR;
+uint CoastN;
+uint CoastGroupsX;
+float CoastFootprint;                   // cm
+float CoastLatticeScale;                // the sea sphere's radius in lattice units
+// Stage W7d: 1: the land bake's cells instead (the shore field's heights, VoxelOceanShoreField.cpp):
+// one thread per cell of the bake's padded layout (6 (N + 2 Pad)^2, CoastN the bake's N), the
+// terrain's own depth (cm) at the cell's centre (an apron cell's on its face continued, as the bake
+// holds it) at the cell's footprint, with no inland basin (the field isn't made yet).
+uint CoastMode;
+
+[numthreads(64, 1, 1)]
+void CoastDepthCS(uint3 GroupId : SV_GroupID, uint3 GroupThreadId : SV_GroupThreadID)
+{
+    const uint I = (GroupId.y * CoastGroupsX + GroupId.x) * 64u + GroupThreadId.x;
+    if (I >= CoastCount) return;
+    if (CoastMode == 1u)
+    {
+        const uint Side = CoastN + 2u * uint(VOXEL_OCEAN_SHORE_PAD);
+        const uint Padded = CoastFirst + I;
+        const uint BakeFace = Padded / (Side * Side);
+        const uint InFace = Padded - BakeFace * Side * Side;
+        const int BI = int(InFace % Side) - VOXEL_OCEAN_SHORE_PAD;
+        const int BJ = int(InFace / Side) - VOXEL_OCEAN_SHORE_PAD;
+        const float3 BakeDir = VoxelOceanShoreCellDir(int(BakeFace), BI, BJ, int(CoastN));
+        const int BX = int(round(BakeDir.x * CoastLatticeScale));
+        const int BY = int(round(BakeDir.y * CoastLatticeScale));
+        const int BZ = int(round(BakeDir.z * CoastLatticeScale));
+        CoastOut[I] = VoxelOceanDepthAt(BX, BY, BZ, max(CoastFootprint, DepthFootprint), false);
+        return;
+    }
+    const uint Cell = CoastFirst + I;
+    const uint PerTile = CoastR * CoastR;
+    const uint Tile = Cell / PerTile;
+    const uint Within = Cell - Tile * PerTile;
+    const int Face = CoastTiles[Tile * 3u];
+    const int CI = CoastTiles[Tile * 3u + 1u];
+    const int CJ = CoastTiles[Tile * 3u + 2u];
+    const int FI = CI * int(CoastR) + int(Within % CoastR);
+    const int FJ = CJ * int(CoastR) + int(Within / CoastR);
+    const float FN = float(CoastN * CoastR);
+    const float3 Dir = VoxelCubeDirection(uint(Face), -1.0f + (2.0f * float(FI) + 1.0f) / FN, -1.0f + (2.0f * float(FJ) + 1.0f) / FN);
+    const int X = int(round(Dir.x * CoastLatticeScale));
+    const int Y = int(round(Dir.y * CoastLatticeScale));
+    const int Z = int(round(Dir.z * CoastLatticeScale));
+    const FVoxelOceanPointShore Shore = VoxelOceanPointShoreAt(X, Y, Z);
+    CoastOut[I] = Shore.bBasin ? VOXEL_OCEAN_BASIN_DEPTH : VoxelOceanDepthAt(X, Y, Z, max(CoastFootprint, DepthFootprint), false);
+}
+
+// The rings' far sphere (stage W2; VoxelOceanRings.usf): one thread per vertex, the terrain's own
+// depth at its lattice point (cm, at the sphere's cell; an inland basin's as land), for its land
+// cull. Sampled once (and again when the terrain's inputs change).
+StructuredBuffer<int> FarLattice;       // 3 ints a vertex
+RWStructuredBuffer<float> FarLandOut;
+uint FarCount;
+float FarFootprint;                     // cm
+
+[numthreads(64, 1, 1)]
+void FarDepthCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    const uint I = DispatchThreadId.x;
+    if (I >= FarCount) return;
+    const int X = FarLattice[I * 3u];
+    const int Y = FarLattice[I * 3u + 1u];
+    const int Z = FarLattice[I * 3u + 2u];
+    const FVoxelOceanPointShore Shore = VoxelOceanPointShoreAt(X, Y, Z);
+    const float Land = VoxelOceanDepthAt(X, Y, Z, max(FarFootprint, DepthFootprint), false);
+    FarLandOut[I] = Shore.bBasin && Land > 0.0f ? VOXEL_OCEAN_BASIN_DEPTH : Land;
+}

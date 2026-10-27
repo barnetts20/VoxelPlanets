@@ -1,0 +1,183 @@
+// VoxelOceanFoam.ush - The ocean's foam (stage W3v; Design/OceanWaves.md section 47): GodotOceanWaves'
+// foam (2Retr0, its fft_unpack.glsl, water.gdshader and wave_generator.gd; Tessendorf's foam), run
+// where a clipmap ocean runs it (Crest: a foam simulation on the wave clipmap's levels). Shared
+// subset (VoxelShaderCompat.h): the wave clipmap's step (VoxelOceanClip.usf), the waves' evaluation
+// (VoxelOceanWaves.ush: the fresh foam without a history), the own pass (VoxelOceanPixelClip.ush,
+// VoxelOceanSurfacePass.usf) and the checks (Tools/OceanHarness/foam_check.cpp) run it.
+//
+// THE RULE (Godot's, per texel and frame): where the surface is compressed past the whitecap
+// threshold (its area ratio J = det(I + chop grad D) under Whitecap), foam grows by how far past it
+// is; everywhere it decays exponentially; it stays within 0 and 1 (Godot's clamp per cascade):
+//   dFoam/dt = max(Whitecap - J, 0) Grow - Decay Foam,
+// integrated exactly over each step (Godot adds Grow dt and multiplies by e^(-Decay dt): the same to
+// first order, but its steady state moves with the frame rate; this one's doesn't):
+//   Foam' = Foam e^(-Decay dt) + Source (Grow / Decay) (1 - e^(-Decay dt)),
+// with Godot's rates from its one handle, the foam amount A (wave_generator.gd): Grow = 7.5 A and
+// Decay = 1.15 max(0.5, 10 - A) per second. A crest breaking again and again builds a patch that
+// thins as it fades; a single one leaves a trail.
+// DRAWN (water.gdshader): smoothstep(0, 1, 0.75 Foam), the share of the surface white: Foam the sum
+// of the layers (the sea's buffer and the fine foam, as Godot sums its cascades'), each within 0 and
+// 1, so a patch built all the way by one layer draws 0.84 white, the other's foam over it the rest.
+// THE RAMP (stage W3y; ours: Godot has none, its foam nearly on or off where a crest breaks): the
+// steady state's gain (Source to foam, FreshGain below; the chart table's row 16 x) set so the foam
+// rises from none at the threshold to all of it (1) a span of J (FoamRamp) under it, so a
+// crest's foam fades in translucent over a wider area round its solid peak; the step's growth is
+// that gain times the decay (VoxelOceanSurface.cpp: FoamGainOf). FoamRamp 0: Godot's, Grow / Decay.
+//
+// WHERE (unlike Godot): Godot keeps the foam in each cascade's own tile, from that cascade's own J:
+// its cascades each hold the whole spectrum from their tile down, so each one's J is nearly the
+// surface's. Ours split the spectrum into four bands of wavelength (each holds its own, so their sum
+// is the sea): a band's J alone seldom comes near the threshold (on the emulated cascades under 1%
+// of any band's texels fall under 0.75, against a few percent of the summed surface's; foam_check),
+// and where it does it isn't where the sea's crests break. So the rule runs on the wave clipmap's levels
+// (world space: the composed sea's J at each texel, as Crest's foam does), the surf's breaking fed
+// into the same buffer (the bores' faces, their short wake and the swash's edge: Source below).
+// Without a buffer (the material without the clipmap, the underwater pass), the fresh foam: the
+// rule's steady state for the compression now, Source Grow / Decay.
+// AT A COARSE TEXEL (stage W3z; VoxelOceanFoamSourceSpread): Godot's J is a cascade texel's, 1 to 24
+// cm, so its threshold traces the crests' thin streaks; a clipmap texel's J holds only the waves it
+// resolves (smooth, and at a coarse level broad), so the rule there foamed every broad compression
+// of a long wave at once: round, solid patches (and needed a high threshold, 0.85 against Godot's
+// 0.5, to foam at all). The texel takes instead the source's mean over the surface it covers, its
+// unresolved compression Gaussian about its J with the deviation the waves it can't resolve give
+// (sigma_J = chop sqrt(their slope variance): J - 1 is to first order chop (Dxx + Dyy), whose
+// variance is chop^2 times the slope variance): E[(c - J')+] = d Phi(d / s) + s phi(d / s), d = c -
+// J. The rule is linear in its source, so the buffer then holds the fine surface's mean foam;
+// where the texel resolves everything (s 0) it is Godot's hard rule. On the emulated cascades the
+// Gaussian mean with each texel's own deviation is within 4% of the fine surface's mean source
+// from 0.4 to 3.2 m texels, where the hard rule on the texel's J falls short by up to 90%; the
+// deviation from the bands' statistics runs 7 to 30% high (a band counts unresolved as a whole once
+// its shortest waves are), so it is taken at VOXEL_OCEAN_FOAM_SPREAD_SCALE (foam_check 3c).
+
+#ifndef VOXEL_OCEAN_FOAM_USH
+#define VOXEL_OCEAN_FOAM_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// The unresolved compression's deviation per chop sqrt(slope variance) (stage W3z; above).
+#define VOXEL_OCEAN_FOAM_SPREAD_SCALE 0.85f
+// Godot's gain on the foam before its smoothstep (water.gdshader's foam_factor).
+#define VOXEL_OCEAN_FOAM_GAIN 0.75f
+// Godot's rates per unit of the foam amount (wave_generator.gd: foam_grow_rate, foam_decay_rate).
+#define VOXEL_OCEAN_FOAM_GROW_PER_AMOUNT 7.5f
+#define VOXEL_OCEAN_FOAM_DECAY_SCALE 1.15f
+#define VOXEL_OCEAN_FOAM_DECAY_FROM 10.0f
+#define VOXEL_OCEAN_FOAM_DECAY_LEAST 0.5f
+// The most foam a layer holds: 1, Godot's clamp per cascade (stage W3z; W3v to W3y held 1 / GAIN,
+// so a built patch drew solid white, the blobs of a coarse buffer: Godot's interiors are 0.84 white
+// till another cascade's foam adds to them).
+#define VOXEL_OCEAN_FOAM_MAX 1.0f
+
+// The rule's rates (per second) for a foam amount (Godot's 0 to 10).
+VOXEL_FUNC float VoxelOceanFoamGrowRate(float Amount)
+{
+    return VOXEL_OCEAN_FOAM_GROW_PER_AMOUNT * max(Amount, 0.0f);
+}
+
+VOXEL_FUNC float VoxelOceanFoamDecayRate(float Amount)
+{
+    return VOXEL_OCEAN_FOAM_DECAY_SCALE * max(VOXEL_OCEAN_FOAM_DECAY_LEAST, VOXEL_OCEAN_FOAM_DECAY_FROM - max(Amount, 0.0f));
+}
+
+// The compression past the threshold (Godot's foam_factor before its rate): J the area ratio.
+VOXEL_FUNC float VoxelOceanFoamSource(float J, float Whitecap)
+{
+    return max(Whitecap - J, 0.0f);
+}
+
+// The source's mean over a texel (stage W3z; above): J the texel's area ratio, Sigma the deviation of
+// the compression it doesn't resolve. Phi by its tanh form (within 2e-4).
+VOXEL_FUNC float VoxelOceanFoamSourceSpread(float J, float Sigma, float Whitecap)
+{
+    if (Whitecap <= 0.0f) return 0.0f;
+    const float D = Whitecap - J;
+    if (Sigma <= 1.0e-4f) return max(D, 0.0f);
+    const float Z = clamp(D / Sigma, -8.0f, 8.0f);
+    const float Cdf = 0.5f + 0.5f * tanh(0.7978845608f * (Z + 0.044715f * Z * Z * Z));
+    const float Pdf = 0.3989422804f * exp(-0.5f * Z * Z);
+    return max(D * Cdf + Sigma * Pdf, 0.0f);
+}
+
+// Stage W5h: THE TEXEL'S MEAN OF THE HELD FOAM. The foam at a point is held at 1 (its steady state
+// min(Gain Source, 1): Gain the rule's Grow / Decay, FreshGain, 26 at Godot's amount 8 with no
+// ramp), so a texel's mean foam is the mean of the held foam over the surface it covers, not the
+// held mean: min(Gain E[s], 1) whitens a whole coarse texel wherever a few of its points break, and
+// more so the coarser the texel (each clipmap level out: a step in the foam at each level's edge, a
+// smear far off). The source a texel steps with is that mean over Gain: with Y = Whitecap - J' and
+// J' Gaussian about J (deviation Sigma), T = 1 / Gain,
+//   E[min(Gain Y+, 1)] = Gain E[Y; 0 < Y < T] + P(Y > T),
+//   E[Y; 0 < Y < T] = D (Phi(b) - Phi(a)) + Sigma (phi(a) - phi(b)), a = -D / Sigma, b = (T - D) / Sigma.
+// Where the texel resolves its compression (Sigma Gain small) the free mean: a resolved crest far past
+// the threshold fills its texel at once, as Godot's (the held one would fill it over the decay time).
+// The two blend over Sigma Gain from 0.5 to 2.
+VOXEL_FUNC float VoxelOceanFoamCdf(float Z)
+{
+    return 0.5f + 0.5f * tanh(0.7978845608f * (Z + 0.044715f * Z * Z * Z));
+}
+
+VOXEL_FUNC float VoxelOceanFoamSourceHeld(float J, float Sigma, float Whitecap, float Gain)
+{
+    const float Free = VoxelOceanFoamSourceSpread(J, Sigma, Whitecap);
+    if (Whitecap <= 0.0f || Gain <= 0.0f || Sigma <= 1.0e-4f) return Free;
+    const float D = Whitecap - J;
+    const float T = 1.0f / Gain;
+    const float A = clamp(-D / Sigma, -8.0f, 8.0f);
+    const float B = clamp((T - D) / Sigma, -8.0f, 8.0f);
+    const float CdfA = VoxelOceanFoamCdf(A);
+    const float CdfB = VoxelOceanFoamCdf(B);
+    const float PdfA = 0.3989422804f * exp(-0.5f * A * A);
+    const float PdfB = 0.3989422804f * exp(-0.5f * B * B);
+    const float Linear = max(D * (CdfB - CdfA) + Sigma * (PdfA - PdfB), 0.0f);
+    const float Held = (Gain * Linear + (1.0f - CdfB)) * T;
+    const float W = saturate((Sigma * Gain - 0.5f) * (1.0f / 1.5f));
+    return Free + (min(Held, Free) - Free) * W;
+}
+
+// One step: Keep = e^(-Decay dt), GrowDt = (Grow / Decay) (1 - Keep) (the exact step's growth per
+// unit of source; Grow dt to first order, Godot's); Source the open sea's compression past the
+// threshold plus the surf's foam (0 to 1). Within 0 and VOXEL_OCEAN_FOAM_MAX.
+VOXEL_FUNC float VoxelOceanFoamStep(float Foam, float Source, float GrowDt, float Keep)
+{
+    return clamp(Foam * Keep + max(Source, 0.0f) * GrowDt, 0.0f, VOXEL_OCEAN_FOAM_MAX);
+}
+
+// Stage W5a: THE SURF'S FOAM IN THE BUFFER is a density (the bores' white water, 0 to 1: its steady
+// state is itself, not the open sea's gain times it; at Godot's gain, about 26, the surf's trail and
+// carpet saturated the whole breaking zone white), with its own decay (white water lingers seconds
+// behind a bore; the open sea's whitecaps, Godot's 0.4 s at amount 8), the zone's share taking it.
+// THE BREAKUP: the foam fades faster where its water stretches (J over 1: the bubbles spread and
+// burst; foam thins where the surface diverges and gathers where it converges, as Crest's and the
+// real sea's do), so a trail breaks into the lacy patches of the short waves riding through it
+// instead of fading as one smooth sheet: each step's keep raised to 1 + Breakup (J - 1)+.
+VOXEL_FUNC float VoxelOceanFoamKeepAt(float Keep, float J, float Breakup)
+{
+    return pow(max(Keep, 1.0e-6f), 1.0f + max(Breakup, 0.0f) * max(J - 1.0f, 0.0f));
+}
+
+// One step with the surf apart (stage W5a): Open the open sea's source (its growth per unit GrowDt,
+// as VoxelOceanFoamStep), Surf the surf's foam density, KeepOpen and KeepSurf their steps' keeps
+// (VoxelOceanFoamKeepAt's), Zone the surf's breaking zone (0 to 1: whose decay the texel's is).
+VOXEL_FUNC float VoxelOceanFoamStepSurf(float Foam, float Open, float GrowDt, float KeepOpen, float Surf, float KeepSurf, float Zone)
+{
+    const float Keep = KeepOpen + (KeepSurf - KeepOpen) * clamp(Zone, 0.0f, 1.0f);
+    return clamp(Foam * Keep + max(Open, 0.0f) * GrowDt + max(Surf, 0.0f) * (1.0f - KeepSurf), 0.0f, VOXEL_OCEAN_FOAM_MAX);
+}
+
+// The rule's steady state under a constant source (Source Grow / Decay, at most 1): the fresh foam
+// where there is no buffer, a new texel's start, the whitecaps (the breaking now). FreshGain: Grow /
+// Decay.
+VOXEL_FUNC float VoxelOceanFoamFresh(float Source, float FreshGain)
+{
+    return clamp(max(Source, 0.0f) * FreshGain, 0.0f, VOXEL_OCEAN_FOAM_MAX);
+}
+
+// The drawn foam (0 to 1): Godot's smoothstep(0, 1, 0.75 Foam).
+VOXEL_FUNC float VoxelOceanFoamDrawn(float Foam)
+{
+    const float X = clamp(VOXEL_OCEAN_FOAM_GAIN * Foam, 0.0f, 1.0f);
+    return X * X * (3.0f - 2.0f * X);
+}
+
+#endif // VOXEL_OCEAN_FOAM_USH

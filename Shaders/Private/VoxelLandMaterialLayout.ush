@@ -1,0 +1,150 @@
+// VoxelLandMaterialLayout.ush - The layout of the land textures the terrain material reads
+// (VoxelLandMaterialAccess.ush), shared with the C++ that fills them (VoxelLandMaterial.h).
+// Macros only, so both sides include it.
+//
+// Height texture (RG32F): R the bake's heights (m), G its landform (FVoxelLandBake::Form, the
+// 16-bit value as a float: exact), Side x 6 Side texels, cell I at (I % Side, I / Side) (the
+// bake's padded index: face-major, rows of U).
+// Field texture (RGBA16F), the same texels: R the drainage (log2 m^2, 0 without it), G the kept
+// lake's level above the cell's own height (m: small, so the half keeps it to a few cm in lakes
+// tens of metres deep, 0.25 m at 500 m;
+// VOXEL_LAND_MATERIAL_NO_LAKE where there is none), B the attributes' low byte (the crust,
+// 0..255), A their high bits (class, sea-connected, lake: attr >> 8, five bits) plus the
+// province (FVoxelLandBake::Province, 0..63, T4c) << 5: at most 2047, exact in a half.
+// Constants texture (RGBA32F, VOXEL_LAND_MATERIAL_CONST_WIDTH texels a row): scalars first (four
+// a texel, at the VOXEL_LAND_MC_* indices), then the tan table (two entries a texel), the noise
+// octaves (VOXEL_LAND_MATERIAL_OCTAVE_TEXELS texels each), the plates (two texels each) and the
+// rivers' tiles and data (R1: four values a texel), at the texel offsets the scalars give. Integers below 2^24 are stored as floats; 32-bit ones as
+// two floats of 16 bits (low, high), so every value reads back exactly.
+
+#ifndef VOXEL_LAND_MATERIAL_LAYOUT_USH
+#define VOXEL_LAND_MATERIAL_LAYOUT_USH
+
+#define VOXEL_LAND_MATERIAL_CONST_WIDTH 256
+#define VOXEL_LAND_MATERIAL_OCTAVE_TEXELS 7
+#define VOXEL_LAND_MATERIAL_NO_LAKE -60000.0f
+
+// Scalar indices (float units; texel = index / 4).
+#define VOXEL_LAND_MC_N 0
+#define VOXEL_LAND_MC_PAD 1
+#define VOXEL_LAND_MC_HAS_FLOW 2
+#define VOXEL_LAND_MC_CELL_M 3
+#define VOXEL_LAND_MC_GULLY_STRENGTH 4
+#define VOXEL_LAND_MC_GULLY_OCTAVES 5
+#define VOXEL_LAND_MC_GULLY_FLOW_GAIN 6
+#define VOXEL_LAND_MC_GULLY_DETAIL 7
+#define VOXEL_LAND_MC_GULLY_SEED 8          // two (low, high 16 bits)
+#define VOXEL_LAND_MC_WARP_OCTAVES 10
+#define VOXEL_LAND_MC_WARP_INV_NORM 11
+#define VOXEL_LAND_MC_WARP_AMPLITUDE 12
+#define VOXEL_LAND_MC_DETAIL_AMPLITUDE 13
+#define VOXEL_LAND_MC_HEIGHT_OFFSET 14      // double-float: two
+#define VOXEL_LAND_MC_PLANET_RADIUS 16      // two
+#define VOXEL_LAND_MC_NOISE_AMPLITUDE 18    // two
+#define VOXEL_LAND_MC_INV_NORM_DETAIL 20    // two
+#define VOXEL_LAND_MC_RIDGE_GAIN 22
+#define VOXEL_LAND_MC_SLOPE_DAMPING 23
+#define VOXEL_LAND_MC_CONTINENT_OCTAVES 24
+#define VOXEL_LAND_MC_MOUNTAIN_OCTAVES 25
+#define VOXEL_LAND_MC_DETAIL_OCTAVES 26
+#define VOXEL_LAND_MC_LAND_MODE 27
+#define VOXEL_LAND_MC_PLATE_COUNT 28
+#define VOXEL_LAND_MC_PLATE_SEED 29         // two
+#define VOXEL_LAND_MC_HAS_HYDRO 31
+#define VOXEL_LAND_MC_TAN_BASE 32           // texel offsets
+#define VOXEL_LAND_MC_OCTAVE_BASE 33
+#define VOXEL_LAND_MC_PLATE_BASE 34
+#define VOXEL_LAND_MC_SIDE 35
+#define VOXEL_LAND_MC_PLATE_RADIUS_M 36     // the plate model's warp (the plates view)
+#define VOXEL_LAND_MC_PLATE_WIDTH_SCALE 37
+#define VOXEL_LAND_MC_HILL_RELIEF 38        // the hills (VoxelLandHills.ush)
+#define VOXEL_LAND_MC_HILL_FREQUENCY 39     // double-float: two
+#define VOXEL_LAND_MC_HILL_OCTAVES 41
+#define VOXEL_LAND_MC_HILL_SEED 42          // two
+#define VOXEL_LAND_MC_HAS_FORM 44
+#define VOXEL_LAND_MC_PEAK_STRENGTH 45      // the peaks (VoxelLandPeaks.ush)
+#define VOXEL_LAND_MC_PEAK_TEXELS_PER_CELL 46
+#define VOXEL_LAND_MC_PEAK_SEED 47          // two
+#define VOXEL_LAND_MC_NOISE_N 49            // the noise set (VoxelLandNoise.ush)
+#define VOXEL_LAND_MC_NOISE_MIPS 50
+#define VOXEL_LAND_MC_PEAK_SPACING_M 51
+#define VOXEL_LAND_MC_PEAK_MEAN_R 52
+#define VOXEL_LAND_MC_PEAK_MEAN_G 53
+#define VOXEL_LAND_MC_NOISE_SHIFT 54        // log2 RowN: the noise texture's rows (VoxelLandMaterialAccess.ush)
+#define VOXEL_LAND_MC_PEAK_RELIEF_M 55
+#define VOXEL_LAND_MC_PEAK_SCALE_G 56
+#define VOXEL_LAND_MC_PEAK_SCALE_B 57
+#define VOXEL_LAND_MC_PEAK_SCALE_R 58
+#define VOXEL_LAND_MC_DETAIL_BASE 59  // the detail set (T3e's tile; N1 the planet's set): two
+#define VOXEL_LAND_MC_DETAIL_N 61
+#define VOXEL_LAND_MC_DETAIL_MIPS 62
+#define VOXEL_LAND_MC_PEAK_DETAIL_TEXELS_PER_CELL 63
+#define VOXEL_LAND_MC_DETAIL_MEAN_HARD 64
+#define VOXEL_LAND_MC_DETAIL_MEAN_SOFT 65
+#define VOXEL_LAND_MC_PEAK_DETAIL_SCALE_HARD 66
+#define VOXEL_LAND_MC_PEAK_DETAIL_SCALE_SOFT 67
+#define VOXEL_LAND_MC_PEAK_DETAIL_FADE 68
+#define VOXEL_LAND_MC_HILL_BASE 69  // the hills' set (T4a): two
+#define VOXEL_LAND_MC_HILL_N 71
+#define VOXEL_LAND_MC_HILL_MIPS 72
+#define VOXEL_LAND_MC_HILL_TEXELS_PER_CELL 73
+#define VOXEL_LAND_MC_HILL_SCALE_R 74
+#define VOXEL_LAND_MC_HILL_SCALE_G 75
+#define VOXEL_LAND_MC_HILL_SCALE_B 76
+#define VOXEL_LAND_MC_HILL_SPACING_M 77
+#define VOXEL_LAND_MC_HILL_SWELL_TEXELS_PER_CELL 78
+#define VOXEL_LAND_MC_HILL_SWELL_M 79
+#define VOXEL_LAND_MC_HILL_SWELL_SCALE_G 80
+#define VOXEL_LAND_MC_HILL_DETAIL_TEXELS_PER_CELL 81
+#define VOXEL_LAND_MC_HILL_DETAIL_SCALE_HARD 82
+#define VOXEL_LAND_MC_HILL_DETAIL_SCALE_SOFT 83
+#define VOXEL_LAND_MC_HILL_DETAIL_FADE 84
+#define VOXEL_LAND_MC_HILL_FOOTHILL 85      // T4b
+#define VOXEL_LAND_MC_PEAK_RELIEF_START 86  // T4b
+#define VOXEL_LAND_MC_PEAK_RELIEF_END 87
+#define VOXEL_LAND_MC_STRATA_BASE 88  // the strata (T4c): two
+#define VOXEL_LAND_MC_STRATA_N 90
+#define VOXEL_LAND_MC_STRATA_MIPS 91
+#define VOXEL_LAND_MC_STRATA_TEXELS_PER_CELL 92
+#define VOXEL_LAND_MC_STRATA_SCALE_R 93
+#define VOXEL_LAND_MC_STRATA_SCALE_G 94
+#define VOXEL_LAND_MC_STRATA_SCALE_B 95
+#define VOXEL_LAND_MC_STRATA_SPACING_M 96
+#define VOXEL_LAND_MC_STRATA_RELIEF 97
+#define VOXEL_LAND_MC_STRATA_FLAT 98
+#define VOXEL_LAND_MC_STRATA_THRESHOLD 99
+#define VOXEL_LAND_MC_STRATA_WIDTH 100
+#define VOXEL_LAND_MC_STRATA_SEED 101  // two
+#define VOXEL_LAND_MC_STRATA_DETAIL_TEXELS_PER_CELL 103
+#define VOXEL_LAND_MC_STRATA_DETAIL_SCALE_HARD 104
+#define VOXEL_LAND_MC_STRATA_DETAIL_SCALE_SOFT 105
+#define VOXEL_LAND_MC_STRATA_DETAIL_FADE 106
+#define VOXEL_LAND_MC_RIVER_TILES_PER_FACE 107   // the rivers (R1; 0: none)
+#define VOXEL_LAND_MC_RIVER_RADIUS_M 108
+#define VOXEL_LAND_MC_RIVER_WIDTH_SCALE 109
+#define VOXEL_LAND_MC_RIVER_VALLEY_SCALE 110
+#define VOXEL_LAND_MC_RIVER_TILE_TEXEL 111      // texel offsets: the tiles' block starts (4 a texel),
+#define VOXEL_LAND_MC_RIVER_DATA_TEXEL 112      // the segments and the tile blocks (4 floats a texel)
+#define VOXEL_LAND_MC_RIVER_CARVE 113        // the rivers' and lakes' carve (R2, VoxelLandCarve.ush)
+#define VOXEL_LAND_MC_RIVER_DEPTH_SCALE 114
+#define VOXEL_LAND_MC_RIVER_FLOODPLAIN_SCALE 115
+#define VOXEL_LAND_MC_RIVER_MIN_LOG2_AREA 116
+#define VOXEL_LAND_MC_LAKE_SHORE_BAND 117
+#define VOXEL_LAND_MC_HAS_WATER 118          // 1: the field texture's lake levels are the bake's
+#define VOXEL_LAND_MC_RIVER_MEANDER 119      // R3: the meanders' swing, the knickpoints' falls
+#define VOXEL_LAND_MC_RIVER_FALLS 120
+#define VOXEL_LAND_MC_DETAIL_TEXELS_PER_CELL 121  // N1: the detail layer (VoxelLandDetail.ush; 0: none)
+#define VOXEL_LAND_MC_DETAIL_SCALES 122
+#define VOXEL_LAND_MC_DETAIL_MEAN_A 123
+#define VOXEL_LAND_MC_DETAIL_SCALE_A 124
+#define VOXEL_LAND_MC_DETAIL_FADE 125
+#define VOXEL_LAND_MC_DETAIL_SEED 126        // two
+#define VOXEL_LAND_MC_DETAIL_SCALE_GAIN 128
+#define VOXEL_LAND_MC_HILL_MEAN_R 129        // N1b: the sets' means for the face blend
+#define VOXEL_LAND_MC_HILL_MEAN_G 130
+#define VOXEL_LAND_MC_STRATA_MEAN_R 131
+#define VOXEL_LAND_MC_STRATA_MEAN_G 132
+#define VOXEL_LAND_MC_COUNT 133             // scalars in use (34 texels)
+#define VOXEL_LAND_MC_TEXELS 34
+
+#endif // VOXEL_LAND_MATERIAL_LAYOUT_USH

@@ -1,0 +1,161 @@
+// VoxelOceanSpray.ush - The ocean's spray (stage W3x; Design/OceanWaves.md section 49): GodotOceanWaves'
+// sea spray (2Retr0; its sea_spray_particle.gdshader and sea_spray.gdshader), the particles' birth,
+// shape and look, shared by the GPU passes (VoxelOceanSpray.usf) and the harness (Tools/OceanHarness/
+// spray_check.cpp). Shared subset (VoxelShaderCompat.h): no out parameters, f-suffixed literals,
+// members not swizzles, every field set.
+//
+// WHAT IT IS (Godot's). Not many small droplets thrown by the wind (stages W3o to W3s) but a few
+// large soft splashes, each one billboard: born where the foam is dense (over FoamFrom, Godot's 0.9)
+// and the surface not steep (its normal's vertical over 0.92, the splash flattened toward 0.897),
+// riding the wave at its birth point (the surface's displacement there each frame, its horizontal
+// part three quarters), thrown up half a metre and sinking back under the water along a parabola
+// (-5 (2.5 t - 0.45)^2 S + 0.5 m, S its foam's and flatness's share), growing as a splash does
+// (its height an impulse peaking at a third of its life, its width log(1 + t)), up to 20 m wide
+// and 8.5 m tall where the foam is densest (times its size setting), living 3 s (less up to a
+// quarter: a shorter one smaller), dissolving through a scrolling noise from its first tenth
+// (exp_impulse(t, 10)) by a seed of its own. Godot's candidates are a grid of 32,768 over 150 m
+// square restarting every 6 s: 0.243 per square metre per second, of which those on dense foam live;
+// here they are born at that rate on the dense foam the view sees (VoxelOceanSpray.usf).
+//
+// Lengths: cm; time: s.
+
+#ifndef VOXEL_OCEAN_SPRAY_USH
+#define VOXEL_OCEAN_SPRAY_USH
+
+#ifndef VOXEL_FUNC
+#define VOXEL_FUNC
+#endif
+
+// Godot's: candidates per m^2 per s; the lifetime (s) and its randomness; the largest splash (cm);
+// the foam (its summed foam, ours the clipmap's raw foam) it rises from, and the normal's range.
+#define VOXEL_OCEAN_SPRAY_CANDIDATES 0.243f
+#define VOXEL_OCEAN_SPRAY_LIFETIME 3.0f
+#define VOXEL_OCEAN_SPRAY_LIFE_RANDOM 0.25f
+#define VOXEL_OCEAN_SPRAY_WIDTH 2000.0f
+#define VOXEL_OCEAN_SPRAY_HEIGHT 850.0f
+#define VOXEL_OCEAN_SPRAY_FOAM_SPAN 0.1f
+#define VOXEL_OCEAN_SPRAY_NORMAL_FROM 0.92f
+#define VOXEL_OCEAN_SPRAY_NORMAL_TO 0.99f
+// The most opaque a splash is (sea_spray.gdshader's max_alpha), and how fast it fades in near the
+// camera (1 - e^(-0.04 d), d in m).
+#define VOXEL_OCEAN_SPRAY_MAX_ALPHA 0.666f
+#define VOXEL_OCEAN_SPRAY_NEAR_FADE 0.0004f
+
+struct FVoxelOceanSprayParticle
+{
+    float3 Rest;        // cm (the frame's): its birth point at rest on the sea (the waves move it from there)
+    float Age;          // s
+    float3 Drawn;       // cm (the frame's): where it is drawn this frame (VoxelOceanSpray.usf's step)
+    float Life;         // s (0: none)
+    float Width;        // cm, its largest
+    float Height;       // cm, its largest
+    float Seed;         // 0 to 1 (its dissolve, its look)
+    float Arc;          // its rise's share (Godot's SCALE_FACTOR: the foam's and the flatness's)
+};
+
+VOXEL_FUNC FVoxelOceanSprayParticle VoxelOceanSprayNone()
+{
+    FVoxelOceanSprayParticle P;
+    P.Rest = float3(0.0f, 0.0f, 0.0f);
+    P.Age = 0.0f;
+    P.Drawn = float3(0.0f, 0.0f, 0.0f);
+    P.Life = 0.0f;
+    P.Width = 0.0f;
+    P.Height = 0.0f;
+    P.Seed = 0.0f;
+    P.Arc = 0.0f;
+    return P;
+}
+
+// Godot's exp_impulse (Inigo Quilez): k x e^(1 - k x), peaking at 1 where x = 1 / k.
+VOXEL_FUNC float VoxelOceanSprayImpulse(float X, float K)
+{
+    const float H = K * X;
+    return H * exp(1.0f - H);
+}
+
+// The splash's foam share (0.25 to 1) and flatness share (under 0: none is born; 0.25 to 1).
+VOXEL_FUNC float VoxelOceanSprayFoamFactor(float Foam, float FoamFrom)
+{
+    return 0.25f + 0.75f * min((Foam - FoamFrom) / VOXEL_OCEAN_SPRAY_FOAM_SPAN, 1.0f);
+}
+
+VOXEL_FUNC float VoxelOceanSprayNormalFactor(float NormalUp)
+{
+    return 0.25f + 0.75f * min((NormalUp - VOXEL_OCEAN_SPRAY_NORMAL_FROM) / (VOXEL_OCEAN_SPRAY_NORMAL_TO - VOXEL_OCEAN_SPRAY_NORMAL_FROM), 1.0f);
+}
+
+/** A splash born at Rest (its point at rest on the sea, cm) where the foam is Foam (the clipmap's
+ *  raw foam) and the surface's normal has NormalUp of the vertical; FoamFrom: the foam it rises from
+ *  (Godot's 0.9); Size: the size setting (1: Godot's); U0, U1: uniform randoms (its life, its seed).
+ *  Life 0 where none is born (the foam under FoamFrom, the surface too steep). */
+VOXEL_FUNC FVoxelOceanSprayParticle VoxelOceanSprayBirth(float3 Rest, float Foam, float NormalUp, float FoamFrom, float Size, float U0, float U1)
+{
+    FVoxelOceanSprayParticle P = VoxelOceanSprayNone();
+    const float NormalFactor = VoxelOceanSprayNormalFactor(NormalUp);
+    if (Foam <= FoamFrom || NormalFactor < 0.0f || NormalFactor > 1.0f) return P;
+    const float FoamFactor = VoxelOceanSprayFoamFactor(Foam, FoamFrom);
+    P.Rest = Rest;
+    P.Drawn = Rest;
+    P.Life = VOXEL_OCEAN_SPRAY_LIFETIME * (1.0f - VOXEL_OCEAN_SPRAY_LIFE_RANDOM * U0);
+    P.Width = VOXEL_OCEAN_SPRAY_WIDTH * FoamFactor * max(Size, 0.0f);
+    P.Height = VOXEL_OCEAN_SPRAY_HEIGHT * FoamFactor * NormalFactor * max(Size, 0.0f);
+    P.Seed = U1;
+    P.Arc = NormalFactor * FoamFactor;
+    return P;
+}
+
+/** Its life's share now (0 to 1). */
+VOXEL_FUNC float VoxelOceanSprayT(FVoxelOceanSprayParticle P)
+{
+    return P.Life > 0.0f ? clamp(P.Age / P.Life, 0.0f, 1.0f) : 1.0f;
+}
+
+/** Its rise over the surface now (cm): Godot's parabola, -5 (2.5 t - 0.45)^2 S + 0.5 m. */
+VOXEL_FUNC float VoxelOceanSprayRise(FVoxelOceanSprayParticle P)
+{
+    const float T = VoxelOceanSprayT(P);
+    const float X = 2.5f * T - 0.45f;
+    return 100.0f * (0.5f - 5.0f * X * X * P.Arc);
+}
+
+/** Its size now (cm): x across, y up. A shorter-lived one smaller (its life's share of the
+ *  lifetime, squared); its height an impulse (peaking at a third of its life), its width growing as
+ *  log(1 + t). */
+VOXEL_FUNC float2 VoxelOceanSpraySizeNow(FVoxelOceanSprayParticle P)
+{
+    const float T = VoxelOceanSprayT(P);
+    const float S = P.Life / VOXEL_OCEAN_SPRAY_LIFETIME;
+    return float2(P.Width * S * S * log(1.0f + T), P.Height * S * S * VoxelOceanSprayImpulse(T, 3.0f));
+}
+
+/** Its fade now (Godot's alpha_fade: in over its first tenth, out after). */
+VOXEL_FUNC float VoxelOceanSprayFade(FVoxelOceanSprayParticle P)
+{
+    return P.Life > 0.0f ? VoxelOceanSprayImpulse(VoxelOceanSprayT(P), 10.0f) : 0.0f;
+}
+
+/** Its dissolve at a point of it: the fade and its seed against the dissolve noise there (0 to 1;
+ *  Godot's max((alpha_fade + dissolve_factor) / 2 - noise, 0)). */
+VOXEL_FUNC float VoxelOceanSprayDissolve(float Fade, float Seed, float Noise)
+{
+    return max(0.5f * (Fade + Seed) - Noise, 0.0f);
+}
+
+/** Its fade near the camera (Godot's distance_fade, 1 - e^(-0.04 d), d in m): Distance cm. */
+VOXEL_FUNC float VoxelOceanSprayNear(float Distance)
+{
+    return 1.0f - exp(-VOXEL_OCEAN_SPRAY_NEAR_FADE * Distance);
+}
+
+/** A step of Dt (s): older, gone at the end of its life. */
+VOXEL_FUNC FVoxelOceanSprayParticle VoxelOceanSprayAge(FVoxelOceanSprayParticle In, float Dt)
+{
+    FVoxelOceanSprayParticle P = In;
+    if (P.Life <= 0.0f || Dt <= 0.0f) return P;
+    P.Age = P.Age + Dt;
+    if (P.Age >= P.Life) P.Life = 0.0f;
+    return P;
+}
+
+#endif

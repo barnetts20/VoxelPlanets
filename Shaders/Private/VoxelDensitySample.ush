@@ -1,0 +1,346 @@
+// VoxelDensitySample.ush - The planet density at a lattice point, in double-float precision:
+// what FVoxelDensityCPU::Sample computes in double, for the GPU. Shared subset (see
+// VoxelShaderCompat.h), so the C++ tests run it against the CPU backend.
+//
+// Include after VoxelDensityCore.ush, VoxelDF64.ush, VoxelCubeSphere.ush,
+// VoxelLandParameters.ush, VoxelLandSample.ush and VoxelLandGully.ush, and after declaring the
+// inputs below
+// (shader parameters on the GPU, globals in the C++ tests). Octave tables and every constant
+// come from FVoxelDensityCPU::BuildGPUData, so both backends evaluate the same octaves with
+// the same seeds, offsets, amplitudes and band limits.
+//
+// With LandMode 1 (the terrestrial generator) the height is the land bake's
+// (VoxelLandSample.ush) through the sampling warp, plus the gullies (VoxelLandGully.ush) and
+// the detail layer (VoxelLandDetail.ush: the pack's detail set since N1), offset to the height
+// above PlanetRadius (FVoxelDensityCPU::LandHeightAt); the continent, mountain and detail
+// octave layers are empty (DetailOctaves 0) and the octave table holds the warp's.
+//
+//   StructuredBuffer<FVoxelOctave> Octaves;      continent, mountain, detail, then the land warp's octaves
+//                                                (the warp's alone in land mode)
+//   uint ContinentOctaves, MountainOctaves, DetailOctaves;
+//   float2 InvNormContinent, InvNormMountain, InvNormDetail;   (double-float)
+//   float2 PlanetRadius, NoiseAmplitude, HalfFinest;
+//   float2 ContinentWeight, MountainWeight, MountainStart, MountainBlend, DetailWeight;
+//   float RidgeGain, SlopeDamping;
+
+#ifndef VOXEL_DENSITY_SAMPLE_USH
+#define VOXEL_DENSITY_SAMPLE_USH
+
+#include "VoxelLandAccess.ush"
+
+// Sum of one layer's octaves before normalisation, and its gradient (per cm; plain layers
+// only, for the land warp's Jacobian). SP is the point on the planet sphere.
+struct FVoxelLayerSum
+{
+    float2 Sum;
+    float3 Gradient;
+};
+
+/** An octave's lattice cell and the fraction inside it, at SP: from the layer's fixed-point
+ *  coordinate (FX, FY, FZ, when the layer has one) or in double-float. */
+struct FVoxelLatticePoint
+{
+    uint3 Cell;
+    float3 Frac;
+};
+
+VOXEL_FUNC FVoxelLatticePoint VoxelLayerLattice(bool bFixed, FVoxelFixed FX, FVoxelFixed FY, FVoxelFixed FZ, FVoxelOctave Oct,
+    float2 SPX, float2 SPY, float2 SPZ)
+{
+    FVoxelLatticePoint P;
+    if (bFixed)
+    {
+        const FVoxelFixed LX = VoxelFixedLattice(FX, Oct.Shift, Oct.OffsetCellX, Oct.OffsetFracX);
+        const FVoxelFixed LY = VoxelFixedLattice(FY, Oct.Shift, Oct.OffsetCellY, Oct.OffsetFracY);
+        const FVoxelFixed LZ = VoxelFixedLattice(FZ, Oct.Shift, Oct.OffsetCellZ, Oct.OffsetFracZ);
+        P.Cell = uint3(LX.Cell, LY.Cell, LZ.Cell);
+        P.Frac = float3(VoxelFixedFraction(LX.Frac), VoxelFixedFraction(LY.Frac), VoxelFixedFraction(LZ.Frac));
+    }
+    else
+    {
+        const FVoxelLatticeSplit LX = VoxelDFLatticeSplit(VoxelDFAdd(VoxelDFMul(SPX, Oct.Frequency), Oct.OffsetX));
+        const FVoxelLatticeSplit LY = VoxelDFLatticeSplit(VoxelDFAdd(VoxelDFMul(SPY, Oct.Frequency), Oct.OffsetY));
+        const FVoxelLatticeSplit LZ = VoxelDFLatticeSplit(VoxelDFAdd(VoxelDFMul(SPZ, Oct.Frequency), Oct.OffsetZ));
+        P.Cell = uint3(asuint(LX.Cell), asuint(LY.Cell), asuint(LZ.Cell));
+        P.Frac = float3(LX.Frac, LY.Frac, LZ.Frac);
+    }
+    return P;
+}
+
+/** The layer's fixed-point coordinate (lacunarity 2: the finest octave's, once; each octave
+ *  shifts it), when its first octave has one. */
+struct FVoxelLayerFixed
+{
+    bool bFixed;
+    FVoxelFixed X;
+    FVoxelFixed Y;
+    FVoxelFixed Z;
+};
+
+VOXEL_FUNC FVoxelLayerFixed VoxelLayerFixedAt(VOXEL_LAND_ARGS_DECL uint First, uint Count, float2 SPX, float2 SPY, float2 SPZ)
+{
+    FVoxelLayerFixed L;
+    L.bFixed = VOXEL_OCTAVE(First).Shift != VoxelNoFixedPoint;
+    L.X.Cell = 0u; L.X.Frac = 0u;
+    L.Y = L.X;
+    L.Z = L.X;
+    if (L.bFixed)
+    {
+        const float2 Finest = VOXEL_OCTAVE(First + Count - 1u).Frequency;
+        L.X = VoxelDFToFixed(VoxelDFMul(SPX, Finest));
+        L.Y = VoxelDFToFixed(VoxelDFMul(SPY, Finest));
+        L.Z = VoxelDFToFixed(VoxelDFMul(SPZ, Finest));
+    }
+    return L;
+}
+
+VOXEL_FUNC FVoxelLayerSum VoxelLayerSumGradDF(VOXEL_LAND_ARGS_DECL uint First, uint Count, uint Kind, float2 SPX, float2 SPY, float2 SPZ, float Footprint)
+{
+    FVoxelFbmState State = VoxelFbmBegin();
+    FVoxelLayerSum Out;
+    Out.Sum = float2(0.0f, 0.0f);
+    Out.Gradient = float3(0.0f, 0.0f, 0.0f);
+    if (Count == 0u) return Out;
+
+    const FVoxelLayerFixed L = VoxelLayerFixedAt(VOXEL_LAND_ARGS First, Count, SPX, SPY, SPZ);
+    for (uint o = 0u; o < Count; o++)
+    {
+        const FVoxelOctave Oct = VOXEL_OCTAVE(First + o);
+        const float Band = VoxelOctaveBandWeight(Oct.Wavelength, Footprint);
+        if (Band <= 0.0f) break;
+
+        const FVoxelLatticePoint P = VoxelLayerLattice(L.bFixed, L.X, L.Y, L.Z, Oct, SPX, SPY, SPZ);
+        const FVoxelNoiseSample N = VoxelGradientNoise(P.Cell, P.Frac, Oct.Seed);
+
+        // Each octave's contribution is taken from a zeroed float sum and added in
+        // double-float, as the CPU adds them in double.
+        State.Sum = 0.0f;
+        State = VoxelLayerOctave(State, Kind, N, Oct.Amplitude * Band, RidgeGain, SlopeDamping);
+        Out.Sum = VoxelDFAdd(Out.Sum, float2(State.Sum, 0.0f));
+        Out.Gradient = Out.Gradient + N.Gradient * (Oct.Amplitude * Band * Oct.Frequency.x);
+    }
+    return Out;
+}
+
+VOXEL_FUNC float2 VoxelLayerSumDF(VOXEL_LAND_ARGS_DECL uint First, uint Count, uint Kind, float2 SPX, float2 SPY, float2 SPZ, float Footprint)
+{
+    return VoxelLayerSumGradDF(VOXEL_LAND_ARGS First, Count, Kind, SPX, SPY, SPZ, Footprint).Sum;
+}
+
+// The land bake's sampling warp at the sphere point SP (every octave: the warp doesn't change
+// with the footprint): the warped point Q where the bake is read, and the gradients of the
+// warp's components (dimensionless) for the gullies' steering (VoxelLandWarpedGradient).
+struct FVoxelLandWarp
+{
+    float2 QX;
+    float2 QY;
+    float2 QZ;
+    float3 DWX;
+    float3 DWY;
+    float3 DWZ;
+};
+
+VOXEL_FUNC FVoxelLandWarp VoxelLandWarpDF(VOXEL_LAND_ARGS_DECL float2 SPX, float2 SPY, float2 SPZ)
+{
+    FVoxelLandWarp Out;
+    Out.QX = SPX;
+    Out.QY = SPY;
+    Out.QZ = SPZ;
+    Out.DWX = float3(0.0f, 0.0f, 0.0f);
+    Out.DWY = Out.DWX;
+    Out.DWZ = Out.DWX;
+    if (LandWarpAmplitude <= 0.0f) return Out;
+    const uint WarpFirst = ContinentOctaves + MountainOctaves + DetailOctaves;
+    const FVoxelLayerSum WX = VoxelLayerSumGradDF(VOXEL_LAND_ARGS WarpFirst, LandWarpOctaves, VoxelLayerPlain, SPX, SPY, SPZ, 0.0f);
+    const FVoxelLayerSum WY = VoxelLayerSumGradDF(VOXEL_LAND_ARGS WarpFirst + LandWarpOctaves, LandWarpOctaves, VoxelLayerPlain, SPX, SPY, SPZ, 0.0f);
+    const FVoxelLayerSum WZ = VoxelLayerSumGradDF(VOXEL_LAND_ARGS WarpFirst + 2u * LandWarpOctaves, LandWarpOctaves, VoxelLayerPlain, SPX, SPY, SPZ, 0.0f);
+    const float WarpScale = LandWarpAmplitude * LandWarpInvNorm;
+    Out.QX = VoxelDFAdd(SPX, float2(WarpScale * (WX.Sum.x + WX.Sum.y), 0.0f));
+    Out.QY = VoxelDFAdd(SPY, float2(WarpScale * (WY.Sum.x + WY.Sum.y), 0.0f));
+    Out.QZ = VoxelDFAdd(SPZ, float2(WarpScale * (WZ.Sum.x + WZ.Sum.y), 0.0f));
+    Out.DWX = WX.Gradient * WarpScale;
+    Out.DWY = WY.Gradient * WarpScale;
+    Out.DWZ = WZ.Gradient * WarpScale;
+    return Out;
+}
+
+// The terrestrial surface at the point LP on the sea-level sphere (double-float, cm, planet
+// frame): the bake through the sampling warp, the hills, the peaks, the gullies, the rivers' and
+// lakes' carve (VoxelLandCarve.ush, R2) and the detail layer, as the density adds them. Height is cm above PlanetRadius (double-float, before the density's clamp to
+// [0, NoiseAmplitude]); the terms are m. bGradient (a constant: dropped when false) adds the
+// bake's exact gradient through the warp (m/m, a tangent vector at LP) and the drainage, for the
+// terrain material (VoxelLandMaterial.ush), and the detail layer's exact gradient at fixed
+// amplitude (VoxelLandDetailDF: the detail set's B-splines), and the hills' and the peaks' at
+// their amplitudes (VoxelLandHills.ush, VoxelLandPeaks.ush; their change, like the detail's, is
+// left to differences). The carve scales all of those but the detail's (CarveScale) and adds its
+// own (CarveGradient). The gullies'
+// gradient is not given:
+// its analytic form leaves out terms of the same size as it keeps (the steering's turn, the
+// octaves' slope-dependent depths), so the material takes it, and the change of the detail's
+// amplitude (by the bake's height near the coast), from screen-space changes instead.
+struct FVoxelLandHeight
+{
+    float2 Height;
+    float Bake;
+    float Hills;            // m
+    float HillUnit;         // the hills per metre of amplitude (Hills = HillUnit x HillAmplitudeM)
+    float HillAmplitudeM;   // m
+    float3 HillGradient;    // m/m at LP, tangent, at the hills' amplitude
+    float Peaks;            // m
+    float PeakUnit;         // Peaks = PeakUnit x PeakAmplitudeM
+    float PeakAmplitudeM;   // m
+    float3 PeakGradient;    // m/m at LP, tangent, at the peaks' amplitude
+    float Gully;
+    float Detail;
+    float GullyScale;
+    float Flow;
+    float3 BakeGradient;
+    float3 Warped;      // the bake's direction after the sampling warp (unit)
+    float DetailScale;  // FVoxelLandSurface::DetailScale
+    float3 DetailGradient;  // bGradient: the detail's gradient at its amplitude (m/m, at LP, tangent)
+    float DetailUnit;       // the detail per metre of amplitude (Detail = DetailUnit x DetailAmplitudeM)
+    float DetailAmplitudeM; // m
+    float Carve;            // m: the rivers' and lakes' carve of Bake + Hills + Peaks + Gully (R2)
+    float CarveScale;       // bGradient: d (that sum carved) / d (that sum)
+    float3 CarveGradient;   // bGradient: the carve's own gradient (m/m at LP, tangent)
+};
+
+VOXEL_FUNC FVoxelLandHeight VoxelLandHeightDF(VOXEL_LAND_ARGS_DECL float2 LPX, float2 LPY, float2 LPZ, float Footprint, bool bGradient)
+{
+    const FVoxelLandWarp Warp = VoxelLandWarpDF(VOXEL_LAND_ARGS LPX, LPY, LPZ);
+    const FVoxelLandSurface Land = VoxelLandSurfaceDF(VOXEL_LAND_ARGS LPX, LPY, LPZ, Warp.QX, Warp.QY, Warp.QZ, Warp.DWX, Warp.DWY, Warp.DWZ,
+        Footprint, bGradient);
+
+    // Detail (VoxelLandDetail.ush), a quarter as strong under the sea and scaled by
+    // GullyDetailScale on land while there are gullies.
+    const float SeaWeight = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, Land.Bake));
+    const FVoxelLandDetail Detail = VoxelLandDetailDF(VOXEL_LAND_ARGS LPX, LPY, LPZ, Footprint, bGradient);
+    const float DetailAmplitude = LandDetailAmplitude * SeaWeight * Land.DetailScale;
+    float2 Total = VoxelDFAdd(VoxelDFAdd(VoxelDFMulFloat(float2(Land.Bake, 0.0f), 100.0f), LandHeightOffset),
+        VoxelDFMulFloat(float2(Detail.Unit, 0.0f), DetailAmplitude));
+    Total = VoxelDFAdd(Total, VoxelDFMulFloat(float2(Land.Hills, 0.0f), 100.0f));
+    Total = VoxelDFAdd(Total, VoxelDFMulFloat(float2(Land.Peaks, 0.0f), 100.0f));
+    Total = VoxelDFAdd(Total, VoxelDFMulFloat(float2(Land.Gully, 0.0f), 100.0f));
+    Total = VoxelDFAdd(Total, VoxelDFMulFloat(float2(Land.Carve, 0.0f), 100.0f));
+
+    FVoxelLandHeight Out;
+    Out.Height = Total;
+    Out.Bake = Land.Bake;
+    Out.Hills = Land.Hills;
+    Out.HillUnit = Land.HillUnit;
+    Out.HillAmplitudeM = Land.HillAmplitudeM;
+    Out.HillGradient = Land.HillGradient;
+    Out.Peaks = Land.Peaks;
+    Out.PeakUnit = Land.PeakUnit;
+    Out.PeakAmplitudeM = Land.PeakAmplitudeM;
+    Out.PeakGradient = Land.PeakGradient;
+    Out.Gully = Land.Gully;
+    Out.Detail = Detail.Unit * DetailAmplitude * 0.01f;
+    Out.GullyScale = Land.GullyScale;
+    Out.Flow = Land.Flow;
+    Out.BakeGradient = Land.BakeGradient;
+    Out.Warped = normalize(float3(Warp.QX.x, Warp.QY.x, Warp.QZ.x));
+    Out.DetailScale = Land.DetailScale;
+    Out.DetailUnit = Detail.Unit;
+    Out.DetailAmplitudeM = DetailAmplitude * 0.01f;
+    // Per m of the unit, times m of amplitude: m/m.
+    Out.DetailGradient = Detail.Gradient * (DetailAmplitude * 0.01f);
+    Out.Carve = Land.Carve;
+    Out.CarveScale = Land.CarveScale;
+    Out.CarveGradient = Land.CarveGradient;
+    return Out;
+}
+
+/** The terms VoxelLandHeightDF leaves to differences (the gullies, m, and the detail's, the
+ *  hills' and the peaks' amplitudes, m: they follow the bake's height near the coast, the hills
+ *  and peaks also the landform, the relief and the drainage, the detail and the hills the
+ *  rivers' and lakes' fades), computed as it computes them, at LP (on the sea-level sphere).
+ *  For the terrain material's normal close up, where it differences them over a fixed step
+ *  rather than a pixel, and the land surface cache. */
+struct FVoxelLandDifferenced
+{
+    float Gully;
+    float DetailAmplitudeM;
+    float HillAmplitudeM;
+    float PeakAmplitudeM;
+};
+
+VOXEL_FUNC FVoxelLandDifferenced VoxelLandDifferencedDF(VOXEL_LAND_ARGS_DECL float2 LPX, float2 LPY, float2 LPZ, float Footprint)
+{
+    const FVoxelLandWarp Warp = VoxelLandWarpDF(VOXEL_LAND_ARGS LPX, LPY, LPZ);
+    // The peaks' shape isn't needed: only their amplitude and their steering of the gullies (the
+    // set's steering channel alone).
+    const FVoxelLandSurface Land = VoxelLandSurfaceTermsDF(VOXEL_LAND_ARGS LPX, LPY, LPZ, Warp.QX, Warp.QY, Warp.QZ, Warp.DWX, Warp.DWY, Warp.DWZ,
+        Footprint, true, false);
+    const float SeaWeight = lerp(0.25f, 1.0f, smoothstep(-50.0f, 50.0f, Land.Bake));
+    FVoxelLandDifferenced Out;
+    Out.Gully = Land.Gully;
+    Out.DetailAmplitudeM = LandDetailAmplitude * SeaWeight * Land.DetailScale * 0.01f;
+    Out.HillAmplitudeM = Land.HillAmplitudeM;
+    Out.PeakAmplitudeM = Land.PeakAmplitudeM;
+    return Out;
+}
+
+// Density (negative = solid, cm) at lattice point Index (half finest cells from the root
+// centre), with octaves finer than Footprint (cm) left out. Edits are not included.
+VOXEL_FUNC float VoxelSampleDensityDF(VOXEL_LAND_ARGS_DECL int IndexX, int IndexY, int IndexZ, float Footprint)
+{
+    const float2 PX = VoxelDFMul(VoxelDFFromInt(IndexX), HalfFinest);
+    const float2 PY = VoxelDFMul(VoxelDFFromInt(IndexY), HalfFinest);
+    const float2 PZ = VoxelDFMul(VoxelDFFromInt(IndexZ), HalfFinest);
+    const float2 Radius = VoxelDFSqrt(VoxelDFAdd(VoxelDFAdd(VoxelDFMul(PX, PX), VoxelDFMul(PY, PY)), VoxelDFMul(PZ, PZ)));
+
+    float2 Height = float2(0.0f, 0.0f);
+    if (Radius.x > 1.0e-6f && NoiseAmplitude.x > 0.0f)
+    {
+        const float2 Scale = VoxelDFDiv(PlanetRadius, Radius);
+        const float2 SPX = VoxelDFMul(PX, Scale);
+        const float2 SPY = VoxelDFMul(PY, Scale);
+        const float2 SPZ = VoxelDFMul(PZ, Scale);
+
+        if (LandMode != 0u)
+        {
+            // The layers on the sea-level sphere (PlanetRadius is the bottom of the height range,
+            // which moves with their amplitudes: FVoxelDensityCPU's terrestrial constructor).
+            const float2 LandScale = VoxelDFDiv(VoxelDFAdd(PlanetRadius, LandHeightOffset), Radius);
+            const float2 LPX = VoxelDFMul(PX, LandScale);
+            const float2 LPY = VoxelDFMul(PY, LandScale);
+            const float2 LPZ = VoxelDFMul(PZ, LandScale);
+            float2 Total = VoxelLandHeightDF(VOXEL_LAND_ARGS LPX, LPY, LPZ, Footprint, false).Height;
+            // Within [0, NoiseAmplitude], as FVoxelDensityCPU::LandHeightAt clamps.
+            if (Total.x < 0.0f || (Total.x == 0.0f && Total.y < 0.0f)) Total = float2(0.0f, 0.0f);
+            if (Total.x > NoiseAmplitude.x || (Total.x == NoiseAmplitude.x && Total.y > NoiseAmplitude.y)) Total = NoiseAmplitude;
+            Height = Total;
+        }
+        else
+        {
+            const float2 C = VoxelDFMul(VoxelLayerSumDF(VOXEL_LAND_ARGS 0u, ContinentOctaves, VoxelLayerPlain, SPX, SPY, SPZ, Footprint), InvNormContinent);
+            const float2 R = VoxelDFMul(VoxelLayerSumDF(VOXEL_LAND_ARGS ContinentOctaves, MountainOctaves, VoxelLayerRidged, SPX, SPY, SPZ, Footprint), InvNormMountain);
+            const float2 D = VoxelDFMul(VoxelLayerSumDF(VOXEL_LAND_ARGS ContinentOctaves + MountainOctaves, DetailOctaves, VoxelLayerDamped, SPX, SPY, SPZ, Footprint), InvNormDetail);
+
+            // FVoxelDensityCPU::HeightAt.
+            const float2 Base = VoxelDFAdd(float2(0.5f, 0.0f), VoxelDFMulFloat(VoxelDFMul(ContinentWeight, C), 0.5f));
+            const float2 T = VoxelDFClamp01(VoxelDFDiv(VoxelDFSub(C, MountainStart), MountainBlend));
+            const float2 Mask = VoxelDFMul(VoxelDFMul(T, T), VoxelDFSub(float2(3.0f, 0.0f), VoxelDFMulFloat(T, 2.0f)));
+            const float2 Mountains = VoxelDFMul(VoxelDFMul(MountainWeight, Mask), R);
+            const float2 Details = VoxelDFMul(DetailWeight, D);
+            Height = VoxelDFMul(NoiseAmplitude, VoxelDFClamp01(VoxelDFAdd(VoxelDFAdd(Base, Mountains), Details)));
+        }
+    }
+
+    const float2 Surface = VoxelDFSub(Radius, VoxelDFAdd(PlanetRadius, Height));
+    return VoxelComposeTerrain(Surface.x + Surface.y, VoxelCaveDensity());
+}
+
+// |p| - R at lattice point Index, no noise: checks the double-float position path alone.
+VOXEL_FUNC float VoxelRadialDF(VOXEL_LAND_ARGS_DECL int IndexX, int IndexY, int IndexZ)
+{
+    const float2 PX = VoxelDFMul(VoxelDFFromInt(IndexX), HalfFinest);
+    const float2 PY = VoxelDFMul(VoxelDFFromInt(IndexY), HalfFinest);
+    const float2 PZ = VoxelDFMul(VoxelDFFromInt(IndexZ), HalfFinest);
+    const float2 Radius = VoxelDFSqrt(VoxelDFAdd(VoxelDFAdd(VoxelDFMul(PX, PX), VoxelDFMul(PY, PY)), VoxelDFMul(PZ, PZ)));
+    const float2 Height = VoxelDFSub(Radius, PlanetRadius);
+    return Height.x + Height.y;
+}
+
+#endif // VOXEL_DENSITY_SAMPLE_USH

@@ -1,0 +1,544 @@
+// VoxelOceanPixelClip.ush - The wave clipmap at a pixel (stages O9k, O9l, W1; VoxelOceanClip.ush):
+// the surface's normal, the slope variance it leaves out and the foam, from the clipmap's levels of
+// the pixel's footprint, with the FFT bands' slope the clipmap can't hold added on top. No material
+// types: the ocean material's pixel node (VoxelOcean.ush, VoxelOceanPixelClip and
+// VoxelOceanPixelClipDetail) and the ocean's own pass (stage W3, VoxelOceanSurfacePass.usf) both
+// call these, so the surface the pass shades is the one the material shaded.
+
+#pragma once
+
+#include "/Plugin/VoxelPlanets/Private/VoxelOceanVertexCore.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelOceanClip.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelOceanClipShore.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelOceanFoamLace.ush"
+
+// The wave clipmap at a pixel: the normal and the slope variance it leaves out (planet frame), the
+// foam, the levels' footprint there (cm: the blend's, the finer level's spacing times
+// 2^(1 - weight)), whether any level held the point.
+struct FVoxelOceanPixelClipOut
+{
+    float3 Normal;
+    float SlopeVariance;
+    float Foam;
+    float Spacing;
+    float Valid;
+    float Height;       // stage W3h: the surface's height over the sea sphere there (cm; the levels' blend)
+    float Cover;        // stage W6e: the levels' share of the point (their weights: 0 past the outermost level's reach, fading in over its edge)
+};
+
+// Stage W3u: a clipmap texture at a pick (VoxelOceanClipSample), each level's lookup toward its
+// cubic B-spline (VoxelOceanCubic.ush) by how far the footprint magnifies its texels, with CubicOn
+// (0: bilinear, as VoxelOceanClipSample). Size: the levels' texels across (F.Size); Footprint: the
+// pixel's narrower axis (cm: across a grazing view the level the longer axis picks is magnified).
+float4 VoxelOceanClipSampleFiltered(Texture2DArray Levels, SamplerState Sampler, FVoxelOceanClipPick P, Texture2D ClipInfo, float Size, float Footprint,
+    float CubicOn)
+{
+    if (P.Level < 0) return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float Cubic = 0.0f;
+    float CubicNext = 0.0f;
+    if (CubicOn > 0.5f)
+    {
+        const float Spacing = VoxelOceanClipLevelOfTexture(ClipInfo, P.Level).Spacing;
+        Cubic = VoxelOceanCubicShareOf(Spacing / max(Footprint, 1.0e-3f));
+        CubicNext = VoxelOceanCubicShareOf(2.0f * Spacing / max(Footprint, 1.0e-3f));
+    }
+    const float4 A = VoxelOceanSampleArrayCubic(Levels, Sampler, P.UV.xy, P.UV.z, 0.0f, Size, Cubic);
+    float4 B = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (P.Weight < 1.0f && P.NextValid > 0.5f)
+        B = VoxelOceanSampleArrayCubic(Levels, Sampler, P.UVNext.xy, P.UVNext.z, 0.0f, Size, CubicNext);
+    return A * P.Weight + B * (1.0f - P.Weight);
+}
+
+// The clipmap at a pixel, its lookups toward the cubic where they're magnified with CubicOn (stage
+// W3u; VoxelOceanPixelClipOf: bilinear), judged by CubicFootprint (the pixel's narrower axis, cm).
+// (Stage W6i: at a pick made already, VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint): the
+// anisotropic taps share theirs with the whitecaps' lookups.)
+FVoxelOceanPixelClipOut VoxelOceanPixelClipFilteredAtPick(FVoxelOceanClipPick Pick, float3 X, float3 UpP, float Footprint, float CubicFootprint,
+    Texture2DArray ClipDisplacement, Texture2DArray ClipNormal, SamplerState ClipNormalSampler, Texture2D ClipInfo, float CubicOn)
+{
+    FVoxelOceanPixelClipOut O;
+    O.Normal = UpP;
+    O.SlopeVariance = 0.0f;
+    O.Foam = 0.0f;
+    O.Spacing = 0.0f;
+    O.Valid = 0.0f;
+    O.Height = 0.0f;
+    O.Cover = 0.0f;
+    const FVoxelOceanClipFrame F = VoxelOceanClipFrameOfTexture(ClipInfo);
+    const int Count = clamp(int(F.Count + 0.5f), 0, VOXEL_OCEAN_CLIP_MAX_LEVELS);
+    if (Count <= 0) return O;
+    const FVoxelOceanClipLevel L0 = VoxelOceanClipLevelOfTexture(ClipInfo, 0);
+    if (Pick.Level < 0)
+    {
+        // Past the outermost level: its slope at its reach's edge as roughness.
+        const FVoxelOceanClipLevel L = VoxelOceanClipLevelOfTexture(ClipInfo, Count - 1);
+        if (L.Valid < 0.5f) return O;
+        const float Reach = 0.5f * F.Size - VOXEL_OCEAN_CLIP_EDGE - VOXEL_OCEAN_CLIP_SLACK;
+        const float2 T = clamp(VoxelOceanClipPlaneOffset(F, X) / L.Spacing, -Reach, Reach);
+        const float4 N = ClipNormal.SampleLevel(ClipNormalSampler, VoxelOceanClipStorageUV(F, L, T * L.Spacing), 0.0f);
+        const float C = max(dot(normalize(N.xyz), UpP), 0.1f);
+        O.SlopeVariance = N.w + (1.0f / (C * C) - 1.0f);
+        return O;
+    }
+    // The levels' blend; where the next level doesn't hold the point, its share goes to the radial.
+    const float Missing = Pick.NextValid > 0.5f ? 0.0f : 1.0f - Pick.Weight;
+    const float4 N = VoxelOceanClipSampleFiltered(ClipNormal, ClipNormalSampler, Pick, ClipInfo, F.Size, CubicFootprint, CubicOn);
+    const float4 D = VoxelOceanClipSampleFiltered(ClipDisplacement, ClipNormalSampler, Pick, ClipInfo, F.Size, CubicFootprint, CubicOn);
+    O.Normal = normalize(N.xyz + UpP * Missing);
+    O.SlopeVariance = N.w;
+    O.Foam = saturate(D.w);
+    // (VoxelOceanClipSample already weighs a missing next level out.)
+    O.Height = dot(D.xyz, UpP);
+    O.Spacing = L0.Spacing * exp2(float(Pick.Level) + 1.0f - Pick.Weight);
+    O.Valid = 1.0f;
+    O.Cover = saturate(Pick.Weight + (Pick.NextValid > 0.5f ? 1.0f - Pick.Weight : 0.0f));
+    return O;
+}
+
+FVoxelOceanPixelClipOut VoxelOceanPixelClipFilteredOf(float3 X, float3 UpP, float Footprint, float CubicFootprint, Texture2DArray ClipDisplacement,
+    Texture2DArray ClipNormal, SamplerState ClipNormalSampler, Texture2D ClipInfo, float CubicOn)
+{
+    return VoxelOceanPixelClipFilteredAtPick(VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint), X, UpP, Footprint, CubicFootprint, ClipDisplacement,
+        ClipNormal, ClipNormalSampler, ClipInfo, CubicOn);
+}
+
+// Stage W6i: the clipmap's footprint at a point (FVoxelOceanPixelClipOut's Spacing) without its
+// lookups: the levels' pick alone.
+float VoxelOceanPixelClipSpacingOf(float3 X, float Footprint, Texture2D ClipInfo)
+{
+    const FVoxelOceanClipFrame F = VoxelOceanClipFrameOfTexture(ClipInfo);
+    if (int(F.Count + 0.5f) <= 0) return 0.0f;
+    const FVoxelOceanClipPick Pick = VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint);
+    if (Pick.Level < 0) return 0.0f;
+    return VoxelOceanClipLevelOfTexture(ClipInfo, 0).Spacing * exp2(float(Pick.Level) + 1.0f - Pick.Weight);
+}
+
+FVoxelOceanPixelClipOut VoxelOceanPixelClipOf(float3 X, float3 UpP, float Footprint, Texture2DArray ClipDisplacement, Texture2DArray ClipNormal,
+    SamplerState ClipNormalSampler, Texture2D ClipInfo)
+{
+    return VoxelOceanPixelClipFilteredOf(X, UpP, Footprint, Footprint, ClipDisplacement, ClipNormal, ClipNormalSampler, ClipInfo, 0.0f);
+}
+
+// The whitecaps' density at a pixel (stage W3h; stage W3v: the breaking now, VoxelOceanClip.usf's whitecap
+// texture): the levels of the footprint blended as the foam's are; past the outermost level, none
+// (its density there is the foam's job). X: the point (planet frame).
+float VoxelOceanPixelWhitecapOf(float3 X, float Footprint, Texture2DArray ClipWhitecap, SamplerState ClipSampler, Texture2D ClipInfo)
+{
+    const FVoxelOceanClipFrame F = VoxelOceanClipFrameOfTexture(ClipInfo);
+    if (int(F.Count + 0.5f) <= 0) return 0.0f;
+    const FVoxelOceanClipPick Pick = VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint);
+    if (Pick.Level < 0) return 0.0f;
+    return saturate(VoxelOceanClipSample(ClipWhitecap, ClipSampler, Pick).x);
+}
+
+// Stage W3t: the whitecaps' density (x) and the foam's history (y) at a pixel, the levels blended as
+// the whitecaps' are; z 1 where a level holds the point (0 past the outermost: none there).
+float3 VoxelOceanPixelWhitecapHistoryOf(float3 X, float Footprint, Texture2DArray ClipWhitecap, SamplerState ClipSampler, Texture2D ClipInfo)
+{
+    const FVoxelOceanClipFrame F = VoxelOceanClipFrameOfTexture(ClipInfo);
+    if (int(F.Count + 0.5f) <= 0) return float3(0.0f, 0.0f, 0.0f);
+    const FVoxelOceanClipPick Pick = VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint);
+    if (Pick.Level < 0) return float3(0.0f, 0.0f, 0.0f);
+    const float4 V = VoxelOceanClipSample(ClipWhitecap, ClipSampler, Pick);
+    return float3(saturate(V.x), saturate(V.y), 1.0f);
+}
+
+// Stage W3u: the clipmap's whitecap texture at a pixel, all four channels (x the whitecaps' density,
+// y the foam's history, z the surf's breaking zone, w the surf's own foam; VoxelOceanClip.usf),
+// toward the cubic with CubicOn (judged by CubicFootprint); zero past the outermost level.
+// (Stage W6i: at a pick made already, as VoxelOceanPixelClipFilteredAtPick.)
+float4 VoxelOceanPixelWhitecapAllAtPick(FVoxelOceanClipPick Pick, float CubicFootprint, Texture2DArray ClipWhitecap, SamplerState ClipSampler,
+    Texture2D ClipInfo, float CubicOn)
+{
+    const FVoxelOceanClipFrame F = VoxelOceanClipFrameOfTexture(ClipInfo);
+    if (int(F.Count + 0.5f) <= 0) return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (Pick.Level < 0) return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    return saturate(VoxelOceanClipSampleFiltered(ClipWhitecap, ClipSampler, Pick, ClipInfo, F.Size, CubicFootprint, CubicOn));
+}
+
+float4 VoxelOceanPixelWhitecapAllOf(float3 X, float Footprint, float CubicFootprint, Texture2DArray ClipWhitecap, SamplerState ClipSampler, Texture2D ClipInfo,
+    float CubicOn)
+{
+    return VoxelOceanPixelWhitecapAllAtPick(VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint), CubicFootprint, ClipWhitecap, ClipSampler, ClipInfo, CubicOn);
+}
+
+// The surface at a pixel in world axes: the clipmap's normal, slope variance and foam, plus the
+// detail the clipmap can't hold (stage O9l): the FFT bands' slope between the pixel's footprint and
+// the clipmap's, looked up here (deep water: the bands high-passed through their mips, without the
+// shore's work), added to the clipmap's normal, its variance taken off the clipmap's unresolved
+// variance; faded out within a metre of depth, where the clipmap's bores and swash carry the
+// surface. SamplePoint: the undisplaced point from the selection camera (world axes, cm); Footprint:
+// how far it moves to the next pixel (cm); Depth: the depth the waves feel there (cm); W: the
+// material's wave parameters (VoxelOceanMakeWaveParamsFFT; W.FFT.x 0: no detail). Normal (world
+// axes) in the result.
+FVoxelOceanPixelClipOut VoxelOceanPixelClipDetailOf(float3 SamplePoint, float Footprint, float Depth, FVoxelOceanWaveParams W,
+    Texture2DArray Displacement, SamplerState DisplacementSampler, Texture2DArray Derivatives, SamplerState DerivativesSampler, Texture2D Charts
+    VOXEL_OCEAN_FINE_PARAMS, Texture2DArray ClipDisplacement, Texture2DArray ClipNormal, SamplerState ClipNormalSampler, Texture2D ClipInfo)
+{
+    const float3 Up = normalize(SamplePoint - W.Center);
+    const float3 UpP = VoxelOceanRotateBack(W.Rotation, Up);
+    FVoxelOceanPixelClipOut C = VoxelOceanPixelClipOf(VoxelOceanRotateBack(W.Rotation, SamplePoint), UpP, Footprint,
+        ClipDisplacement, ClipNormal, ClipNormalSampler, ClipInfo);
+    float3 Normal = C.Normal;
+    // The detail: where the clipmap holds the point at a coarser footprint than the pixel's, in water.
+    const float Keep = saturate(Depth * (1.0f / 100.0f));
+    if (W.FFT.x > 0.5f && C.Valid > 0.5f && C.Spacing > 1.01f * Footprint && Keep > 0.0f)   // (stage W6i: 1%, past exp2(log2) rounding)
+    {
+        FVoxelOceanWaveParams H = W;
+        H.HighPass = C.Spacing;
+        const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(SamplePoint, Up, 1.0e9f, Footprint, VOXEL_OCEAN_DEEP, VoxelOceanShoreNone(), H,
+            Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts VOXEL_OCEAN_FINE_ARGS, 2u);
+        Normal = normalize(Normal - Pt.R.Gradient * Keep);
+        const float Resolved = VoxelOceanFFTSlopeVariance(Pt, H, C.Spacing, Charts) - VoxelOceanFFTSlopeVariance(Pt, H, Footprint, Charts);
+        C.SlopeVariance = max(C.SlopeVariance - Keep * max(Resolved, 0.0f), 0.0f);
+    }
+    C.Normal = normalize(VoxelOceanRotate(W.Rotation, Normal));
+    return C;
+}
+
+// THE FOAM PER PIXEL (stage W3u; Design/OceanWaves.md section 46). GodotOceanWaves' foam (its
+// water.gdshader) is each cascade's own foam texture looked up per pixel, bicubically where its
+// texels are magnified, summed: its detail is the cascades' texels (a few centimetres for the short
+// ones), not a grid's. Ours till W3u was the wave clipmap's, its texels 20 cm to 1.6 m near the
+// camera, bilinear: blocky wherever a texel spans many pixels. Now, where the clipmap's footprint
+// is coarser than the pixel's (where its normal takes the FFT's detail, VoxelOceanPixelClipDetailOf),
+// one evaluation of the bands at the pixel (VOXEL_OCEAN_LOOKUP_DUAL) gives the detail's gradient as
+// before and, besides, the whole surface there, in deep water (as the detail: no shore). Stage W3v:
+// the foam is the clipmap's buffer (GodotOceanWaves' rule on the summed surface's J, VoxelOceanClip.
+// usf; its whitecap texture's y), and where the pixel's own compression past the threshold makes
+// more fresh foam than the texel holds (a crest's own pixels), that, so fresh crests are as sharp as
+// the pixels; the whitecaps likewise. They take over over an octave of the clipmap's magnification
+// (one texel a pixel: the clipmap's; two: the pixel's); in the surf's breaking zone (its z) the
+// bores own them. With CUBIC, the bands' and the clipmap's lookups are cubic B-splines where
+// magnified (VoxelOceanCubic.ush).
+struct FVoxelOceanPixelSurf
+{
+    float3 Normal;          // world axes
+    float SlopeVariance;
+    float Foam;
+    float Whitecap;
+    float Height;           // over the sea sphere (cm)
+    float Spacing;          // the clipmap's footprint there (cm)
+    float Valid;
+    float Own;              // the share of the foam that is the pixel's own (0: the clipmap's)
+    float Cover;            // stage W6e: the clipmap's levels' share of the point (FVoxelOceanPixelClipOut)
+    // Stage W5f: the foam's layers, for the debug views (voxel.Ocean.DebugFoam 6 to 11): x the
+    // clipmap's buffer (its whitecap texture's y), y the fine history, z its share, w the pixel's
+    // fresh foam (as far as the buffer has grown); Parts2: x the surf's foam at the pixel, y the fine
+    // cascade's foam at the pixel, z the clipmap's drawn foam (its buffer and fine foam, drawn).
+    float4 Parts;
+    float4 Parts2;
+};
+
+// SamplePoint, Footprint, Depth, W as VoxelOceanPixelClipDetailOf; Across: the pixel's narrower
+// axis on the water (cm; the cubic filter's judge); Distance: from the view's camera (cm); Settings: x the pixel's own foam's strength (0: none, the clipmap's), y how far from the
+// camera it reaches (cm; it fades over the last 30%), z 1 with foam (Foam: the cascades' retired foam
+// texture, bound for the evaluation's signature, not read; stage W3v), w 1
+// for the cubic filtering.
+// Stage W3y: THE CLIPMAP FILTERED ANISOTROPICALLY (as hardware anisotropic filtering does it): at a
+// grazing view a pixel covers far more water along the view than across it, so its level, picked by
+// the longer axis, is magnified across the view (blurred there since W3u's cubic, blocky before).
+// Up to MaxTaps lookups along the longer axis (Major: world axes, its length the longer footprint)
+// at the level of the longer footprint over the taps (no finer than the narrower one), averaged:
+// the detail across the view kept, the long axis still filtered. The normals' spread over the taps
+// becomes slope variance (Toksvig: 1 - |mean normal|^2), so the glitter stays filtered.
+struct FVoxelOceanPixelClipAniso
+{
+    FVoxelOceanPixelClipOut C;
+    float4 Caps;
+};
+
+// The anisotropic taps' count along the longer axis, and the footprint each tap's level is picked by.
+int VoxelOceanPixelClipTapsOf(float Footprint, float Narrow, float MaxTaps)
+{
+    return int(clamp(ceil(Footprint / max(Narrow, 1.0e-3f) - 0.25f), 1.0f, max(MaxTaps, 1.0f)));
+}
+
+float VoxelOceanPixelClipTapFootOf(float Footprint, float Narrow, float MaxTaps)
+{
+    return max(Footprint / float(VoxelOceanPixelClipTapsOf(Footprint, Narrow, MaxTaps)), Narrow);
+}
+
+FVoxelOceanPixelClipAniso VoxelOceanPixelClipAnisoOf(float3 X, float3 UpP, float3 MajorP, float Footprint, float Narrow, float MaxTaps,
+    Texture2DArray ClipDisplacement, Texture2DArray ClipNormal, Texture2DArray ClipWhitecap, SamplerState ClipSampler, Texture2D ClipInfo, float CubicOn)
+{
+    const int Taps = VoxelOceanPixelClipTapsOf(Footprint, Narrow, MaxTaps);
+    const float Foot = VoxelOceanPixelClipTapFootOf(Footprint, Narrow, MaxTaps);
+    FVoxelOceanPixelClipAniso A;
+    // (Stage W6i: one pick shared by the clipmap's lookups and the whitecaps'; with taps, the
+    // centre's lookups not made: of them only the spacing stays, from the pick alone.)
+    if (Taps <= 1)
+    {
+        const FVoxelOceanClipPick Pick = VoxelOceanClipPickOfTexture(ClipInfo, X, Foot);
+        A.C = VoxelOceanPixelClipFilteredAtPick(Pick, X, UpP, Foot, Narrow, ClipDisplacement, ClipNormal, ClipSampler, ClipInfo, CubicOn);
+        A.Caps = VoxelOceanPixelWhitecapAllAtPick(Pick, Narrow, ClipWhitecap, ClipSampler, ClipInfo, CubicOn);
+        return A;
+    }
+    A.C.Normal = UpP;
+    A.C.SlopeVariance = 0.0f;
+    A.C.Foam = 0.0f;
+    A.C.Height = 0.0f;
+    A.C.Valid = 0.0f;
+    A.C.Cover = 0.0f;
+    A.C.Spacing = VoxelOceanPixelClipSpacingOf(X, Foot, ClipInfo);
+    A.Caps = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float3 NormalSum = float3(0.0f, 0.0f, 0.0f);
+    float SlopeVariance = 0.0f;
+    float FoamSum = 0.0f;
+    float HeightSum = 0.0f;
+    float CoverSum = 0.0f;
+    float4 CapsSum = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float Valid = 1.0f;
+    [loop]
+    for (int T = 0; T < Taps; T++)
+    {
+        const float3 XT = X + MajorP * ((float(T) + 0.5f) / float(Taps) - 0.5f);
+        const FVoxelOceanClipPick PickT = VoxelOceanClipPickOfTexture(ClipInfo, XT, Foot);
+        const FVoxelOceanPixelClipOut CT = VoxelOceanPixelClipFilteredAtPick(PickT, XT, UpP, Foot, Narrow, ClipDisplacement, ClipNormal, ClipSampler, ClipInfo, CubicOn);
+        NormalSum += CT.Normal;
+        SlopeVariance += CT.SlopeVariance;
+        FoamSum += CT.Foam;
+        HeightSum += CT.Height;
+        CoverSum += CT.Cover;
+        Valid = min(Valid, CT.Valid);
+        CapsSum += VoxelOceanPixelWhitecapAllAtPick(PickT, Narrow, ClipWhitecap, ClipSampler, ClipInfo, CubicOn);
+    }
+    const float Inv = 1.0f / float(Taps);
+    const float3 Mean = NormalSum * Inv;
+    const float Length2 = dot(Mean, Mean);
+    A.C.Normal = Length2 > 1.0e-8f ? Mean * rsqrt(Length2) : UpP;
+    A.C.SlopeVariance = SlopeVariance * Inv + max(1.0f - Length2, 0.0f);
+    A.C.Foam = FoamSum * Inv;
+    A.C.Height = HeightSum * Inv;
+    A.C.Cover = CoverSum * Inv;
+    A.C.Valid = Valid;
+    A.Caps = CapsSum * Inv;
+    return A;
+}
+
+// The fine history's handover to the buffer: over this share of a level's window (stage W5d).
+#define VOXEL_OCEAN_PIXEL_FINE_FADE 0.25f
+
+// Stage W4c: the foam's fine history at a pixel (VoxelOceanClip.usf, ClipFineFoamCS): its levels
+// picked as the clipmap's for a footprint FineInfo.y (the factor) times the pixel's, so its texels
+// are the pixel's; sampled at the levels' own storage UV, in the slice of the level's index. x the
+// history's foam, y the share it holds (its levels' weights and fades; the rest the buffer's).
+float2 VoxelOceanPixelFineHistoryOf(float3 X, float Footprint, Texture2DArray FineHistory, SamplerState Sampler, Texture2D ClipInfo, float2 FineInfo)
+{
+    const int Count = int(FineInfo.x + 0.5f);
+    if (Count <= 0) return float2(0.0f, 0.0f);
+    const FVoxelOceanClipPick P = VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint * max(FineInfo.y, 1.0f));
+    if (P.Level < 0 || P.Level >= Count) return float2(0.0f, 0.0f);
+    // Stage W5d: each fine level's share fades over the outer quarter of its window (the clipmap's
+    // levels hand over in their last sixteenth): the fine history and the buffer it hands over to
+    // differ in their detail (the fine one's crest-shaped trails, the buffer's smooth mean), and a
+    // narrow handover drew the windows' rectangles across the foam.
+    const FVoxelOceanClipFrame F = VoxelOceanClipFrameOfTexture(ClipInfo);
+    const float2 Offset = VoxelOceanClipPlaneOffset(F, X);
+    const float Reach = 0.5f * F.Size - VOXEL_OCEAN_CLIP_EDGE - VOXEL_OCEAN_CLIP_SLACK;
+    const float2 TA = abs(Offset / VoxelOceanClipLevelOfTexture(ClipInfo, P.Level).Spacing);
+    const float WideA = saturate((Reach - max(TA.x, TA.y)) / (VOXEL_OCEAN_PIXEL_FINE_FADE * F.Size));
+    const float A = max(FineHistory.SampleLevel(Sampler, float3(P.UV.x, P.UV.y, float(P.Level)), 0.0f).x, 0.0f);
+    float B = 0.0f;
+    float WB = 0.0f;
+    if (P.Weight < 1.0f && P.NextValid > 0.5f && P.Level + 1 < Count)
+    {
+        const float2 TB = abs(Offset / VoxelOceanClipLevelOfTexture(ClipInfo, P.Level + 1).Spacing);
+        const float WideB = saturate((Reach - max(TB.x, TB.y)) / (VOXEL_OCEAN_PIXEL_FINE_FADE * F.Size));
+        B = max(FineHistory.SampleLevel(Sampler, float3(P.UVNext.x, P.UVNext.y, float(P.Level + 1)), 0.0f).x, 0.0f);
+        WB = (1.0f - P.Weight) * WideB;
+    }
+    const float WA = P.Weight * WideA;
+    return float2(A * WA + B * WB, WA + WB);
+}
+
+FVoxelOceanPixelSurf VoxelOceanPixelSurfOf(float3 SamplePoint, float Footprint, float Across, float3 Major, float MaxTaps, float Depth, float Distance,
+    FVoxelOceanWaveParams W, Texture2DArray Displacement, SamplerState DisplacementSampler, Texture2DArray Derivatives, SamplerState DerivativesSampler,
+    Texture2D Charts VOXEL_OCEAN_FINE_PARAMS, Texture2DArray Foam, SamplerState FoamSampler VOXEL_OCEAN_FINE_FOAM_PARAMS, Texture2DArray ClipDisplacement,
+    Texture2DArray ClipNormal, Texture2DArray ClipWhitecap, SamplerState ClipSampler, Texture2D ClipInfo, float4 Settings,
+    Texture2DArray FineHistory, float4 FineInfo, Texture2DArray<float4> ClipStatic, Texture2DArray ClipStrain)
+{
+    const float3 Up = normalize(SamplePoint - W.Center);
+    const float3 UpP = VoxelOceanRotateBack(W.Rotation, Up);
+    const float3 X = VoxelOceanRotateBack(W.Rotation, SamplePoint);
+    const float CubicOn = Settings.w;
+    const float Narrow = clamp(Across, 1.0e-3f, max(Footprint, 1.0e-3f));
+    // (Stage W3y: anisotropic along the footprint's longer axis.)
+    const FVoxelOceanPixelClipAniso Aniso = VoxelOceanPixelClipAnisoOf(X, UpP, VoxelOceanRotateBack(W.Rotation, Major), Footprint, Narrow, MaxTaps,
+        ClipDisplacement, ClipNormal, ClipWhitecap, ClipSampler, ClipInfo, CubicOn);
+    const FVoxelOceanPixelClipOut C = Aniso.C;
+    const float4 Caps = Aniso.Caps;
+    FVoxelOceanPixelSurf O;
+    O.SlopeVariance = C.SlopeVariance;
+    O.Foam = C.Foam;
+    O.Whitecap = Caps.x;
+    O.Height = C.Height;
+    O.Spacing = C.Spacing;
+    O.Valid = C.Valid;
+    O.Cover = C.Cover;
+    O.Own = 0.0f;
+    O.Parts = float4(Caps.y, 0.0f, 0.0f, 0.0f);
+    O.Parts2 = float4(0.0f, 0.0f, C.Foam, 0.0f);
+    float3 Normal = C.Normal;
+    const float Keep = saturate(Depth * (1.0f / 100.0f));
+    // (Stage W5d: the pixel's foam in shallow water and on the swash too, the composed sea's (W5c) with
+    // its shore: only the detail's normal fades within a metre of depth, where the clipmap's bores and
+    // swash carry the surface. Until W5d all of it did, and the shallows' foam was the clipmap's
+    // texels, blocky on the flats.)
+    if (W.FFT.x > 0.5f && C.Valid > 0.5f && C.Spacing > 1.01f * Footprint)   // (stage W6i: 1%, past exp2(log2) rounding: nothing to add at equality)
+    {
+        FVoxelOceanWaveParams H = W;
+        H.HighPass = C.Spacing;
+        H.CubicFootprint = Narrow;
+        // The pixel's own foam's share: over the octave of the clipmap's magnification, faded at its
+        // reach, out of the breaking zone (and not under the surf's debug views, carried as the foam).
+        const float Reach = max(Settings.y, 1.0f);
+        float Own = saturate(Settings.x) * saturate(log2(C.Spacing / Footprint)) * (1.0f - smoothstep(0.7f * Reach, Reach, Distance));
+        if (Settings.z < 0.5f || VoxelOceanDebugModeOf(Charts, max(int(W.FFT.y), 1)) > 0) Own = 0.0f;
+        // Stage W8j (FineInfo.w 1): the pixel's own foam from the clipmap's strain (ClipStrain, at the
+        // level the clipmap's lookups above were picked at, as filtered) plus the bands finer than
+        // its texels, high-passed as the normal's detail: the whole surface's J, as the dual lookups
+        // gave it (VOXEL_OCEAN_LOOKUP_DUAL: every band looked up again at the pixel, the long ones
+        // three sea states by up to three detiling copies), at the high pass's lookups alone.
+        bool bStrain = false;
+        if (Own > 0.0f && FineInfo.w > 0.5f)
+        {
+            const FVoxelOceanClipPick SP = VoxelOceanClipPickOfTexture(ClipInfo, X, VoxelOceanPixelClipTapFootOf(Footprint, Narrow, MaxTaps));
+            if (SP.Level >= 0)
+            {
+                const FVoxelOceanClipFrame SF = VoxelOceanClipFrameOfTexture(ClipInfo);
+                const float4 T = VoxelOceanClipSampleFiltered(ClipStrain, ClipSampler, SP, ClipInfo, SF.Size, Narrow, CubicOn);
+                // (A next level that doesn't hold the point: the pick's own level alone.)
+                const float Held = SP.NextValid > 0.5f ? 1.0f : max(SP.Weight, 1.0e-3f);
+                H.BaseStrain = float4(T.x / Held, T.y / Held, T.z / Held, 1.0f);
+                H.StrainAxis = SF.E1;
+                bStrain = true;
+            }
+        }
+        const uint Mask = 2u | (CubicOn > 0.5f ? VOXEL_OCEAN_LOOKUP_CUBIC : 0u) | (Own > 0.0f ? VOXEL_OCEAN_LOOKUP_FOAM | (bStrain ? 0u : VOXEL_OCEAN_LOOKUP_DUAL) : 0u);
+        // Stage W5c: the composed sea at the pixel, as the clipmap's (until W5c the open sea alone, in
+        // deep water: near a coast its detail and its foam weren't the shoaled, surf-shared sea the
+        // clipmap shows): the shore from the static layer of the level the footprint picks, bilinear.
+        FVoxelOceanShore Shore = VoxelOceanShoreNone();
+        float ShoreDepth = VOXEL_OCEAN_DEEP;
+        {
+            const FVoxelOceanClipFrame F = VoxelOceanClipFrameOfTexture(ClipInfo);
+            const FVoxelOceanClipPick P = VoxelOceanClipPickOfTexture(ClipInfo, X, Footprint);
+            if (P.Level >= 0 && FineInfo.z > 0.5f)
+            {
+                const int Size = int(F.Size + 0.5f);
+                const FVoxelOceanClipStatic St = VoxelOceanClipStaticBilinear(ClipStatic, P.UV.xy * F.Size, int(P.UV.z + 0.5f), Size);
+                Shore = VoxelOceanClipShoreOf(St, UpP, F.E1, H, Charts);
+                ShoreDepth = St.S0.x;
+            }
+        }
+        const FVoxelOceanFFTPoint Pt = VoxelOceanFFTEvaluate(SamplePoint, Up, 1.0e9f, Footprint, ShoreDepth, Shore, H,
+            Displacement, DisplacementSampler, Derivatives, DerivativesSampler, Charts VOXEL_OCEAN_FINE_ARGS, Foam, FoamSampler VOXEL_OCEAN_FINE_FOAM_ARGS, Mask);
+        // (Dual: the high-passed gradient apart; else the high pass's sum is the point's own.)
+        const float3 DetailGradient = Own > 0.0f && !bStrain ? Pt.DetailGradient : Pt.R.Gradient;
+        Normal = normalize(Normal - DetailGradient * Keep);
+        const float Resolved = VoxelOceanFFTSlopeVariance(Pt, H, C.Spacing, Charts) - VoxelOceanFFTSlopeVariance(Pt, H, Footprint, Charts);
+        O.SlopeVariance = max(C.SlopeVariance - Keep * max(Resolved, 0.0f), 0.0f);
+        if (Own > 0.0f)
+        {
+            // Stage W3v: the pixel's own compression past the threshold (out of the breaking zone),
+            // its fresh foam over the clipmap's buffer where it is sharper (a crest's own pixels),
+            // drawn as the clipmap draws it; the whitecaps likewise. (Stage W5c: the composed sea's, the
+            // shore's zone and flattening in it; the surf's own foam at the pixel, its bores' faces sharp.)
+            const float FreshGain = max(Charts.Load(int3(VoxelOceanConstantsX(max(int(W.FFT.y), 1)), 16, 0)).x, 0.0f);
+            const float Fresh = VoxelOceanFoamFresh(Pt.FoamSource, FreshGain);
+            const float SurfFoam = Pt.SurfFoam;
+            // (Stage W3w: the fine foam at the pixel added, as the clipmap adds it at its texels.)
+            const float Fine = Pt.FineFoam;
+            // Stage W3z: the pixel's own fresh foam where its surface breaks (as far as the buffer has
+            // grown toward the texel's steady state: the steady state of its mean source, Caps.w,
+            // VoxelOceanFoamSourceSpread), so a crest foams in its own sharp streaks. Stage W4b: over
+            // the buffer, not instead of it: W3z took the texel's fresh part out of the buffer and put
+            // it back on the crests alone (the mean kept), which cut the foam built under and around a
+            // breaking crest down to the trail, a bare border round every whitecap (at Godot's gain the
+            // fresh part fills the texels round a crest). The accumulation now starts right under the
+            // whitecap, the crest's own foam on top.
+            const float TexelFresh = VoxelOceanFoamFresh(Caps.w, FreshGain);
+            const float Grown = TexelFresh > 1.0e-4f ? saturate(Caps.y / TexelFresh) : 1.0f;
+            // Stage W4c: the history at the fine levels' resolution where they hold the point (the
+            // buffer's past them; stage W5c: the surf's in it too).
+            const float2 FineHist = VoxelOceanPixelFineHistoryOf(X, sqrt(Footprint * Narrow), FineHistory, ClipSampler, ClipInfo, FineInfo.xy);
+            const float History = FineHist.x + (1.0f - FineHist.y) * Caps.y;
+            O.Foam = lerp(C.Foam, VoxelOceanFoamDrawn(max(max(History, Fresh * Grown), SurfFoam) + Fine), Own);
+            O.Whitecap = lerp(Caps.x, max(VoxelOceanFoamDrawn(Fresh), Pt.SurfBreaking), Own);
+            O.Own = Own;
+            O.Parts = float4(Caps.y, FineHist.x, FineHist.y, Fresh * Grown);
+            O.Parts2 = float4(SurfFoam, Fine, C.Foam, 0.0f);
+        }
+    }
+    O.Normal = normalize(VoxelOceanRotate(W.Rotation, Normal));
+    return O;
+}
+
+// The foam's structure at a pixel (stage W3f; VoxelOceanFoamLace.ush) for its density: in each
+// chart's coordinates in its short bands' downwind frame (the waves' own lookups', so the structure
+// rides the surface and its streaks lie downwind), blended across the charts as the waves are (the
+// weights summed to 1 here: the structure's mean stays the density). SamplePoint: the undisplaced
+// point from the selection camera (world axes, cm); Footprint: the pixel's (cm); W: the material's
+// wave parameters (W.FFT.x 0: no charts, the density as it is); the clock: the surf's (W.SlopeVar.w).
+FVoxelOceanLace VoxelOceanPixelLaceOf(float3 SamplePoint, float Footprint, float Density, FVoxelOceanWaveParams W, Texture2D OceanCharts)
+{
+    FVoxelOceanLace Out;
+    Out.Foam = saturate(Density);
+    Out.Layer0 = Out.Foam;
+    Out.Layer1 = 1.0f;
+    Out.Layer2 = 1.0f;
+    Out.Thick = 0.5f;
+    if (Density <= 0.0f || W.FFT.x < 0.5f) return Out;
+    const float3 D = VoxelOceanRotateBack(W.Rotation, SamplePoint);
+    const float3 UpP = VoxelOceanRotateBack(W.Rotation, normalize(SamplePoint - W.Center));
+    const int N = max(int(W.FFT.y), 1);
+    const FVoxelOceanChartCandidates Cand = VoxelOceanChartCandidatesOf(UpP, N);
+    const FVoxelOceanChartBlend Blend = VoxelOceanChartBlendOf(Cand.Count, VoxelOceanChartDistancesOf(Cand, UpP), N);
+    float Sum = 0.0f;
+    for (int M = 0; M < VOXEL_OCEAN_CHART_MAX; M++)
+    {
+        if (M < Blend.Count) Sum += Blend.Weight[M];
+    }
+    if (Sum <= 0.0f) return Out;
+    Out.Foam = 0.0f;
+    Out.Layer0 = 0.0f;
+    Out.Layer1 = 0.0f;
+    Out.Layer2 = 0.0f;
+    Out.Thick = 0.0f;
+    const float FootprintM = Footprint * 0.01f;
+    const float Time = W.SlopeVar.w;
+    [unroll]
+    for (int K = 0; K < VOXEL_OCEAN_CHART_MAX; K++)
+    {
+        if (K >= Blend.Count) continue;
+        const int2 T = Cand.Texel[Blend.Index[K]];
+        const float4 T0 = OceanCharts.Load(int3(T.x, T.y, 0));
+        const float4 T1 = OceanCharts.Load(int3(T.x + 1, T.y, 0));
+        const float4 T2 = OceanCharts.Load(int3(T.x + 2, T.y, 0));
+        const FVoxelOceanChart C = VoxelOceanChartOf(T0.xyz, T1.xyz, T2.xyz, float3(T0.w, T1.w, T2.w));
+        const FVoxelOceanChartHeadings H = VoxelOceanChartHeadingsAt(OceanCharts, T);
+        const FVoxelOceanChartCoords Plane = VoxelOceanChartCoordsOf(C, W.RefHigh.xyz, W.RefLow.xyz, D);
+        const uint Seed = VoxelOceanLaceHash(uint(T.x), uint(T.y), 0x1f123bb5u);
+        // A heading that turned crosses over from its previous orientation as the waves do
+        // (VoxelOceanTurnWeights), the weights summed to 1 here.
+        const float2 Turn = VoxelOceanTurnWeights(saturate(W.Shape.z), length(Plane.Base + Plane.Offset), H.ShortPrevious, H.ShortCurrent,
+            VOXEL_OCEAN_SHORT_CORRELATION_LENGTH);
+        const float TurnSum = max(Turn.x + Turn.y, 1.0e-6f);
+        for (int O = 0; O < 2; O++)
+        {
+            const float WO = (O == 0 ? Turn.x : Turn.y) / TurnSum;
+            if (WO <= 0.0f) continue;
+            const FVoxelOceanChartCoords Coords = VoxelOceanCoordsToWind(Plane, O == 0 ? H.ShortCurrent : H.ShortPrevious);
+            const FVoxelOceanLace L = VoxelOceanLaceAt(Coords.Base.x, Coords.Base.y, Coords.Offset.x, Coords.Offset.y, Density, FootprintM, Time,
+                Seed ^ (O == 0 ? 0u : 0x6c8e9cf5u));
+            const float Wk = WO * Blend.Weight[K] / Sum;
+            Out.Foam += Wk * L.Foam;
+            Out.Layer0 += Wk * L.Layer0;
+            Out.Layer1 += Wk * L.Layer1;
+            Out.Layer2 += Wk * L.Layer2;
+            Out.Thick += Wk * L.Thick;
+        }
+    }
+    return Out;
+}

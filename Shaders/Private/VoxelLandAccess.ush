@@ -1,0 +1,114 @@
+// VoxelLandAccess.ush - How the shared land code reaches its data. The land code
+// (VoxelLandSample.ush, VoxelLandHills.ush, VoxelLandGully.ush, VoxelLandPlates.ush, the land parts of
+// VoxelDensitySample.ush, VoxelLandDebugColor.ush) runs in three hosts:
+//   - global shaders (the mesher, the density check, the ocean pages, the bake): its inputs are
+//     shader parameters (StructuredBuffers and uniforms), declared at global scope;
+//   - the CPU backend: the same names are members of the C++ struct the code is included in;
+//   - the terrain material (VoxelLandMaterial.ush): a Custom node can bind only textures and
+//     parameters, which reach the code as function arguments, not as globals.
+// So every function that reads a land input takes VOXEL_LAND_ARGS_DECL first (and passes
+// VOXEL_LAND_ARGS on), and reads buffers through the accessors below. Both are empty or the
+// plain buffer reads unless a host defines them before including the land code; the material
+// defines them as its texture arguments and texture loads (and the scalar inputs as macros that
+// read its constants texture).
+//
+// Shared subset (VoxelShaderCompat.h). Included by each land file; harmless to include twice.
+
+#ifndef VOXEL_LAND_ACCESS_USH
+#define VOXEL_LAND_ACCESS_USH
+
+#ifndef VOXEL_LAND_ARGS_DECL
+#define VOXEL_LAND_ARGS_DECL
+#endif
+#ifndef VOXEL_LAND_ARGS
+#define VOXEL_LAND_ARGS
+#endif
+
+/** The bake's height (m) at padded cell index I. */
+#ifndef VOXEL_LAND_HEIGHT
+#define VOXEL_LAND_HEIGHT(I) LandHeight[I]
+#endif
+
+/** The double-float tan of cell centre I's angle (VoxelLandSample.ush). */
+#ifndef VOXEL_LAND_TAN
+#define VOXEL_LAND_TAN(I) LandTanTable[I]
+#endif
+
+/** The bake's drainage (log2 m^2) at cell I: two f16 cells per word, the lower index in the low
+ *  half. */
+#ifndef VOXEL_LAND_FLOW
+#define VOXEL_LAND_FLOW(I) f16tof32((LandFlow[(I) >> 1u] >> (((I) & 1u) * 16u)) & 0xffffu)
+#endif
+
+/** A cell's landform (FVoxelLandBake::Form: the hilliness in the low byte, the character in the
+ *  high byte) as 0..1 values. */
+VOXEL_FUNC float2 VoxelLandUnpackForm(uint Packed)
+{
+    return float2(float(Packed & 0xffu) * (1.0f / 255.0f), float((Packed >> 8u) & 0xffu) * (1.0f / 255.0f));
+}
+
+/** The bake's landform (hilliness, character; VoxelLandPlates.ush VoxelLandFormAt) at cell I:
+ *  two cells per word, the lower index in the low half (read when LandHasForm). */
+#ifndef VOXEL_LAND_FORM
+#define VOXEL_LAND_FORM(I) VoxelLandUnpackForm((LandForm[(I) >> 1u] >> (((I) & 1u) * 16u)) & 0xffffu)
+#endif
+
+/** A cell's local relief (m; FVoxelLandBake::Relief, VoxelLandRelief.h): q^2 x this. */
+#define VOXEL_LAND_RELIEF_SCALE (12000.0f / 65025.0f)
+
+VOXEL_FUNC float VoxelLandDecodeRelief(uint Q)
+{
+    const float F = float(Q);
+    return F * F * VOXEL_LAND_RELIEF_SCALE;
+}
+
+/** The bake's local relief (m) at cell I: four cells per word, the lowest index in the low byte
+ *  (read when LandHasForm: the bakes that have the landform have it too). */
+#ifndef VOXEL_LAND_RELIEF
+#define VOXEL_LAND_RELIEF(I) VoxelLandDecodeRelief((LandRelief[(I) >> 2u] >> (((I) & 3u) * 8u)) & 0xffu)
+#endif
+
+/** A cell's sedimentary province (FVoxelLandBake::Province, VoxelLandPlates.ush
+ *  VoxelLandPackProvince: 0 .. 63) as 0..1. */
+VOXEL_FUNC float VoxelLandUnpackProvince(uint Q)
+{
+    return float(Q) * (1.0f / 63.0f);
+}
+
+/** The bake's province (0..1, T4c) at cell I: four cells per word, the lowest index in the low
+ *  byte (read when LandHasForm: the bakes that have the landform have it too). */
+#ifndef VOXEL_LAND_PROVINCE
+#define VOXEL_LAND_PROVINCE(I) VoxelLandUnpackProvince((LandProvince[(I) >> 2u] >> (((I) & 3u) * 8u)) & 0xffu)
+#endif
+
+/** The rivers' tables (VoxelLandRivers.ush, VoxelLandRiverLayout.ush): tile I's block start,
+ *  and float I of the segments and the tile blocks. */
+#ifndef VOXEL_LAND_RIVER_TILE
+#define VOXEL_LAND_RIVER_TILE(I) LandRiverTiles[I]
+#endif
+#ifndef VOXEL_LAND_RIVER_DATA
+#define VOXEL_LAND_RIVER_DATA(I) LandRiverData[I]
+#endif
+
+/** The bake's attributes (FVoxelLandBake::Attr) at cell I: two cells per word, low half first
+ *  (the debug views' buffer). */
+#ifndef VOXEL_LAND_ATTR
+#define VOXEL_LAND_ATTR(I) ((LandAttr[(I) >> 1u] >> (((I) & 1u) * 16u)) & 0xffffu)
+#endif
+
+/** The kept lake's level (m) at cell I, or below -1e30 for none. */
+#ifndef VOXEL_LAND_WATER
+#define VOXEL_LAND_WATER(I) LandWater[I]
+#endif
+
+/** Element I of the plate table (8 floats a plate, VoxelLandPlates.ush). */
+#ifndef VOXEL_LAND_PLATE
+#define VOXEL_LAND_PLATE(I) LandPlates[I]
+#endif
+
+/** Noise octave I of the density's tables (FVoxelOctave, VoxelDensitySample.ush). */
+#ifndef VOXEL_OCTAVE
+#define VOXEL_OCTAVE(I) Octaves[I]
+#endif
+
+#endif // VOXEL_LAND_ACCESS_USH

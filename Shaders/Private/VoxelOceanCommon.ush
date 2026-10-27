@@ -1,0 +1,41 @@
+// VoxelOceanCommon.ush - Ocean math independent of the wave model, shared by the wave hook
+// (VoxelOceanWaves.ush), the surface material (VoxelOcean.ush) and the underwater pass
+// (VoxelUnderwater.ush): how well a spacing resolves a wavelength, the normal of a height field
+// over the sphere, and the stable height of a point above the sea sphere. Every position is from
+// a reference point near the camera (the selection camera for the surface, the view's camera for
+// the underwater pass), in world axes and cm (small and exact near it); the planet centre from
+// it is Center.
+//
+// A wave is weighed by how well a spacing (vertex spacing or pixel footprint) resolves it: 1
+// from four spacings per wavelength, 0 at two (VoxelOctaveBandWeight's rule).
+
+#pragma once
+
+// How far a wave of this wavelength is resolved at this spacing (0: no limit).
+float VoxelOceanResolved(float Wavelength, float Spacing)
+{
+    return Spacing > 0.0f ? saturate(Wavelength / (2.0f * Spacing) - 1.0f) : 1.0f;
+}
+
+// The normal of the displaced surface at a point whose radial is Up: the radial tilted by the
+// height's tangential gradient (exact for a height field; the sphere's curvature adds a
+// relative error of height / radius).
+float3 VoxelOceanSurfaceNormal(float3 Up, float3 Gradient)
+{
+    return normalize(Up - (Gradient - Up * dot(Up, Gradient)));
+}
+
+// The height (cm) above the sea sphere of radius Radius of the point D (from the reference
+// point, whose own height is CameraHeight and whose radial is Up), without float
+// cancellation: with a = R + h and mu = Up . D,
+//   |a Up + D| - R = (h (2R + h) + 2 a mu + |D|^2) / (|a Up + D| + R).
+// Every term is small or a product the division brings back down (Design/OceanMeshing.md
+// section 5.3: under 0.03 mm within 100 m of the camera).
+float VoxelOceanSphereHeight(float3 D, float Radius, float CameraHeight, float3 Up)
+{
+    const float A = Radius + CameraHeight;
+    const float Mu = dot(Up, D);
+    const float Numerator = CameraHeight * (2.0f * Radius + CameraHeight) + 2.0f * A * Mu + dot(D, D);
+    const float Denominator = length(A * Up + D) + Radius;
+    return Numerator / max(Denominator, 1.0f);
+}

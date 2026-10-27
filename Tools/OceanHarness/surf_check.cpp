@@ -1,0 +1,754 @@
+// surf_check.cpp - The shore's waves offline (VoxelOceanSurf.ush, the same function the wave hook
+// and the CPU model run; stage O9i): the directed trains from a coastal travel-time field on a
+// uniform beach (the field integrated here as the bake's solve would along straight rays: A =
+// integral ds / sqrt(held depth), B = integral sqrt(held depth) ds, from the seed depth in).
+// Checks: the composition (the trains' share by the field's depth past the cutoff, the FFT's floor,
+// the cover, the reach), the crests' spacing against the exact local wavelength, the derivatives
+// against finite differences (space and time), continuity in depth and across the clock's wrap,
+// the swash (its range, its mean, continuity at the still level), the swash's fade on land by the
+// mesh's spacing and the footprint, the trains' fade by the mesh, the bores' least front, the foam
+// (bores, whitecaps, the slope variance for the open sea's), no field, and the bound.
+//
+//   g++ -O2 -std=c++20 -ffp-contract=off $(<VoxelPlanets>/Tools/include_flags.sh)
+//       surf_check.cpp -o surf_check
+
+#include "VoxelShaderCompat.h"
+#include "VoxelOceanShoreCore.h"
+#include "VoxelOceanCoastCore.h"
+
+namespace VoxelShader
+{
+#include "VoxelOceanFFTWaves.ush"
+#include "VoxelOceanShoal.ush"
+#include "VoxelOceanSurf.ush"
+#include "VoxelOceanFeltDepth.ush"
+}
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <vector>
+
+using namespace VoxelShader;
+
+static int Fails = 0;
+static void Check(bool bOk, const char* What, double Value, double Limit)
+{
+    std::printf("  [%s] %-78s %.6g (limit %.6g)\n", bOk ? "ok" : "FAIL", What, Value, Limit);
+    if (!bOk) Fails++;
+}
+
+static FVoxelOceanSurfSettings Settings(float Sets = 1.0f, float Skew = 0.85f, float Swash = 1.0f, float Strength = 1.0f, float Reach = 10.0f,
+    float Cutoff = 0.2f, float Floor = 0.25f, float Foam = 1.0f)
+{
+    return VoxelOceanSurfSettingsOf(float4(Strength, Sets, Swash, Skew), float4(0.0f, Foam, 1.0f, Reach), float4(Cutoff, Floor, 0.0f, 0.0f), 0.78f);
+}
+
+// A uniform beach of slope M: the depth M x at x metres offshore (below 0 on land), the coastal
+// field along straight rays from the seed depth (40 m) in, tabulated every Step metres.
+struct FBeach
+{
+    double M = 0.02;
+    double Seed = 40.0;
+    double Step = 0.05;
+    double X0 = -200.0;     // the table's start (on land)
+    std::vector<double> A, B;
+
+    explicit FBeach(double InM) : M(InM)
+    {
+        const double XSeed = Seed / M;
+        const int Count = int((XSeed - X0) / Step) + 2;
+        A.assign(size_t(Count), 0.0);
+        B.assign(size_t(Count), 0.0);
+        // From the seed inward (the trapezoid rule on the held depth).
+        for (int i = Count - 2; i >= 0; i--)
+        {
+            const double Xa = X0 + Step * i, Xb = Xa + Step;
+            if (Xb > XSeed) { A[size_t(i)] = 0.0; B[size_t(i)] = 0.0; continue; }
+            const double Ha = VoxelOceanCoastHeldDepth(float(M * Xa)), Hb = VoxelOceanCoastHeldDepth(float(M * Xb));
+            A[size_t(i)] = A[size_t(i + 1)] + 0.5 * Step * (1.0 / std::sqrt(Ha) + 1.0 / std::sqrt(Hb));
+            B[size_t(i)] = B[size_t(i + 1)] + 0.5 * Step * (std::sqrt(Ha) + std::sqrt(Hb));
+        }
+    }
+    double Lerp(const std::vector<double>& T, double X) const
+    {
+        const double U = std::clamp((X - X0) / Step, 0.0, double(T.size() - 2));
+        const int I = int(U);
+        const double F = U - I;
+        return T[size_t(I)] + (T[size_t(I + 1)] - T[size_t(I)]) * F;
+    }
+};
+
+// The offshore direction in the planet frame (the points below run along -X offshore).
+static const float3 Off(-1.0f, 0.0f, 0.0f);
+
+// A point x metres offshore on Beach (along the coast Along metres: the noises), at time T.
+static FVoxelOceanSurfInput Input(const FBeach& Beach, double X, float T, float Hs = 1.5f, float Speed = 12.0f, float Along = 0.0f)
+{
+    FVoxelOceanSurfInput In;
+    const float D = float(Beach.M * X);
+    In.DepthM = D;
+    In.Slope = float(Beach.M);
+    In.ShoreM = float(X);
+    In.Hs = Hs;
+    In.Speed = Speed;
+    // A planet-frame point (cm): 1,000 km out, the coast along y, offshore along -x; split into
+    // whole units of 4096 cm and the rest, as the CPU model splits a site.
+    const double P[3] = { 1.0e8 - 100.0 * X, 200000.0 + 100.0 * double(Along), 30000.0 };
+    int U[3];
+    float L[3];
+    for (int i = 0; i < 3; i++)
+    {
+        const double Units = std::floor(P[i] / 4096.0);
+        U[i] = int(Units);
+        L[i] = float(P[i] - Units * 4096.0);
+    }
+    In.Units = int3(U[0], U[1], U[2]);
+    In.Low = float3(L[0], L[1], L[2]);
+    In.Time = T;
+    In.SpacingM = 0.0f;
+    In.FootprintM = 0.0f;
+    In.BedSlope = float(Beach.M);
+    In.BedDepthM = 1.0e30f;
+    In.ForNormals = 0.0f;
+    // The field: A and B grow shoreward (their gradients point shoreward, -Off).
+    const double Held = VoxelOceanCoastHeldDepth(D);
+    const bool bIn = X < Beach.Seed / Beach.M;
+    In.CoastA = float(Beach.Lerp(Beach.A, X));
+    In.CoastB = float(Beach.Lerp(Beach.B, X));
+    In.CoastGradA = bIn ? Off * float(-1.0 / std::sqrt(Held)) : float3(0.0f, 0.0f, 0.0f);
+    In.CoastGradB = bIn ? Off * float(-std::sqrt(Held)) : float3(0.0f, 0.0f, 0.0f);
+    In.CoastCover = 1.0f;
+    In.CoastSeedM = float(Beach.Seed);
+    In.CoastReachM = 8000.0f;
+    return In;
+}
+
+// The surf's slope offshore (d height / dx): its phase's along Off, the depth's (up the bed is
+// shoreward here) and the inland fade's (landward is shoreward).
+static double Offshore(const FVoxelOceanSurf& R) { return double(dot(R.GradientPhase, Off)) - R.GradientBed - R.Gradient; }
+
+// The exact wavenumber at depth D for angular frequency W.
+static double ExactK(double W, double D)
+{
+    double K = W * W / 9.80665;
+    K = std::max(K, W / std::sqrt(9.80665 * D));
+    for (int i = 0; i < 60; i++)
+    {
+        const double T = std::tanh(K * D);
+        const double F = 9.80665 * K * T - W * W;
+        const double DF = 9.80665 * (T + K * D * (1.0 - T * T));
+        K -= F / DF;
+    }
+    return K;
+}
+
+int main()
+{
+    const FVoxelOceanSurfSettings S = Settings();
+    const FBeach Beach(0.02);
+
+    std::printf("== the composition (Hs 1.5 m, 12 m/s: peak period %.2f s)\n", VOXEL_OCEAN_SURF_PERIOD_PER_SPEED * 12.0);
+    {
+        const double Period = VOXEL_OCEAN_SURF_PERIOD_PER_SPEED * 12.0;
+        const double Cut = std::min(0.2 * 9.80665 * Period * Period / (2.0 * 3.14159265), 0.8 * 40.0);
+        std::printf("  cutoff %.1f m (fully in from %.1f m)\n", Cut, 0.4 * Cut);
+        double DeepShare = 0.0, DeepKeep = 0.0, ShallowShare = 0.0, ShallowLow = 1.0, LowKeep2 = 1.0, Rise = 0.0, EnergyErr = 0.0;
+        double Last = -1.0;
+        for (int i = 0; i < 4000; i++)
+        {
+            const double D = 0.05 + 0.0125 * i;    // to 50 m
+            const FVoxelOceanSurf R = VoxelOceanSurfOf(Input(Beach, D / Beach.M, 100.0f), S);
+            const double Share = R.Debug.x;
+            if (D > Cut * 1.02) { DeepShare = std::max(DeepShare, Share); DeepKeep = std::max(DeepKeep, std::abs(1.0 - R.LongKeep)); }
+            if (D < 0.4 * Cut * 0.98) { ShallowShare = std::max(ShallowShare, std::abs(Share - 0.75)); ShallowLow = std::min(ShallowLow, Share); }
+            LowKeep2 = std::min(LowKeep2, double(R.LongKeep) * R.LongKeep);
+            EnergyErr = std::max(EnergyErr, std::abs(double(R.LongKeep) * R.LongKeep + Share - 1.0));
+            if (Last >= 0.0) Rise = std::max(Rise, Share - Last);
+            Last = Share;
+        }
+        Check(DeepShare == 0.0, "past the cutoff: no trains (their share)", DeepShare, 0.0);
+        Check(DeepKeep == 0.0, "past the cutoff: the long bands whole", DeepKeep, 0.0);
+        Check(ShallowShare < 1.0e-4, "within 0.4 of the cutoff: the trains take 1 - floor (0.75)", ShallowShare, 1.0e-4);
+        Check(LowKeep2 > 0.25 - 1.0e-4, "the FFT never under its floor (LongKeep^2)", LowKeep2, 0.25);
+        Check(EnergyErr < 1.0e-4, "energy: LongKeep^2 + share = 1 (resolved)", EnergyErr, 1.0e-4);
+        Check(Rise <= 1.0e-6, "the share never falls shoreward (monotone in depth)", Rise, 1.0e-6);
+        // The floor's setting.
+        double AllFFT = 0.0, NoFloor = 0.0;
+        for (int i = 0; i < 100; i++)
+        {
+            const double X = 10.0 + 4.0 * i;
+            AllFFT = std::max(AllFFT, double(VoxelOceanSurfOf(Input(Beach, X, 100.0f), Settings(1, 0.85f, 1, 1, 10, 0.2f, 1.0f)).Debug.x));
+            NoFloor = std::max(NoFloor, double(VoxelOceanSurfOf(Input(Beach, X, 100.0f), Settings(1, 0.85f, 1, 1, 10, 0.2f, 0.0f)).Debug.x));
+        }
+        Check(AllFFT == 0.0, "floor 1: no trains", AllFFT, 0.0);
+        Check(std::abs(NoFloor - 1.0) < 1.0e-5, "floor 0: the trains take all of it shallow", NoFloor, 1.0);
+        // Cutoff 0: none.
+        const FVoxelOceanSurf C0 = VoxelOceanSurfOf(Input(Beach, 50.0, 100.0f), Settings(1, 0.85f, 1, 1, 10, 0.0f));
+        Check(C0.Debug.x < 1.0e-6, "cutoff 0: no trains", C0.Debug.x, 0.0);
+        // No field: nothing (no trains, no swash).
+        FVoxelOceanSurfInput In = Input(Beach, 20.0, 100.0f);
+        In.CoastCover = 0.0f;
+        const FVoxelOceanSurf N = VoxelOceanSurfOf(In, S);
+        Check(N.Active == 0.0f && N.LongKeep == 1.0f && N.Height == 0.0f, "no coastal field: no surf (the FFT whole)", N.Active, 0.0);
+        // The swash fades in with the cover (no line where the field ends along a coast).
+        double Faint = 0.0;
+        for (int k = 0; k < 600; k++)
+        {
+            FVoxelOceanSurfInput F = Input(Beach, -0.05 / 0.02, 0.5f * k);
+            F.CoastCover = 1.0e-3f;
+            Faint = std::max(Faint, std::abs(double(VoxelOceanSurfOf(F, S).Height)));
+        }
+        Check(Faint < 1.0e-4, "the swash at a cover of 0.001 (the field's end): next to nothing", Faint, 1.0e-4);
+        // Half the cover: half the share.
+        In.CoastCover = 0.5f;
+        const FVoxelOceanSurf Half = VoxelOceanSurfOf(In, S);
+        Check(std::abs(Half.Debug.x - 0.375) < 1.0e-4, "half the field's cover: half the share", Half.Debug.x, 0.375);
+        // The field's reach: faded from 0.7 of it, none past it.
+        double PastReach = 0.0;
+        for (int i = 0; i < 50; i++)
+        {
+            FVoxelOceanSurfInput R = Input(Beach, 20.0, 100.0f);
+            R.ShoreM = 8000.0f + 10.0f * i;
+            PastReach = std::max(PastReach, double(VoxelOceanSurfOf(R, S).Debug.x));
+        }
+        Check(PastReach == 0.0, "past the field's reach: no trains", PastReach, 0.0);
+        FVoxelOceanSurfInput Mid = Input(Beach, 20.0, 100.0f);
+        Mid.ShoreM = 0.85f * 8000.0f;
+        const double MidShare = VoxelOceanSurfOf(Mid, S).Debug.x;
+        Check(MidShare > 0.3 && MidShare < 0.45, "at 0.85 of the reach: half faded", MidShare, 0.375);
+    }
+
+    std::printf("\n== the crests' spacing (the field's phase against the exact local wavelength)\n");
+    {
+        for (int b = 0; b < 3; b++)
+        {
+            const double M = b == 0 ? 0.01 : (b == 1 ? 0.02 : 0.05);
+            const FBeach Bch(M);
+            double Worst = 0.0, WorstD = 0.0;
+            for (int t = 0; t < VOXEL_OCEAN_SURF_TRAINS; t++)
+            {
+                const double Cycles = VoxelOceanSurfCycles(t);
+                const double W = 2.0 * 3.14159265358979 * Cycles / VOXEL_OCEAN_SURF_WRAP;
+                const double L0 = 2.0 * 3.14159265358979 * 9.80665 / (W * W);
+                for (int i = 0; i < 200; i++)
+                {
+                    const double D = 2.0 + (0.2 * L0 - 2.0) * i / 199.0;
+                    if (D > 0.8 * Bch.Seed) continue;
+                    const FVoxelOceanSurfInput In = Input(Bch, D / M, 100.0f);
+                    const FVoxelOceanSurfTrain T = VoxelOceanSurfTrainOf(t, In, S, 1.5f, 0.0f, 0.0f, 0.0f, float(M), 0.0f, 1.0f);
+                    // The spacing from the phase itself: the distance between crests along the ray.
+                    const double Exact = 2.0 * 3.14159265358979 / ExactK(W, D);
+                    const double Err = std::abs(T.Wavelength / Exact - 1.0);
+                    if (Err > Worst) { Worst = Err; WorstD = D; }
+                }
+            }
+            char What[128];
+            std::snprintf(What, sizeof(What), "beach 1:%.0f: within the series' error, 2 m to a fifth of the deep wavelength (worst at %.1f m)", 1.0 / M, WorstD);
+            Check(Worst < 0.06, What, Worst, 0.06);
+        }
+        // The phase's own change along the ray matches its gradient (no seam in the field's use).
+        double Worst = 0.0;
+        for (int i = 0; i < 400; i++)
+        {
+            const double X = 100.0 + 3.0 * i;
+            const FVoxelOceanSurfTrain A = VoxelOceanSurfTrainOf(2, Input(Beach, X - 0.25, 100.0f), S, 1.5f, 0, 0, 0, 0.02f, 0, 1);
+            const FVoxelOceanSurfTrain B = VoxelOceanSurfTrainOf(2, Input(Beach, X + 0.25, 100.0f), S, 1.5f, 0, 0, 0, 0.02f, 0, 1);
+            const FVoxelOceanSurfTrain C = VoxelOceanSurfTrainOf(2, Input(Beach, X, 100.0f), S, 1.5f, 0, 0, 0, 0.02f, 0, 1);
+            const double Numeric = (B.Phase - A.Phase) / 0.5;
+            Worst = std::max(Worst, std::abs(Numeric / double(dot(C.GradPhase, Off)) - 1.0));
+        }
+        Check(Worst < 0.01, "the phase's change offshore against its gradient", Worst, 0.01);
+    }
+
+    std::printf("\n== derivatives against finite differences (sets 0; resolved)\n");
+    {
+        const FVoxelOceanSurfSettings S0 = Settings(0.0f);
+        double SumErr = 0.0, SumRef = 0.0, SumErrT = 0.0, SumRefT = 0.0;
+        for (int b = 0; b < 2; b++)
+        {
+            const FBeach Bch(b == 0 ? 0.02 : 0.05);
+            for (int i = 0; i < 300; i++)
+                for (int k = 0; k < 12; k++)
+                {
+                    const double D = -0.3 + 0.07 * i;
+                    const double X = D / Bch.M;
+                    const float T = 17.0f + 3.7f * k;
+                    const double H = 0.002;
+                    const double Up = VoxelOceanSurfOf(Input(Bch, X + H, T), S0).Height;
+                    const double Dn = VoxelOceanSurfOf(Input(Bch, X - H, T), S0).Height;
+                    const FVoxelOceanSurf R = VoxelOceanSurfOf(Input(Bch, X, T), S0);
+                    const double Numeric = (Up - Dn) / (2.0 * H);
+                    // Skip the profile's kinks (the crest and the trough of a skewed bore).
+                    if (std::abs(Numeric - Offshore(R)) > 0.2 * std::abs(Numeric) + 0.01)
+                    {
+                        const double Up2 = VoxelOceanSurfOf(Input(Bch, X + 0.5 * H, T), S0).Height;
+                        const double Dn2 = VoxelOceanSurfOf(Input(Bch, X - 0.5 * H, T), S0).Height;
+                        const double Numeric2 = (Up2 - Dn2) / H;
+                        if (std::abs(Numeric2 - Numeric) > 0.05 * std::abs(Numeric) + 1.0e-3) continue;
+                    }
+                    SumErr += (Numeric - Offshore(R)) * (Numeric - Offshore(R));
+                    SumRef += Numeric * Numeric;
+                    const double Tu = VoxelOceanSurfOf(Input(Bch, X, T + 0.002f), S0).Height;
+                    const double Td = VoxelOceanSurfOf(Input(Bch, X, T - 0.002f), S0).Height;
+                    const double NumericT = (Tu - Td) / 0.004;
+                    SumErrT += (NumericT - R.Rate) * (NumericT - R.Rate);
+                    SumRefT += NumericT * NumericT;
+                }
+        }
+        Check(std::sqrt(SumErr / SumRef) < 0.05, "the slope offshore (phase, bed, inland fade): rms error / rms slope", std::sqrt(SumErr / SumRef), 0.05);
+        Check(std::sqrt(SumErrT / SumRefT) < 0.02, "the rate: rms error / rms rate", std::sqrt(SumErrT / SumRefT), 0.02);
+        // With the sets: the rate (the groups and the drift).
+        double E = 0.0, Ref = 0.0;
+        for (int i = 0; i < 200; i++)
+            for (int k = 0; k < 10; k++)
+            {
+                const double X = (0.2 + 0.1 * i) / 0.02;
+                const float T = 31.0f + 11.3f * k;
+                const FVoxelOceanSurf R = VoxelOceanSurfOf(Input(Beach, X, T, 1.5f, 12.0f, 50.0f), S);
+                const double Num = (VoxelOceanSurfOf(Input(Beach, X, T + 0.002f, 1.5f, 12.0f, 50.0f), S).Height
+                    - VoxelOceanSurfOf(Input(Beach, X, T - 0.002f, 1.5f, 12.0f, 50.0f), S).Height) / 0.004;
+                E += (Num - R.Rate) * (Num - R.Rate);
+                Ref += Num * Num;
+            }
+        Check(std::sqrt(E / Ref) < 0.03, "the rate with the sets: rms error / rms rate", std::sqrt(E / Ref), 0.03);
+    }
+
+    std::printf("\n== continuity (across the still level, in depth, across the clock's wrap)\n");
+    {
+        double Step = 0.0, AtZero = 0.0;
+        for (int k = 0; k < 400; k++)
+        {
+            const float T = 0.75f * k;
+            double Prev = VoxelOceanSurfOf(Input(Beach, -1.5 / 0.02, T), S).Height;
+            for (int i = 1; i <= 2000; i++)
+            {
+                const double X = (-1.5 + 0.002 * i) / 0.02;    // 10 cm steps from 1.5 m up the beach to 2.5 m deep
+                const double H = VoxelOceanSurfOf(Input(Beach, X, T), S).Height;
+                Step = std::max(Step, std::abs(H - Prev));
+                Prev = H;
+            }
+            AtZero = std::max(AtZero, std::abs(double(VoxelOceanSurfOf(Input(Beach, 0.0005, T), S).Height) - VoxelOceanSurfOf(Input(Beach, -0.0005, T), S).Height));
+        }
+        // (Stage W5i: 0.065, was 0.06: the bores run on to the mean shoreline, their fronts steepest
+        // in its last few centimetres of depth.)
+        Check(Step < 0.065, "no step over 10 cm along the beach (1.5 m up to 2.5 m deep, 300 s)", Step, 0.065);
+        Check(AtZero < 0.002, "across the still level", AtZero, 0.002);
+        double Wrap = 0.0;
+        for (int i = 0; i < 200; i++)
+        {
+            const double X = (0.1 + 0.1 * i) / 0.02;
+            const FVoxelOceanSurf A = VoxelOceanSurfOf(Input(Beach, X, VOXEL_OCEAN_SURF_WRAP - 0.001f), S);
+            const FVoxelOceanSurf B = VoxelOceanSurfOf(Input(Beach, X, 0.0f), S);
+            // (A is 1 ms before B: A + 1 ms of its rate is B. Stage W5a: the sign was wrong, a bound
+            // of 2 ms of the rate that the taller peaks passed.)
+            Wrap = std::max(Wrap, std::abs(double(A.Height) - B.Height + 0.001 * A.Rate));
+        }
+        Check(Wrap < 0.003, "across the clock's wrap", Wrap, 0.003);
+    }
+
+    std::printf("\n== the swash (Hs 1.5 m, 12 m/s; beach 1:20, reach 10 m)\n");
+    {
+        const FBeach Steep(0.05);
+        double Lo = 1e9, Hi = -1e9, Sum = 0.0;
+        int Count = 0;
+        for (int k = 0; k < 6000; k++)
+        {
+            const float T = 0.1f * k;
+            const double H = VoxelOceanSurfOf(Input(Steep, -0.01 / 0.05, T), S).Height;
+            Lo = std::min(Lo, H);
+            Hi = std::max(Hi, H);
+            Sum += H;
+            Count++;
+        }
+        std::printf("  the shoreline's level over 600 s: %.2f to %.2f m, mean %.2f m\n", Lo, Hi, Sum / Count);
+        Check(Hi - Lo > 0.2, "the shoreline's level swings (run-up and run-down)", Hi - Lo, 0.2);
+        Check(Sum / Count > 0.02, "its mean stands above the still level (setup)", Sum / Count, 0.02);
+        Check(Hi < 0.5 * 10.0 * 0.05 * 2.0 + 0.3 * 1.5 * 1.3 + 0.01, "within the reach's hold and the setup's cap", Hi, 0.5 * 10.0 * 0.05 * 2.0 + 0.3 * 1.5 * 1.3);
+        // Far up the beach (past three reaches from the mean shoreline, stage W5i: the setup's
+        // shoreline, up to 0.3 Hs above the still level's, 9 m up this beach): the still level.
+        double Far = 0.0;
+        for (int k = 0; k < 600; k++)
+            Far = std::max(Far, std::abs(double(VoxelOceanSurfOf(Input(Steep, -40.0, 1.0f * k), S).Height)));
+        Check(Far == 0.0, "past three reaches up the beach: the still level", Far, 0.0);
+        // The bores reach the swash: the shoreline's level rises with the crests (correlated with
+        // the sea's surface a little offshore, a lag later).
+        double Best = -1.0;
+        for (int Lag = 0; Lag < 80; Lag++)
+        {
+            double SAB = 0, SA = 0, SB = 0, SAA = 0, SBB = 0;
+            for (int k = 0; k < 3000; k++)
+            {
+                const float T = 0.2f * k;
+                const double A = VoxelOceanSurfOf(Input(Steep, 1.0 / 0.05, T), S).Height;
+                const double B = VoxelOceanSurfOf(Input(Steep, -0.01 / 0.05, T + 0.1f * Lag), S).Height;
+                SAB += A * B; SA += A; SB += B; SAA += A * A; SBB += B * B;
+            }
+            const double N = 3000.0;
+            const double C = (SAB / N - SA / N * SB / N) / std::sqrt(std::max((SAA / N - SA * SA / (N * N)) * (SBB / N - SB * SB / (N * N)), 1e-12));
+            Best = std::max(Best, C);
+        }
+        Check(Best > 0.4, "the swash follows the bores (best lagged correlation with 1 m deep)", Best, 0.4);
+    }
+
+    std::printf("\n== the swash on land by the mesh (stage O9i: a far mesh leaves the still level)\n");
+    {
+        const FBeach Steep(0.05);
+        auto LandRange = [&](float Spacing, float Footprint, float ForNormals)
+        {
+            double Most = 0.0;
+            for (int k = 0; k < 600; k++)
+            {
+                FVoxelOceanSurfInput In = Input(Steep, -5.0, 0.5f * k);
+                In.SpacingM = Spacing;
+                In.FootprintM = Footprint;
+                In.ForNormals = ForNormals;
+                Most = std::max(Most, std::abs(double(VoxelOceanSurfOf(In, S).Height)));
+            }
+            return Most;
+        };
+        const double Near = LandRange(0.0f, 0.0f, 0.0f);
+        const double Fine = LandRange(2.0f, 0.0f, 0.0f);
+        const double Coarse = LandRange(20.0f, 0.0f, 0.0f);
+        const double CoarseN = LandRange(0.0f, 30.0f, 1.0f);
+        std::printf("  5 m up the beach: %.3f m (no limit), %.3f m (2 m spacing), %.3f m (20 m), %.3f m (30 m footprint)\n", Near, Fine, Coarse, CoarseN);
+        Check(Near > 0.05, "near: the sheet runs up the beach", Near, 0.05);
+        Check(std::abs(Fine - Near) < 1.0e-6, "2 m spacing carries a 60 m sheet whole", std::abs(Fine - Near), 1.0e-6);
+        Check(Coarse == 0.0, "20 m spacing: the still level (the terrain draws the waterline)", Coarse, 0.0);
+        Check(CoarseN == 0.0, "30 m footprint (the normals, 2 a sheet's width): the still level", CoarseN, 0.0);
+    }
+
+    std::printf("\n== the trains by the mesh and the footprint\n");
+    {
+        // 8 m deep: the trains' wavelengths about 75 to 85 m; a 25 m spacing carries neither.
+        FVoxelOceanSurfInput In = Input(Beach, 8.0 / 0.02, 50.0f);
+        In.SpacingM = 25.0f;
+        double Most = 0.0;
+        for (int k = 0; k < 300; k++)
+        {
+            In.Time = 0.37f * k;
+            Most = std::max(Most, std::abs(double(VoxelOceanSurfOf(In, S).Height)));
+        }
+        const FVoxelOceanSurf R = VoxelOceanSurfOf(In, S);
+        Check(Most < 1.0e-6, "25 m spacing at 8 m deep: no trains in the height", Most, 1.0e-6);
+        // Stage W3f: the composition is by place: the long bands keep 1 - share whatever the mesh
+        // or the footprint shows of the trains.
+        Check(std::abs(double(R.LongKeep) * R.LongKeep + R.Debug.x - 1.0) < 1.0e-5, "and the long bands keep 1 - share (composition by place)",
+            std::abs(double(R.LongKeep) * R.LongKeep + R.Debug.x - 1.0), 1.0e-5);
+        In.SpacingM = 0.0f;
+        In.FootprintM = 45.0f;
+        In.ForNormals = 1.0f;
+        const FVoxelOceanSurf N = VoxelOceanSurfOf(In, S);
+        Check(std::abs(double(N.LongKeep) - R.LongKeep) < 1.0e-6, "45 m footprint (the normals): the same composition", std::abs(double(N.LongKeep) - R.LongKeep), 1.0e-6);
+        Check(dot(N.GradientPhase, N.GradientPhase) < 1.0e-12, "and no trains in the normals", std::sqrt(dot(N.GradientPhase, N.GradientPhase)), 0.0);
+        // The same at every spacing.
+        double Spread = 0.0;
+        for (int i = 0; i <= 200; i++)
+        {
+            FVoxelOceanSurfInput P = Input(Beach, 6.0 / 0.02, 50.0f);
+            P.SpacingM = 0.1f * float(i);
+            const FVoxelOceanSurf Ri = VoxelOceanSurfOf(P, S);
+            Spread = std::max(Spread, std::abs(double(Ri.LongKeep) * Ri.LongKeep + Ri.Debug.x - 1.0));
+        }
+        Check(Spread < 1.0e-5, "at every spacing from 0 to 20 m: the long bands keep 1 - share", Spread, 1.0e-5);
+        // The bores' least front at a 2 m spacing: no slope steeper than a half cosine over 4
+        // spacings of the wave's range.
+        const FVoxelOceanSurfSettings S0 = Settings(0.0f);
+        double Worst = 0.0;
+        for (int k = 0; k < 60; k++)
+        {
+            const float T = 1.3f * k;
+            double MaxSlope = 0.0, Lo = 1e9, Hi = -1e9;
+            for (int i = 0; i < 4000; i++)
+            {
+                const double X = (0.8 + 0.0005 * i) / 0.02;     // 0.8 to 2.8 m deep (2.5 cm steps)
+                FVoxelOceanSurfInput A = Input(Beach, X, T), B = Input(Beach, X + 0.025, T);
+                A.SpacingM = 2.0f; B.SpacingM = 2.0f;
+                const double HA = VoxelOceanSurfOf(A, S0).Height, HB = VoxelOceanSurfOf(B, S0).Height;
+                MaxSlope = std::max(MaxSlope, std::abs(HB - HA) / 0.025);
+                Lo = std::min(Lo, HA);
+                Hi = std::max(Hi, HA);
+            }
+            Worst = std::max(Worst, MaxSlope * 4.0 * 2.0 / std::max(Hi - Lo, 1e-6));
+        }
+        Check(Worst < 1.6 * 1.25, "the bores' fronts at 2 m spacing: slope x 4 spacings / range (pi / 2 a half cosine)", Worst, 1.6 * 1.25);
+    }
+
+    std::printf("\n== the foam\n");
+    {
+        double Bore = 0.0, Deep = 0.0, Cap = 0.0, Calm = 0.0;
+        for (int k = 0; k < 600; k++)
+        {
+            const float T = 0.5f * k;
+            Bore = std::max(Bore, double(VoxelOceanSurfOf(Input(Beach, 1.0 / 0.02, T), S).Foam));
+            Deep = std::max(Deep, double(VoxelOceanSurfOf(Input(Beach, 9.0 / 0.02, T, 0.8f, 8.0f), S).Foam));
+            // A train's crests by their steepness alone (no bores' carpet): the 5 s train 10 m deep.
+            FVoxelOceanSurfInput In = Input(Beach, 10.0 / 0.02, T);
+            Cap = std::max(Cap, double(VoxelOceanSurfTrainOf(0, In, S, 4.0f, 0.0f, 0.0f, 0.0f, 0.02f, 0.0f, 0.0f).Foam));
+            Calm = std::max(Calm, double(VoxelOceanSurfTrainOf(0, In, S, 1.0f, 0.0f, 0.0f, 0.0f, 0.02f, 0.0f, 0.0f).Foam));
+        }
+        std::printf("  the most: %.2f (bores 1 m deep, Hs 1.5), %.2f (9 m deep, Hs 0.8); a 5 s train's whitecaps 10 m deep: %.2f (Hs 4), %.2f (Hs 1)\n", Bore, Deep, Cap, Calm);
+        Check(Bore > 0.5, "the bores make white water in the surf zone", Bore, 0.5);
+        Check(Deep < 0.15, "a small sea past its surf zone: little", Deep, 0.15);
+        // (Stage W5g: a steep train's crests whiten by the open sea's rule, its squeeze in the rule's
+        // J (Pinch, since W5c), at the share of the sea it carries; its own steepness term counted it
+        // twice, at its whole height, and ended on a hard coast-aligned line with the trains' presence.)
+        Check(Cap < 1.0e-6, "a train past the bores' carpet makes no foam of its own (the open sea's rule has it)", Cap, 1.0e-6);
+        double Squeeze = 0.0;
+        for (int k = 0; k < 600; k++)
+            Squeeze = std::max(Squeeze, double(VoxelOceanSurfOf(Input(Beach, 10.0 / 0.02, 0.5f * k, 4.0f, 12.0f), S).Pinch));
+        std::printf("  the trains' squeeze 10 m deep (Hs 4): up to %.3f of J\n", Squeeze);
+        Check(Squeeze > 0.03, "its squeeze reaches the open sea's rule instead", Squeeze, 0.03);
+        Check(Calm == 0.0, "a gentle one's don't", Calm, 0.0);
+        const FVoxelOceanSurf In = VoxelOceanSurfOf(Input(Beach, 5.0 / 0.02, 10.0f), S);
+        const FVoxelOceanSurf Out = VoxelOceanSurfOf(Input(Beach, 45.0 / 0.02, 10.0f), S);
+        Check(In.SteepVar > 1.0e-4, "the trains' slope variance for the open sea's foam where they are", In.SteepVar, 1.0e-4);
+        Check(Out.SteepVar == 0.0f, "none past the cutoff", Out.SteepVar, 0.0);
+        // The swash's sheet: foamy where thin.
+        double Sheet = 0.0;
+        for (int k = 0; k < 300; k++)
+            Sheet = std::max(Sheet, double(VoxelOceanSurfOf(Input(Beach, -0.02 / 0.02, 1.0f * k), S).Foam));
+        Check(Sheet > 0.5, "the swash's thin sheet", Sheet, 0.5);
+        const FVoxelOceanSurf NoFoam = VoxelOceanSurfOf(Input(Beach, 1.0 / 0.02, 10.0f), Settings(1, 0.85f, 1, 1, 10, 0.2f, 0.25f, 0.0f));
+        Check(NoFoam.Foam == 0.0f, "surf foam 0: none", NoFoam.Foam, 0.0);
+
+        // Stage W3n: the whitecaps (Breaking) are on the bores, moving with them: at a point in the
+        // surf zone they come and go with each bore (white a small part of the time, solid when a
+        // bore passes); unresolved, they're their cycle's mean, steady; the carpet between bores
+        // is thin.
+        for (double Depth : { 0.6, 1.0, 1.6 })
+        {
+            const int Steps = 2400;
+            double Max = 0.0, Sum = 0.0, FoamSum = 0.0, FoamMin = 1.0;
+            std::vector<double> V(Steps);
+            for (int k = 0; k < Steps; k++)
+            {
+                const FVoxelOceanSurf R = VoxelOceanSurfOf(Input(Beach, Depth / 0.02, 0.05f * k), S);
+                V[size_t(k)] = R.Breaking;
+                Max = std::max(Max, double(R.Breaking));
+                Sum += R.Breaking;
+                FoamSum += R.Foam;
+                FoamMin = std::min(FoamMin, double(R.Foam));
+            }
+            int White = 0;
+            for (double X : V) if (X > 0.5 * Max) White++;
+            const double Share = double(White) / Steps;
+            std::printf("  %.1f m deep: whitecaps at most %.2f, mean %.3f, white (over half their most) %.0f%% of the time; foam mean %.2f, least %.2f\n",
+                Depth, Max, Sum / Steps, 100.0 * Share, FoamSum / Steps, FoamMin);
+            Check(Max > 0.5, "a passing bore is white", Max, 0.5);
+            Check(Share < 0.4, "white only while a bore passes (share of the time)", Share, 0.4);
+            Check(FoamMin < 0.2, "between the bores the carpet is thin", FoamMin, 0.2);
+        }
+        {
+            // Stage W3p: the breaking zone (stage W5g: whose foam lingers as the surf's; until W5g the
+            // surf's foam replaced the open sea's there): all of it
+            // in the surf zone and on the beach, none well out past it.
+            const float InZone = VoxelOceanSurfOf(Input(Beach, 1.0 / 0.02, 10.0f), S).Zone;
+            const float OnBeach = VoxelOceanSurfOf(Input(Beach, -0.05 / 0.02, 10.0f), S).Zone;
+            const float Out = VoxelOceanSurfOf(Input(Beach, 9.0 / 0.02, 10.0f, 0.8f, 8.0f), S).Zone;
+            std::printf("  the breaking zone: %.2f 1 m deep, %.2f on the beach, %.2f 9 m deep (Hs 0.8)\n", InZone, OnBeach, Out);
+            Check(InZone > 0.7f, "the surf zone is the surf's (its foam lingers as the surf's)", InZone, 0.7);
+            Check(Out < 0.05f, "well past it, the open sea's", Out, 0.05);
+            // The swash's foam comes and goes (no standing mat): stage W5f, the sheet white as it
+            // rushes up (until then only its thin edge foamed), draining away after its peak.
+            double SheetMin = 1.0, SheetMax = 0.0;
+            for (int k = 0; k < 300; k++)
+            {
+                const FVoxelOceanSurf R = VoxelOceanSurfOf(Input(Beach, -0.02 / 0.02, 1.0f * k), S);
+                SheetMin = std::min(SheetMin, double(R.Foam));
+                SheetMax = std::max(SheetMax, double(R.Foam));
+            }
+            std::printf("  the swash's sheet 2 cm above the still level: foam %.3f to %.3f over 300 s\n", SheetMin, SheetMax);
+            Check(SheetMax > 0.6, "the uprush's sheet is white water", SheetMax, 0.6);
+            Check(SheetMin < 0.15, "it drains away between uprushes (no standing mat)", SheetMin, 0.15);
+            // The thin edge band-limited to the footprint (stage W5f): its mean over a footprint kept,
+            // so a coarse texel holds its share rather than catching it or missing it.
+            {
+                FVoxelOceanSurfSettings SE = S;
+                const FBeach B2(0.05);
+                // At the instant the sheet's white water is least (the edge's foam alone, mostly).
+                float TLeast = 0.0f;
+                double Least = 1.0e9;
+                for (int k = 0; k < 600; k++)
+                {
+                    const double V = VoxelOceanSurfOf(Input(B2, -0.5, 0.5f * k), SE).Foam;
+                    if (V < Least) { Least = V; TLeast = 0.5f * k; }
+                }
+                double Fine = 0.0, Coarse = 0.0;
+                int Wet = 0;
+                const int Points = 2000;
+                for (int i = 0; i < Points; i++)
+                {
+                    // Points across 20 m of beach about the still level, at one instant, where the
+                    // sheet covers the beach (its foam elsewhere is under the terrain).
+                    const double X = -10.0 + 20.0 * (i + 0.5) / Points;
+                    FVoxelOceanSurfInput F = Input(B2, X, TLeast);
+                    FVoxelOceanSurfInput C = F;
+                    C.FootprintM = 4.0f;
+                    const FVoxelOceanSurf RF = VoxelOceanSurfOf(F, SE);
+                    if (RF.Height + F.DepthM <= 0.0f) continue;
+                    Wet++;
+                    Fine += RF.Foam;
+                    Coarse += VoxelOceanSurfOf(C, SE).Foam;
+                }
+                Fine /= std::max(Wet, 1);
+                Coarse /= std::max(Wet, 1);
+                std::printf("  the foam's mean over the wet part of 20 m of a 1:20 beach: %.3f exact, %.3f at a 4 m footprint\n", Fine, Coarse);
+                Check(std::abs(Coarse - Fine) < 0.25 * Fine + 0.02, "a coarse footprint keeps the swash foam's mean", std::abs(Coarse - Fine), 0.25 * Fine + 0.02);
+            }
+        }
+        {
+            // Unresolved (a 200 m footprint): steady, at the cycle's mean.
+            double Lo = 1.0, Hi = 0.0, Sum = 0.0;
+            double SumNear = 0.0;
+            for (int k = 0; k < 2400; k++)
+            {
+                FVoxelOceanSurfInput In = Input(Beach, 1.0 / 0.02, 0.05f * k);
+                SumNear += VoxelOceanSurfOf(In, S).Breaking;
+                In.FootprintM = 200.0f;
+                const double B = VoxelOceanSurfOf(In, S).Breaking;
+                Lo = std::min(Lo, B); Hi = std::max(Hi, B); Sum += B;
+            }
+            std::printf("  unresolved (200 m footprint): %.3f to %.3f (mean %.3f; resolved mean %.3f)\n", Lo, Hi, Sum / 2400, SumNear / 2400);
+            Check(Hi - Lo < 0.25 * std::max(Hi, 1e-6), "unresolved, the whitecaps are steady (their swing under a quarter)", (Hi - Lo) / std::max(Hi, 1e-6), 0.25);
+            Check(std::fabs(Sum - SumNear) < 0.15 * SumNear, "and average what the resolved bores do (15%)", std::fabs(Sum - SumNear) / std::max(SumNear, 1e-9), 0.15);
+        }
+        {
+            // A steep train past the bores' carpet (10 m deep, Hs 4): stage W5g, no whitecaps of its own.
+            int White = 0, Count = 0;
+            double Max = 0.0;
+            for (int k = 0; k < 2400; k++)
+            {
+                FVoxelOceanSurfInput In = Input(Beach, 10.0 / 0.02, 0.05f * k);
+                const double B = VoxelOceanSurfTrainOf(0, In, S, 4.0f, 0.0f, 0.0f, 0.0f, 0.02f, 0.0f, 0.0f).Bore;
+                Max = std::max(Max, B);
+                if (B > 0.15) White++;
+                Count++;
+            }
+            std::printf("  a steep train's crests: whitecaps at most %.2f, over 0.15 %.0f%% of the time\n", Max, 100.0 * White / Count);
+            Check(Max < 1.0e-6, "a steep train past the bores' carpet: no whitecaps of its own (stage W5g)", Max, 1.0e-6);
+            Check(double(White) / Count < 0.25, "on its crests only", double(White) / Count, 0.25);
+        }
+    }
+
+    std::printf("\n== the bound\n");
+    {
+        for (int Strong = 0; Strong < 2; Strong++)
+        {
+            const FVoxelOceanSurfSettings SS = Strong ? Settings(1.0f, 0.85f, 2.0f, 2.0f) : S;
+            const float Speed = Strong ? 24.0f : 15.0f;
+            double Highest = 0.0;
+            for (int b = 0; b < 3; b++)
+            {
+                const FBeach Bch(b == 0 ? 0.005 : (b == 1 ? 0.02 : 0.1));
+                for (int j = 0; j < 80; j++)
+                    for (int k = 0; k < 900; k++)
+                    {
+                        const double D = -0.5 + 0.15 * j;
+                        Highest = std::max(Highest, double(VoxelOceanSurfOf(Input(Bch, D / Bch.M, 0.9f * k, 2.0f, Speed, 37.0f * j), SS).Height));
+                    }
+            }
+            const double Bound = VoxelOceanSurfMaxHeight(2.0f, SS);
+            std::printf("  %s: highest %.2f m for Hs 2 m (bound %.2f m)\n", Strong ? "strength and swash 2" : "defaults", Highest, Bound);
+            Check(Highest < Bound, "within the surf's bound (VoxelOceanSurfMaxHeight, the model's reach)", Highest, Bound);
+        }
+    }
+
+    std::printf("\n== the mean shoreline (stage W5i): ground under the setup's water is sea, not beach\n");
+    {
+        // A point 3 cm above the still level on a 1:50 beach, under the setup: the bores run over it
+        // (its surface moves along the beach) rather than the swash's flat sheet standing on it.
+        const FBeach Flat(0.02);
+        const FVoxelOceanSurfSettings SS = Settings(1.0f, 0.85f, 0.33f, 1.0f, 1000.0f, 0.2f, 0.5f, 1.0f);
+        double Structure = 0.0;
+        for (int k = 0; k < 200; k++)
+        {
+            double M1 = 0.0, M2 = 0.0;
+            for (int j = -10; j <= 10; j++)
+            {
+                const double H = VoxelOceanSurfOf(Input(Flat, -0.03 / 0.02 + 0.1 * j, 100.0f + 0.1f * k, 4.0f, 10.0f), SS).Height;
+                M1 += H; M2 += H * H;
+            }
+            M1 /= 21.0;
+            Structure += std::sqrt(std::max(M2 / 21.0 - M1 * M1, 0.0));
+        }
+        Structure /= 200.0;
+        std::printf("  3 cm above the still level (Hs 4, swash 0.33): the surface's deviation across 2 m %.4f m\n", Structure);
+        Check(Structure > 0.002, "the bores run on over it (not the sheet's flat level)", Structure, 0.002);
+    }
+
+    std::printf("\n== the felt depth at the coast (stage W5e; VoxelOceanSurfFeltDepth)\n");
+    {
+        const float Blend = VOXEL_OCEAN_SURF_FELT_BLEND;
+        // Its rule: never shallower than the smoothed depth, never deeper than the deeper of the
+        // two, the terrain's own on the smoothed field's land side, the smoothed past the blend,
+        // unknown beds and basins (deeply negative) ignored; continuous.
+        double Below = 0.0, Above = 0.0, Land = 0.0, Past = 0.0, Unknown = 0.0, Jump = 0.0;
+        for (int b = 0; b < 41; b++)
+        {
+            const float Bed = -2.0f + 0.25f * b;
+            float Prev = VoxelOceanSurfFeltDepth(-6.0f, Bed, Blend);
+            for (int i = 1; i <= 2400; i++)
+            {
+                const float D = -6.0f + 0.005f * i;
+                const float F = VoxelOceanSurfFeltDepth(D, Bed, Blend);
+                Below = std::max(Below, double(D - F));
+                Above = std::max(Above, double(F - std::max(D, Bed)));
+                if (D <= 0.0f) Land = std::max(Land, std::abs(double(F - std::max(D, Bed))));
+                if (D >= Blend) Past = std::max(Past, std::abs(double(F - D)));
+                Jump = std::max(Jump, std::abs(double(F - Prev)));
+                Prev = F;
+                Unknown = std::max(Unknown, std::abs(double(VoxelOceanSurfFeltDepth(D, 1.0e30f, Blend) - D)));
+                Unknown = std::max(Unknown, std::abs(double(VoxelOceanSurfFeltDepth(D, -1.0e6f, Blend) - D)));
+            }
+        }
+        Check(Below <= 0.0, "never shallower than the smoothed depth (m)", Below, 0.0);
+        Check(Above <= 1.0e-6, "never deeper than the deeper of the two (m)", Above, 1.0e-6);
+        Check(Land <= 1.0e-6, "the deeper of the two on the smoothed field's land side (m)", Land, 1.0e-6);
+        Check(Past <= 1.0e-6, "the smoothed depth past the blend (m)", Past, 1.0e-6);
+        Check(Unknown <= 0.0, "an unknown bed or a basin's leaves the smoothed depth (m)", Unknown, 0.0);
+        Check(Jump < 0.02, "continuous: largest step over 5 mm of smoothed depth (m)", Jump, 0.02);
+
+        // A coast whose land rises behind the beach: the smoothed depth 1 m shallower than the
+        // terrain's own near the shore (its 0 line 50 m out on a 1:50 beach). Between that line and
+        // the waterline the waves used to stop (the smoothed depth under 0: the swash's flat
+        // level); with the felt depth they run on to the waterline.
+        const FBeach Bch(0.02);
+        const FVoxelOceanSurfSettings SS = Settings(1.0f, 0.85f, 0.33f, 1.0f, 1000.0f, 0.2f, 0.5f, 1.0f);
+        // The waves' structure along the way (a flat sheet has none): the surface's deviation
+        // across 10 m about the point, averaged over 20 s.
+        auto Structure = [&](double X, bool bFelt)
+        {
+            double Sum = 0.0;
+            for (int k = 0; k < 200; k++)
+            {
+                double M1 = 0.0, M2 = 0.0;
+                for (int j = -10; j <= 10; j++)
+                {
+                    FVoxelOceanSurfInput In = Input(Bch, X + 0.5 * j, 100.0f + 0.1f * k, 2.0f, 10.0f);
+                    const float Own = In.DepthM;
+                    const float Smooth = Own - 1.0f;
+                    In.DepthM = bFelt ? VoxelOceanSurfFeltDepth(Smooth, Own, Blend) : Smooth;
+                    In.BedDepthM = Own;
+                    const double H = VoxelOceanSurfOf(In, SS).Height;
+                    M1 += H;
+                    M2 += H * H;
+                }
+                M1 /= 21.0;
+                Sum += std::sqrt(std::max(M2 / 21.0 - M1 * M1, 0.0));
+            }
+            return Sum / 200.0;
+        };
+        for (int i = 0; i < 3; i++)
+        {
+            const double X = 15.0 + 12.5 * i;     // 0.3 to 0.8 m of the terrain's own depth
+            const double Old = Structure(X, false), New = Structure(X, true);
+            std::printf("  %4.2f m of water (smoothed %+.2f m): the waves' deviation across 10 m %.4f m smoothed, %.4f m felt\n",
+                Bch.M * X, Bch.M * X - 1.0, Old, New);
+            Check(New > 5.0 * Old && New > 0.01, "the waves run on where the smoothed depth reads land (felt, m)", New, std::max(5.0 * Old, 0.01));
+        }
+    }
+
+    std::printf("\n%s: %d failure(s)\n", Fails ? "FAILED" : "PASSED", Fails);
+    return Fails ? 1 : 0;
+}
