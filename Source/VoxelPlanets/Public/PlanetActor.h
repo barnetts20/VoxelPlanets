@@ -534,8 +534,32 @@ private:
     bool UpdateClimateCapture();
     /** The land's share and the distance to the sea for the bake (false without one). */
     bool EnsureLandClimateBase();
-    /** The map for the capture, faded in over the shown one. */
+    /** The map for the capture, faded in over the shown one. Stage P1i (S2): made on the thread
+     *  pool (VoxelLandClimate::BuildMap and MakeField, "any thread": 60-120 ms that were one spawn
+     *  tick's) and applied by TickClimateFieldJob when it lands; a request for what is already
+     *  being made waits for it. */
     void RebuildLandClimateTarget();
+    /** Stage P1i: takes the field job's result when it is ready (the map, the field, the fade), and
+     *  lets go of superseded jobs that have finished. True while one is under way. */
+    bool TickClimateFieldJob();
+
+    /** Stage P1i: what a field job makes, and the job. */
+    struct FClimateFieldResult
+    {
+        FVoxelLandClimateMap Map;
+        bool bFromSim = false;
+        TSharedPtr<const FVoxelLandClimateField, ESPMode::ThreadSafe> Field;
+    };
+    TFuture<TSharedPtr<FClimateFieldResult, ESPMode::ThreadSafe>> ClimateFieldFuture;
+    /** What the job under way is for (its inputs' hash) and the climate base it is made on. */
+    uint32 ClimateFieldFutureKey = 0;
+    uint32 ClimateFieldFutureBaseKey = 0;
+    /** Superseded jobs, kept until they finish so their fields are released on the game thread
+     *  (a field's GPU copy goes through a render command). */
+    TArray<TFuture<TSharedPtr<FClimateFieldResult, ESPMode::ThreadSafe>>> ClimateFieldDiscarded;
+    /** The capture's status line, written when its field lands (it says whether the sim's
+     *  climate was used, which only the map knows): the snapshot's delay (s), or below 0 for none. */
+    double ClimateSnapshotStatusDelay = -1.0;
     void UploadLandClimate();
     /** What the map depends on (the settings' map hash and the planet's latitude curve and warmth). */
     uint32 LandClimateMapHash() const;
@@ -668,6 +692,18 @@ private:
     /** Builds the shared compositor (VoxelDensity::MakeCompositor) with a fresh
      *  FSparseEditStore covering the terrain lattice's root box down to MaxDepth. */
     TSharedPtr<FDensitySampleCompositor> BuildCompositor(double PlanetRadius, double NoiseAmplitude, double RootExtent, int32 MaxDepth);
+
+    /** Stage P1i (S2): a terrestrial build's compositor made on the thread pool ahead of
+     *  Initialize (MakeTerrestrialCompositor, 45-85 ms: the density's packed fields), which
+     *  BuildCompositor takes when it is for the same inputs. False while it is under way. */
+    bool PrebuildCompositor();
+    /** The edit store a compositor at this root box and depth keeps (the held one: the same
+     *  planet and lattice), or null for a fresh one (BuildCompositor's rule, R1 PLN-4). */
+    TSharedPtr<FSparseEditStore> HeldEditStore(double RootExtent, int32 MaxDepth) const;
+    /** The prebuild's inputs' hash. */
+    uint32 CompositorKey(double PlanetRadius, double NoiseAmplitude, double RootExtent, int32 MaxDepth) const;
+    TFuture<TSharedPtr<FDensitySampleCompositor>> CompositorFuture;
+    uint32 CompositorFutureKey = 0;
 
     /** Computes ocean radius from planet radius, noise amplitude, and SeaLevel.
      *  OceanRadius = PlanetRadius + SeaLevel * NoiseAmplitude, at least 1 cm (a sea level

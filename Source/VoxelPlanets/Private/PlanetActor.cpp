@@ -295,6 +295,9 @@ void APlanetActor::Tick(float DeltaTime)
             ConfigureAtmosphere(SeaRadius, SeaRadius);
         }
 
+        // Stage P1i: a climate field made on a worker since the last tick is taken first.
+        TickClimateFieldJob();
+
         // A terrestrial planet is built once its bake is ready; until then it shows what it
         // showed (nothing on the first build).
         if (Generator == EVoxelSurfaceGenerator::Terrestrial && !TickLandBake())
@@ -320,10 +323,17 @@ void APlanetActor::Tick(float DeltaTime)
         if (Generator == EVoxelSurfaceGenerator::Terrestrial && (IsLandClimateFieldStale()
             || (LandClimateField.IsValid() && ClimateMapHash != LandClimateMapHash() && ClimateBaseKey == CurrentClimateBaseKey())))
             RebuildLandClimateTarget();
+        // Stage P1i (S2): the field is made on a worker; the build waits for it (the shelf is
+        // placed by it, the terrain's dunes too).
+        if (Generator == EVoxelSurfaceGenerator::Terrestrial && TickClimateFieldJob())
+            return;
         // T5e: the ice shelf in the terrain's bake, by the climate captured. Stage P1d: made on a
         // worker; the build waits for it (a few frames) as it waits for the bake, so the field's
         // tick and Initialize's are no longer one tick with the shelf in it.
         if (Generator == EVoxelSurfaceGenerator::Terrestrial && !UpdateIceShelf())
+            return;
+        // Stage P1i (S2): and the compositor on a worker too, for Initialize to take.
+        if (Generator == EVoxelSurfaceGenerator::Terrestrial && !PrebuildCompositor())
             return;
         bPendingInitialize = false;
         bPendingOceanUpdate = false;
@@ -956,10 +966,10 @@ bool APlanetActor::UpdateClimateCapture()
         ClimateCaptureState = EVoxelPlanetClimateCapture::Captured;
         ShowAtOnce();
         RebuildLandClimateTarget();
-        LandClimateStatus = bClimateFromSim
-            ? FString::Printf(TEXT("Snapshot: the sim's climate, captured %.1f s after the request; kept for this seed."), Latest->RequestSeconds - ClimateCaptureStart)
-            : FString(TEXT("Provisional model: the sim's snapshot had no precipitation."));
-        UE_LOG(LogVoxelPlanets, Log, TEXT("[Planet] %s: %s"), *GetName(), *LandClimateStatus);
+        // Stage P1i: the status says whether the sim's climate was used, which only the map knows:
+        // written (and logged) when the field job lands (TickClimateFieldJob).
+        ClimateSnapshotStatusDelay = Latest->RequestSeconds - ClimateCaptureStart;
+        LandClimateStatus = TEXT("Snapshot captured; making the land's climate from it.");
         return true;
     }
     // No snapshot coming. The provisional model, kept for this seed (the terrain mustn't change
@@ -1010,32 +1020,85 @@ void APlanetActor::RebuildLandClimateTarget()
     TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::RebuildLandClimateTarget);
     FSpentScope Spent(SpawnTimeline, ESpawnSpent::Field);
     if (ClimateLand.Num() != VoxelLandClimate::Width() * VoxelLandClimate::Height()) return;
-    FVoxelLandClimateMap Map;
     // T5e: the ice shelf's share in the map (the material's whitening, the chain's ice and rivers).
+    const bool bShelf = IceShelfOn() && LandBake.IsValid();
     const FVoxelLandShelfParams Shelf = VoxelLandClimate::ShelfParamsFor(TerrestrialSettings, LandBake.IsValid() ? LandBake->PlateSeed : 0u);
-    bClimateFromSim = VoxelLandClimate::BuildMap(ClimateLand, ClimateCoast, ClimateSim.Get(), LandClimate, GetActorScale3D().GetMax() * 0.01,
-        ClimateEquatorTemperature, ClimatePoleTemperature, ClimateLatitudeExponent, ClimateWarmthScale, Map, &ClimateHeight,
-        IceShelfOn() && LandBake.IsValid() ? &Shelf : nullptr);
     ClimateMapHash = LandClimateMapHash();
-    // Stage T5c: the land chain's climate, from the target (the sim's drift with it, or the
-    // provisional winds).
-    LandClimateField = VoxelLandClimate::MakeField(Map, bClimateFromSim ? ClimateSim.Get() : nullptr, ClimateLapseRate, ClimateLand, ClimateHeight,
-        GetActorScale3D().GetMax() * 0.01, (float)TerrestrialSettings.IceSheetMaxThickness);
-    LandClimateFieldBaseKey = ClimateBaseKey;
+
+    // Stage P1i (S2): what the map and the field are made from (the base by its key, the sim's
+    // climate by its pointer: each map is new); a job for the same is waited for, not repeated.
+    uint32 Key = HashCombine(ClimateBaseKey, ClimateMapHash);
+    Key = HashCombine(Key, PointerHash(ClimateSim.Get()));
+    Key = HashCombine(Key, GetTypeHash(ClimateLapseRate));
+    Key = HashCombine(Key, GetTypeHash(TerrestrialSettings.IceSheetMaxThickness));
+    Key = HashCombine(Key, GetTypeHash(bShelf));
+    Key |= 1u;
+    if (ClimateFieldFuture.IsValid())
+    {
+        if (ClimateFieldFutureKey == Key) return;
+        ClimateFieldDiscarded.Add(MoveTemp(ClimateFieldFuture));
+        ClimateFieldFuture = TFuture<TSharedPtr<FClimateFieldResult, ESPMode::ThreadSafe>>();
+    }
+
+    // The same two calls with the same inputs as before P1i, on the thread pool: the base copied
+    // (a few hundred KB), the sim's climate held.
+    ClimateFieldFutureKey = Key;
+    ClimateFieldFutureBaseKey = ClimateBaseKey;
+    ClimateFieldFuture = Async(EAsyncExecution::ThreadPool,
+        [Land = ClimateLand, Coast = ClimateCoast, Height = ClimateHeight, Sim = ClimateSim, Settings = LandClimate,
+            SeaRadiusM = GetActorScale3D().GetMax() * 0.01, Equator = ClimateEquatorTemperature, Pole = ClimatePoleTemperature,
+            Exponent = ClimateLatitudeExponent, Warmth = ClimateWarmthScale, Lapse = ClimateLapseRate,
+            IceMax = (float)TerrestrialSettings.IceSheetMaxThickness, bShelf, Shelf]() -> TSharedPtr<FClimateFieldResult, ESPMode::ThreadSafe>
+        {
+            TSharedPtr<FClimateFieldResult, ESPMode::ThreadSafe> Out = MakeShared<FClimateFieldResult, ESPMode::ThreadSafe>();
+            Out->bFromSim = VoxelLandClimate::BuildMap(Land, Coast, Sim.Get(), Settings, SeaRadiusM,
+                Equator, Pole, Exponent, Warmth, Out->Map, &Height, bShelf ? &Shelf : nullptr);
+            // Stage T5c: the land chain's climate, from the target (the sim's drift with it, or the
+            // provisional winds).
+            Out->Field = VoxelLandClimate::MakeField(Out->Map, Out->bFromSim ? Sim.Get() : nullptr, Lapse, Land, Height, SeaRadiusM, IceMax);
+            return Out;
+        });
+}
+
+bool APlanetActor::TickClimateFieldJob()
+{
+    // Superseded jobs, let go once done (here, on the game thread).
+    for (int32 i = ClimateFieldDiscarded.Num() - 1; i >= 0; i--)
+        if (!ClimateFieldDiscarded[i].IsValid() || ClimateFieldDiscarded[i].IsReady())
+            ClimateFieldDiscarded.RemoveAtSwap(i);
+    if (!ClimateFieldFuture.IsValid()) return false;
+    if (!ClimateFieldFuture.IsReady()) return true;
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::TickClimateFieldJob);
+    const TSharedPtr<FClimateFieldResult, ESPMode::ThreadSafe> Result = ClimateFieldFuture.Get();
+    ClimateFieldFuture = TFuture<TSharedPtr<FClimateFieldResult, ESPMode::ThreadSafe>>();
+    if (!Result.IsValid()) return false;
+
+    bClimateFromSim = Result->bFromSim;
+    LandClimateField = Result->Field;
+    LandClimateFieldBaseKey = ClimateFieldFutureBaseKey;
+    if (ClimateSnapshotStatusDelay >= 0.0)
+    {
+        LandClimateStatus = bClimateFromSim
+            ? FString::Printf(TEXT("Snapshot: the sim's climate, captured %.1f s after the request; kept for this seed."), ClimateSnapshotStatusDelay)
+            : FString(TEXT("Provisional model: the sim's snapshot had no precipitation."));
+        UE_LOG(LogVoxelPlanets, Log, TEXT("[Planet] %s: %s"), *GetName(), *LandClimateStatus);
+        ClimateSnapshotStatusDelay = -1.0;
+    }
     if (!ClimateShown.IsValid() || LandClimate.FadeSeconds <= 0.0f)
     {
         // The first map (or no fade): at once.
-        ClimateShown = MoveTemp(Map);
+        ClimateShown = MoveTemp(Result->Map);
         ClimateFrom.Empty();
         ClimateTarget.Cells.Empty();
         ClimateFade = 1.0f;
         UploadLandClimate();
-        return;
+        return false;
     }
     // Fades in from what is shown now (mid-fade, from the blend).
     ClimateFrom = ClimateShown.Cells;
-    ClimateTarget = MoveTemp(Map);
+    ClimateTarget = MoveTemp(Result->Map);
     ClimateFade = 0.0f;
+    return false;
 }
 
 bool APlanetActor::IceShelfOn() const
@@ -1185,6 +1248,11 @@ void APlanetActor::TickLandClimate(float DeltaTime)
             ClimateHeight.Empty();
             ClimateSim.Reset();
             LandClimateField.Reset();
+            // (Stage P1i: a field under way finishes unread.)
+            if (ClimateFieldFuture.IsValid())
+                ClimateFieldDiscarded.Add(MoveTemp(ClimateFieldFuture));
+            ClimateFieldFuture = TFuture<TSharedPtr<FClimateFieldResult, ESPMode::ThreadSafe>>();
+            ClimateSnapshotStatusDelay = -1.0;
             ClimateBaseKey = 0u;
             ClimateCaptureKey = 0u;
             ClimateCaptureState = EVoxelPlanetClimateCapture::None;
@@ -1193,6 +1261,9 @@ void APlanetActor::TickLandClimate(float DeltaTime)
         }
         return;
     }
+
+    // Stage P1i: a field made since the last tick.
+    TickClimateFieldJob();
 
     // The capture (the build waited for it unless bWaitForClimate is off; a change after the build,
     // such as a new atmosphere seed, captures again here). Then the map's own settings.
@@ -1340,11 +1411,8 @@ void APlanetActor::RecordAppliedState()
 // Compositor
 // ---------------------------------------------------------------------------
 
-TSharedPtr<FDensitySampleCompositor> APlanetActor::BuildCompositor(
-    double PlanetRadius, double NoiseAmplitude, double RootExtent, int32 MaxDepth)
+TSharedPtr<FSparseEditStore> APlanetActor::HeldEditStore(double RootExtent, int32 MaxDepth) const
 {
-    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::BuildCompositor);
-    FSpentScope Spent(SpawnTimeline, ESpawnSpent::Compositor);
     // The edit store: kept across a rebuild of the same planet that leaves the lattice as it is
     // (the same generator and surface settings, root box and depth: a climate landing after the
     // build, a recapture, the climate's settings), so the edits dug meanwhile survive it (R1,
@@ -1354,14 +1422,84 @@ TSharedPtr<FDensitySampleCompositor> APlanetActor::BuildCompositor(
     TSharedPtr<FSparseEditStore> EditStore = bSamePlanet && SharedCompositor.IsValid() ? SharedCompositor->GetEditStore() : nullptr;
     const double HalfFinest = RootExtent / FMath::Pow(2.0, (double)FMath::Max(MaxDepth, 0));
     if (!EditStore.IsValid() || !EditStore->GetCenter().IsZero() || EditStore->GetExtent() != RootExtent || EditStore->GetHalfFinest() != HalfFinest)
-        EditStore = MakeShared<FSparseEditStore>(FVector::ZeroVector, RootExtent, MaxDepth);
+        return nullptr;
+    return EditStore;
+}
 
+uint32 APlanetActor::CompositorKey(double PlanetRadius, double NoiseAmplitude, double RootExtent, int32 MaxDepth) const
+{
+    uint32 Key = HashCombine(PointerHash(TerrainBake().Get()), PointerHash(DuneClimate().Get()));
+    Key = HashCombine(Key, TerrestrialSettings.GetSettingsHash());
+    Key = HashCombine(Key, GetTypeHash(PlanetRadius));
+    Key = HashCombine(Key, GetTypeHash(NoiseAmplitude));
+    Key = HashCombine(Key, GetTypeHash(RootExtent));
+    Key = HashCombine(Key, GetTypeHash(MaxDepth));
+    Key = HashCombine(Key, PointerHash(HeldEditStore(RootExtent, MaxDepth).Get()));
+    return Key | 1u;
+}
+
+bool APlanetActor::PrebuildCompositor()
+{
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::PrebuildCompositor);
+    // Only where Initialize would build a terrestrial compositor; else it builds as before.
+    if (Generator != EVoxelSurfaceGenerator::Terrestrial || !LandBake.IsValid()) return true;
+    SpawnChildActors();
+    if (!TerrainActor) return true;
+    double PlanetRadius = 0.0, NoiseAmplitude = 0.0, OceanRadius = 0.0;
+    ComputeShape(PlanetRadius, NoiseAmplitude, OceanRadius);
+    const double RootExtent = VoxelDensity::RootExtentFor(PlanetRadius, NoiseAmplitude);
+    const int32 MaxDepth = APlanetTerrainActor::MaxDepthFor(RootExtent, TerrainActor->TargetPrecision);
+    const uint32 Key = CompositorKey(PlanetRadius, NoiseAmplitude, RootExtent, MaxDepth);
+    if (CompositorFuture.IsValid() && CompositorFutureKey == Key)
+        return CompositorFuture.IsReady();
+
+    // BuildCompositor's call, with BuildCompositor's inputs, on the thread pool: the density reads
+    // the bake, the climate and the noise pack (shared, immutable; the pack's registry locks), and
+    // the compositor holds the edit store without writing it.
+    TSharedPtr<FSparseEditStore> EditStore = HeldEditStore(RootExtent, MaxDepth);
+    if (!EditStore.IsValid())
+        EditStore = MakeShared<FSparseEditStore>(FVector::ZeroVector, RootExtent, MaxDepth);
     const double Finest = VoxelDensity::TerrainFinestCell(PlanetRadius, NoiseAmplitude, MaxDepth);
+    CompositorFutureKey = Key;
+    CompositorFuture = Async(EAsyncExecution::ThreadPool,
+        [Settings = TerrestrialSettings, Bake = TerrainBake(), PlanetRadius, NoiseAmplitude, EditStore, Finest, Climate = DuneClimate()]()
+        {
+            return VoxelDensity::MakeTerrestrialCompositor(Settings, Bake, PlanetRadius, NoiseAmplitude, EditStore, Finest, Climate);
+        });
+    return false;
+}
+
+TSharedPtr<FDensitySampleCompositor> APlanetActor::BuildCompositor(
+    double PlanetRadius, double NoiseAmplitude, double RootExtent, int32 MaxDepth)
+{
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::BuildCompositor);
+    FSpentScope Spent(SpawnTimeline, ESpawnSpent::Compositor);
+
     if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid())
     {
         // Stage T5c: the dunes by the climate captured for this seed (the build waited for it,
         // unless bWaitForClimate is off: TickLandClimate rebuilds once it lands).
         LandClimateFieldBuilt = DuneClimateHash();
+        // Stage P1i (S2): the one made on a worker, when it is for these inputs.
+        if (CompositorFuture.IsValid())
+        {
+            const bool bMatch = CompositorFutureKey == CompositorKey(PlanetRadius, NoiseAmplitude, RootExtent, MaxDepth)
+                && CompositorFuture.IsReady();
+            TSharedPtr<FDensitySampleCompositor> Made = bMatch ? CompositorFuture.Get() : nullptr;
+            CompositorFuture = TFuture<TSharedPtr<FDensitySampleCompositor>>();
+            CompositorFutureKey = 0;
+            if (Made.IsValid())
+                return Made;
+        }
+    }
+
+    TSharedPtr<FSparseEditStore> EditStore = HeldEditStore(RootExtent, MaxDepth);
+    if (!EditStore.IsValid())
+        EditStore = MakeShared<FSparseEditStore>(FVector::ZeroVector, RootExtent, MaxDepth);
+
+    const double Finest = VoxelDensity::TerrainFinestCell(PlanetRadius, NoiseAmplitude, MaxDepth);
+    if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid())
+    {
         // T5e: on the terrain's bake (with the ice shelf when there is one).
         return VoxelDensity::MakeTerrestrialCompositor(TerrestrialSettings, TerrainBake(), PlanetRadius, NoiseAmplitude, EditStore, Finest, DuneClimate());
     }

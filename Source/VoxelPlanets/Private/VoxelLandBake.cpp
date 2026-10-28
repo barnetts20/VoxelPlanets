@@ -102,6 +102,11 @@ static TAutoConsoleVariable<int32> CVarVoxelDebugLand(
     TEXT("1: log the terrestrial bake's progress and timings."),
     ECVF_Default);
 
+static TAutoConsoleVariable<int32> CVarVoxelLandNoisePacksKept(
+    TEXT("voxel.Land.NoisePacksKept"), 0,
+    TEXT("P1j: the noise packs kept alive after every planet and density let them go, most recently taken first (each about 450 MB at the default sets: its words in memory and its GPU copy). 0: none; a pack goes with its last holder and is read again if asked for again (about 0.5 s on a worker, beside the bake). Packs made but not yet taken are always kept (up to four). R1a kept the four most recently made."),
+    ECVF_Default);
+
 namespace VoxelLandCache
 {
     bool IsUsable(const FVoxelLandBake& Bake);
@@ -560,6 +565,9 @@ double VoxelLand::RiverReachM(const FVoxelTerrestrialSettings& Settings, float L
 
 FVoxelLandNoiseSet::~FVoxelLandNoiseSet()
 {
+    // P1j: shows when a pack goes (its words here, its GPU copy on the render thread).
+    UE_LOG(LogVoxelPlanets, Log, TEXT("[VoxelLand] Noise pack %s released (%.0f MB of words and its GPU copy)."), *Name,
+        (double)Words.Num() * sizeof(uint32) / 1048576.0);
     if (GPU.IsValid())
     {
         TSharedPtr<FVoxelLandNoiseGPU, ESPMode::ThreadSafe> Resource = MoveTemp(GPU);
@@ -586,8 +594,8 @@ namespace VoxelLandNoiseDetail
     constexpr uint64 MaxRows = 16384;
 
     /** A pack by key. The densities that sample it hold it; the registry only watches it (and
-     *  keeps the few most recent alive: Recent), so a pack nobody uses any more goes, with its
-     *  GPU copy, and is made again if asked for. */
+     *  keeps those not yet taken alive: Pending; P1j), so a pack nobody uses any more goes, with
+     *  its GPU copy, and is made again if asked for. */
     struct FEntry
     {
         TWeakPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Set;
@@ -596,14 +604,22 @@ namespace VoxelLandNoiseDetail
         bool bPending = false;
     };
 
-    // The packs kept alive whatever uses them: those just made, so a planet that waited for one
-    // finds it when it builds its density.
-    constexpr int32 RecentCount = 4;
+    // P1j: the packs kept alive whatever uses them. Pending: those made and not yet taken (by
+    // TryGetLandNoise or GetLandNoise), so a planet that waited for one finds it when it asks;
+    // at most PendingCount (a pack prewarmed for a planet that has since moved on to another
+    // goes when four newer ones are made). Kept: after they were taken, the
+    // voxel.Land.NoisePacksKept most recently taken (none by default: a pack then lives exactly
+    // as long as a planet or a density holds it). R1a kept the four most recently made, so up to
+    // three packs (each ~224 MB of words and a ~224 MB GPU copy) outlived the reseeds that
+    // replaced them.
+    constexpr int32 PendingCount = 4;
+    using FPackRef = TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>;
 
-    FCriticalSection Lock;        // Entries, Recent, the folder's list, the flags (held briefly)
+    FCriticalSection Lock;        // Entries, Pending, Kept, the folder's list, the flags (held briefly)
     FCriticalSection MakeLock;    // one pack made at a time (held while reading or generating)
     TMap<FString, FEntry> Entries;
-    TArray<TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>> Recent;
+    TArray<FPackRef> Pending;
+    TArray<FPackRef> Kept;
     FString Directory;            // NoiseSetDirectory, found on the game thread (StartupModule)
     bool bDirectoryKnown = false;
     TArray<FString> AuthoredPeaks;
@@ -1154,6 +1170,9 @@ namespace VoxelLandNoiseDetail
     /** Stores Pack under Key (Lock taken here). */
     void Store(const FString& Key, const TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>& Pack)
     {
+        // A pack let go here is released after the lock (its words freed, its GPU copy's release
+        // enqueued).
+        TArray<FPackRef> Dropped;
         FScopeLock ScopeLock(&Lock);
         if (bClosed) return;
         FEntry& Entry = Entries.FindOrAdd(Key);
@@ -1162,9 +1181,9 @@ namespace VoxelLandNoiseDetail
         Entry.bReady = true;
         if (Pack.IsValid())
         {
-            Recent.Remove(Pack);
-            Recent.Insert(Pack, 0);
-            if (Recent.Num() > RecentCount) Recent.SetNum(RecentCount);
+            Pending.Remove(Pack);
+            Pending.Insert(Pack, 0);
+            while (Pending.Num() > PendingCount) Dropped.Add(Pending.Pop(EAllowShrinking::No));
         }
         // Dropped before the RHI goes (each pack's GPU copy is released on the render thread).
         if (!bExitHooked)
@@ -1187,6 +1206,42 @@ namespace VoxelLandNoiseDetail
     {
         FScopeLock ScopeLock(&Lock);
         return FindReadyLocked(Key, Out);
+    }
+
+    /** P1j: Pack handed to a holder (a planet or a density): no longer pending; among the kept
+     *  ones if voxel.Land.NoisePacksKept asks for any (Lock held; what goes is moved to Dropped,
+     *  released after the lock). */
+    void TakeLocked(const FPackRef& Pack, TArray<FPackRef>& Dropped)
+    {
+        if (!Pack.IsValid() || bClosed) return;
+        Pending.Remove(Pack);
+        const int32 Keep = FMath::Clamp(CVarVoxelLandNoisePacksKept.GetValueOnAnyThread(), 0, 16);
+        Kept.Remove(Pack);
+        if (Keep > 0) Kept.Insert(Pack, 0);
+        while (Kept.Num() > Keep) Dropped.Add(Kept.Pop(EAllowShrinking::No));
+    }
+
+    void Take(const FPackRef& Pack)
+    {
+        TArray<FPackRef> Dropped;
+        FScopeLock ScopeLock(&Lock);
+        TakeLocked(Pack, Dropped);
+    }
+
+    /** The pack Key, made here if it isn't there (MakeLock while making); not taken. */
+    FPackRef FindOrMake(const FString& Key)
+    {
+        FPackRef Pack;
+        if (Key.IsEmpty()) return Pack;
+        if (FindReady(Key, Pack)) return Pack;
+        FScopeLock MakeScope(&MakeLock);
+        // Made meanwhile by another thread?
+        if (FindReady(Key, Pack)) return Pack;
+        // Kept under the key while a planet uses it (an error isn't repeated meanwhile); asked for
+        // again after that, the files are read again.
+        Pack = MakePackLocked(Key);
+        Store(Key, Pack);
+        return Pack;
     }
 
     /** A set name as a setting gives it: trimmed, without a .vxnt; empty if it names a path. */
@@ -1496,16 +1551,9 @@ TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> VoxelLand::GetLandNois
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLand::GetLandNoise);
     using namespace VoxelLandNoiseDetail;
-    TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Pack;
-    if (Key.IsEmpty()) return Pack;
-    if (FindReady(Key, Pack)) return Pack;
-    FScopeLock MakeScope(&MakeLock);
-    // Made meanwhile by another thread?
-    if (FindReady(Key, Pack)) return Pack;
-    // Kept under the key while a planet uses it (an error isn't repeated meanwhile); asked for
-    // again after that, the files are read again.
-    Pack = MakePackLocked(Key);
-    Store(Key, Pack);
+    // The caller holds it from here (a density): no longer pending.
+    const FPackRef Pack = FindOrMake(Key);
+    Take(Pack);
     return Pack;
 }
 
@@ -1519,6 +1567,8 @@ bool VoxelLand::TryGetLandNoise(const FString& Key, TSharedPtr<const FVoxelLandN
         return true;
     }
     if (!FindReady(Key, Pack)) return false;
+    // The caller holds it from here (the planet, until its density has taken it).
+    Take(Pack);
     Out = MoveTemp(Pack);
     return true;
 }
@@ -1538,7 +1588,8 @@ void VoxelLand::PrewarmLandNoise(const FString& Key)
     }
     Async(EAsyncExecution::ThreadPool, [Key]()
         {
-            GetLandNoise(Key);
+            // Made and left pending (not taken: nothing holds it here).
+            VoxelLandNoiseDetail::FindOrMake(Key);
             FScopeLock ScopeLock(&VoxelLandNoiseDetail::Lock);
             if (VoxelLandNoiseDetail::FEntry* Entry = VoxelLandNoiseDetail::Entries.Find(Key))
                 Entry->bPending = false;
@@ -1552,7 +1603,8 @@ void VoxelLand::ReleaseLandNoise()
     // The engine is exiting: a pack still being made is handed to its caller but not kept.
     bClosed = true;
     Entries.Empty();
-    Recent.Empty();
+    Pending.Empty();
+    Kept.Empty();
 }
 
 // ---------------------------------------------------------------------------------------------

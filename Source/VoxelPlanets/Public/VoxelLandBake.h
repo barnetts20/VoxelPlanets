@@ -604,8 +604,9 @@ namespace VoxelLand
 
     /** The pack Key (LandNoiseNameFor): its sets read (about 0.1 s for a 2048 set, and a few
      *  hundredths more for a detail set's statistics) or the stand-ins generated (about a second
-     *  of worker time each), then shared while densities hold it (and the four most recent kept
-     *  regardless); made again when asked for after that. A peaks or detail file that is missing
+     *  of worker time each), then shared while planets and densities hold it (P1j: and while no
+     *  one has taken it yet, and the voxel.Land.NoisePacksKept most recently taken, none by
+     *  default); made again when asked for after that. A peaks or detail file that is missing
      *  or isn't a valid set logs an error and gives the generated set; a hills file likewise,
      *  and the pack goes without it (the procedural hills). Null only if nothing could be made.
      *  Thread-safe; blocks while it's made (the planet waits for TryGetLandNoise before it

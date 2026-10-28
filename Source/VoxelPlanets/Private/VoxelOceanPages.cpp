@@ -2327,10 +2327,13 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
                     P->ClipDisplacementSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
                     P->ClipDerivativesSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
                     P->ClipFoamSampler = TStaticSamplerState<SF_Trilinear, AM_Wrap, AM_Wrap, AM_Clamp>::GetRHI();
-                    // (One layer at least: its first threads write the info.)
+                    // (One layer at least: its first threads write the info. Stage P1i (F6, R1's P1-2):
+                    // with no level due, one group, whose first threads do just that; the rest of a
+                    // full layer's groups only returned.)
+                    const int32 WaveGroups = Job->NumDue > 0 ? FMath::DivideAndRoundUp(Size, 8) : 1;
                     FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelOceanClip waves %d levels of %d", Job->NumDue, Size),
                         TShaderMapRef<FVoxelOceanClipWaveCS>(ShaderMap), P,
-                        FIntVector(FMath::DivideAndRoundUp(Size, 8), FMath::DivideAndRoundUp(Size, 8), FMath::Max(Job->NumDue, 1)));
+                        FIntVector(WaveGroups, WaveGroups, FMath::Max(Job->NumDue, 1)));
                 }
                 // Into the textures the material and the vertices read (stage W3y: only when a level
                 // was evaluated; else they hold what they did). Stage W8m: only the slots of the levels
