@@ -718,13 +718,27 @@ void FVoxelOceanSurface::UpdateWaveModel()
         bSame = WaveModelKind == 0;
     if (bSame) return;
 
+    // Stage P1g (C1): only the reach's wind changed (the weather crossed a 2 m/s step): the held
+    // model at the new wind, its layout shared (R1, OCN-23: a full build was 15-20 ms on the game
+    // thread, the ocean actor's spike in flight).
+    TSharedPtr<const FVoxelOceanWavesFFT, ESPMode::ThreadSafe> Held;
+    if (Chosen == 2 && WaveModelKind == 2 && FFTModel.IsValid() && FFTRadius == Settings.Radius)
+    {
+        FVoxelOceanFFTSettings SameWind = NextFFT;
+        SameWind.WindSpeed = FFTSettings.WindSpeed;
+        if (SameWind == FFTSettings)
+            Held = FFTModel;
+    }
+
     WaveModel.Reset();
     FFTModel.Reset();
     WaveModelKind = Chosen;
     WaveSettings = NextTest;
     if (Chosen == 2 && Settings.Radius > 0.0)
     {
-        const TSharedPtr<const FVoxelOceanWavesFFT, ESPMode::ThreadSafe> Model = MakeShared<FVoxelOceanWavesFFT, ESPMode::ThreadSafe>(NextFFT, Settings.Radius);
+        const TSharedPtr<const FVoxelOceanWavesFFT, ESPMode::ThreadSafe> Model = Held.IsValid()
+            ? MakeShared<FVoxelOceanWavesFFT, ESPMode::ThreadSafe>(*Held, NextFFT.WindSpeed)
+            : MakeShared<FVoxelOceanWavesFFT, ESPMode::ThreadSafe>(NextFFT, Settings.Radius);
         FFTModel = Model;
         WaveModel = Model;
         FFTSettings = NextFFT;

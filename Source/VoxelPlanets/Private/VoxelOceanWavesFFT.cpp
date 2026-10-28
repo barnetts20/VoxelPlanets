@@ -149,12 +149,9 @@ FVoxelOceanWavesFFT::FVoxelOceanWavesFFT(const FVoxelOceanFFTSettings& InSetting
     }
 
     // The reach, at the reach's wind; shoaled waves grow (stage O8).
-    MaxHeightCm = HeightBoundCm(FMath::Max(Settings.WindSpeed, 0.0));
-    MaxHorizontalCm = FMath::Max(Settings.Chop, 0.0) * VOF::ReachSigmas * SigmaAt(FMath::Max(Settings.WindSpeed, 0.0)) * 100.0;
-    if (Settings.ShoreBreaking > 0.0)
-        MaxHorizontalCm *= VOXEL_OCEAN_SHOAL_REACH_HORIZONTAL;
+    SetReach();
 
-    Charts = VoxelOceanCharts::Build(Radius);
+    Charts = MakeShared<const VoxelOceanCharts::FTable, ESPMode::ThreadSafe>(VoxelOceanCharts::Build(Radius));
     // An exact float in the shaders (a 24-bit integer).
     DetileSeed = VoxelShader::VoxelOceanHash((uint32)Settings.Seed ^ 0xde711eu) & 0xffffffu;
 
@@ -170,6 +167,38 @@ FVoxelOceanWavesFFT::FVoxelOceanWavesFFT(const FVoxelOceanFFTSettings& InSetting
         check(Cascade->IsValid());
         Prototypes.Add(Cascade);
     }
+}
+
+FVoxelOceanWavesFFT::FVoxelOceanWavesFFT(const FVoxelOceanWavesFFT& Base, double ReachWindSpeed)
+    : Settings(Base.Settings)
+    , Radius(Base.Radius)
+    , Slots(Base.Slots)
+    , SlotTable(Base.SlotTable)
+    , Tiles(Base.Tiles)
+    , Constants(Base.Constants)
+    , DetileSeed(Base.DetileSeed)
+    , Charts(Base.Charts)
+    , QuerySlots(Base.QuerySlots)
+    , Prototypes(Base.Prototypes)
+{
+    Settings.WindSpeed = ReachWindSpeed;
+    for (int32 Slot = 0; Slot < VoxelOceanSpectrum::SlotCount; Slot++)
+    {
+        SlotSigma[Slot] = Base.SlotSigma[Slot];
+        SlotSlope[Slot] = Base.SlotSlope[Slot];
+    }
+    SetReach();
+    // The query frames don't depend on the wind either (the prototypes' cascades at a tick).
+    FScopeLock Lock(&Base.CacheLock);
+    Cache = Base.Cache;
+}
+
+void FVoxelOceanWavesFFT::SetReach()
+{
+    MaxHeightCm = HeightBoundCm(FMath::Max(Settings.WindSpeed, 0.0));
+    MaxHorizontalCm = FMath::Max(Settings.Chop, 0.0) * VOF::ReachSigmas * SigmaAt(FMath::Max(Settings.WindSpeed, 0.0)) * 100.0;
+    if (Settings.ShoreBreaking > 0.0)
+        MaxHorizontalCm *= VOXEL_OCEAN_SHOAL_REACH_HORIZONTAL;
 }
 
 double FVoxelOceanWavesFFT::HeightBoundCm(double Wind) const
@@ -198,14 +227,14 @@ double FVoxelOceanWavesFFT::MaxHeightAt(const FVoxelOceanWaveContext& Context, c
     // whole pass (its surface map's million FFT evaluations) every frame.
     using namespace VoxelShader;
     const FVoxelOceanWeatherTable* Weather = Context.Weather.Get();
-    if (!Weather || Weather->Table.N != Charts.N) return MaxHeightCm;
+    if (!Weather || Weather->Table.N != Charts->N) return MaxHeightCm;
     const FVoxelOceanTableReader Reader = Weather->Table.Reader();
     const VoxelOceanCharts::FVec Dir = VoxelOceanCharts::Normalize({ PlanetPoint.X, PlanetPoint.Y, PlanetPoint.Z });
     const float3 D((float)Dir.X, (float)Dir.Y, (float)Dir.Z);
     double Wind = 0.0;
     for (int32 Key = 0; Key < 2; Key++)
     {
-        const FVoxelOceanSeaState Sea = VoxelOceanSeaStateAt(Reader, D, Charts.N, (float)Key);
+        const FVoxelOceanSeaState Sea = VoxelOceanSeaStateAt(Reader, D, Charts->N, (float)Key);
         Wind = FMath::Max(Wind, (double)FMath::Max(Sea.Wind, Sea.Swell));
     }
     return FMath::Min(MaxHeightCm, HeightBoundCm(Wind));
@@ -307,7 +336,7 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
 
     // The weather: the table's (as the GPU's), or the context's constants.
     const FVoxelOceanWeatherTable* Weather = Context.Weather.Get();
-    if (Weather && Weather->Table.N != Charts.N) Weather = nullptr;
+    if (Weather && Weather->Table.N != Charts->N) Weather = nullptr;
     const FVoxelOceanTableReader Reader = Weather ? Weather->Table.Reader() : FVoxelOceanTableReader();
     const float WeatherAlpha = Weather ? (float)Weather->Alpha(Context.Time) : 0.0f;
     const float Fade = Weather ? (float)Weather->Fade(Context.Time) : 1.0f;
@@ -323,7 +352,7 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
         if (Weather)
         {
             const VoxelOceanCharts::FVec Dir = VoxelOceanCharts::Normalize({ Site.Point.X, Site.Point.Y, Site.Point.Z });
-            Sea = VoxelOceanSeaStateAt(Reader, float3((float)Dir.X, (float)Dir.Y, (float)Dir.Z), Charts.N, WeatherAlpha);
+            Sea = VoxelOceanSeaStateAt(Reader, float3((float)Dir.X, (float)Dir.Y, (float)Dir.Z), Charts->N, WeatherAlpha);
         }
         else
         {
@@ -379,7 +408,7 @@ void FVoxelOceanWavesFFT::Evaluate(const FVoxelOceanWaveContext& Context, TConst
         R = FVoxelOceanWaveResult();
         R.Normal = Site.Up;
         const VoxelOceanCharts::FVec P = { Site.Point.X, Site.Point.Y, Site.Point.Z };
-        const VoxelOceanCharts::FPointCharts PointCharts = VoxelOceanCharts::ChartsAt(Charts, P);
+        const VoxelOceanCharts::FPointCharts PointCharts = VoxelOceanCharts::ChartsAt(*Charts, P);
 
         // The site's shoaling (VoxelOceanShoal.ush, as the hook's VoxelOceanFFTShoalAt).
         FVoxelOceanShoal Shoal = VoxelOceanShoalNone();
@@ -612,7 +641,7 @@ void FVoxelOceanWavesFFT::GetShaderParams(const FVoxelOceanWaveContext& Context,
     // way through its interval, z: the headings' turn (VoxelOceanSeaState.ush).
     const FVoxelOceanWeatherTable* Weather = Context.Weather.Get();
     Out.Shape = FVector4f((float)FMath::Max(Settings.Chop, 0.0), Weather ? (float)Weather->Alpha(Context.Time) : 0.0f, Weather ? (float)Weather->Fade(Context.Time) : 1.0f, 0.0f);
-    Out.FFT = FVector4f(1.0f, (float)Charts.N, (float)FMath::Max(Settings.DetileCell, 0.0), (float)DetileSeed);
+    Out.FFT = FVector4f(1.0f, (float)Charts->N, (float)FMath::Max(Settings.DetileCell, 0.0), (float)DetileSeed);
     Out.RefHigh = FVector4f(VoxelOceanCharts::SplitHigh(Reference.X), VoxelOceanCharts::SplitHigh(Reference.Y), VoxelOceanCharts::SplitHigh(Reference.Z), Settings.MipBias);
     Out.RefLow = FVector4f(VoxelOceanCharts::SplitLow(Reference.X), VoxelOceanCharts::SplitLow(Reference.Y), VoxelOceanCharts::SplitLow(Reference.Z), (float)MaxHeightCm);
     const FQuat Q = PlanetToWorld.GetRotation();

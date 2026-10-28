@@ -20,6 +20,7 @@
 //   g++ -O2 -std=c++20 -ffp-contract=off -IUEStandIn $(../include_flags.sh)
 //       -I. hook_check.cpp ../../Source/VoxelPlanets/Private/VoxelOceanWavesFFT.cpp
 //       ../../Source/VoxelPlanets/Private/VoxelOceanWeather.cpp ../../Source/VoxelPlanets/Private/VoxelOceanWeatherTable.cpp -o hook_check
+#include <cstring>
 #include "hook_emulation.h"
 #include "VoxelOceanWeather.h"
 #include "VoxelOceanWeatherTable.h"
@@ -474,6 +475,38 @@ int main()
             100.0 * WorstRatio, CalmCount, Count, CalmCount ? CalmSum / CalmCount : 0.0, Model.MaxHeight());
         Expect(Over == 0, "every point's waves within its own sea state's reach (the underwater skip test, stage W6i)");
         Expect(CalmCount > Count / 4, "the local reach under the planet's away from the storms");
+    }
+
+    // ---- Stage P1g: the model at another reach wind, from the held one --------------------------
+    std::printf("\nThe reach constructor (stage P1g):\n");
+    {
+        const double Wind2 = Settings.WindSpeed + 2.0 * FVoxelOceanWavesFFT::ReachStep;
+        FVoxelOceanFFTSettings S2 = Settings;
+        S2.WindSpeed = Wind2;
+        const FVoxelOceanWavesFFT Full(S2, Radius);
+        const FVoxelOceanWavesFFT Reached(Model, Wind2);
+        bool bSame = Full.MaxHeight() == Reached.MaxHeight() && Full.MaxHorizontal() == Reached.MaxHorizontal()
+            && Full.GetSettings() == Reached.GetSettings() && Full.GetCharts().Texels == Reached.GetCharts().Texels
+            && Full.GetSlotTable().Num() == Reached.GetSlotTable().Num()
+            && std::memcmp(Full.GetSlotTable().GetData(), Reached.GetSlotTable().GetData(), sizeof(VoxelOceanSpectrum::FSlotGPU) * Full.GetSlotTable().Num()) == 0
+            && std::memcmp(&Full.GetTableConstants(), &Reached.GetTableConstants(), sizeof(FVoxelOceanTableConstants)) == 0;
+        std::mt19937_64 Rng(7);
+        int Differ = 0;
+        for (int k = 0; k < 300; k++)
+        {
+            const FVector Dir = RandomDir(Rng);
+            const FVector Ref = Dir * (Radius + 1000.0);
+            FVoxelOceanWaveShaderParams PA, PB;
+            Full.GetShaderParams(Context, Ref, PlanetToWorld, PA);
+            Reached.GetShaderParams(Context, Ref, PlanetToWorld, PB);
+            const FVoxelOceanWaveResult RA = EvaluateOne(Full, Context, Dir, Radius);
+            const FVoxelOceanWaveResult RB = EvaluateOne(Reached, Context, Dir, Radius);
+            if (std::memcmp(&PA, &PB, sizeof(PA)) != 0 || RA.Height != RB.Height || std::memcmp(&RA.Displacement, &RB.Displacement, sizeof(RA.Displacement)) != 0
+                || Full.MaxHeightAt(Context, Dir * Radius) != Reached.MaxHeightAt(Context, Dir * Radius))
+                Differ++;
+        }
+        std::printf("  at %.0f m/s: reach %.1f / %.1f cm both ways; %d of 300 points differ\n", Wind2, Reached.MaxHeight(), Reached.MaxHorizontal(), Differ);
+        Expect(bSame && Differ == 0, "the model made at a new reach wind from the held one is the full build's, bit for bit");
     }
 
     std::printf("\n%s (%d failures)\n", Failures ? "FAILED" : "ALL OK", Failures);

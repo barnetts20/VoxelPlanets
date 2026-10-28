@@ -66,6 +66,12 @@ public:
     /** Radius: the sea sphere (cm), for the charts. InSettings.WindSpeed: the reach's wind. */
     FVoxelOceanWavesFFT(const FVoxelOceanFFTSettings& InSettings, double InRadius);
 
+    /** Stage P1g (C1): Base at another reach wind. Nothing but the reach depends on it (the slots,
+     *  the table's constants, the charts and the query cascades don't: R1, OCN-23), so those are
+     *  Base's, shared or copied, and only the reach is worked out again: the model a full build
+     *  at ReachWindSpeed would make, without its 15-20 ms on the game thread at each 2 m/s step. */
+    FVoxelOceanWavesFFT(const FVoxelOceanWavesFFT& Base, double ReachWindSpeed);
+
     /** The weather, and with shoaling (stage O8) the depth and the shore. */
     virtual EVoxelOceanWaveInputs RequiredInputs() const override
     {
@@ -86,7 +92,7 @@ public:
     const std::vector<VoxelOceanSpectrum::FSlot>& GetSlots() const { return Slots; }
     TConstArrayView<VoxelOceanSpectrum::FSlotGPU> GetSlotTable() const { return SlotTable; }
     /** The charts (VoxelOceanCharts::Build), without weather. */
-    const VoxelOceanCharts::FTable& GetCharts() const { return Charts; }
+    const VoxelOceanCharts::FTable& GetCharts() const { return *Charts; }
     /** The table's constants (VoxelOceanSeaState.ush, THE CONSTANTS). */
     const FVoxelOceanTableConstants& GetTableConstants() const { return Constants; }
     /** The sea's height standard deviation (m) for a wind (all bands, the swell aside). */
@@ -128,7 +134,11 @@ private:
     double MaxHeightCm = 0.0;
     double MaxHorizontalCm = 0.0;
     uint32 DetileSeed = 0;
-    VoxelOceanCharts::FTable Charts;
+    /** The reach's height and horizontal bounds at Settings.WindSpeed (both constructors). */
+    void SetReach();
+
+    /** Shared by the models made from one another at other reach winds (immutable). */
+    TSharedPtr<const VoxelOceanCharts::FTable, ESPMode::ThreadSafe> Charts;
     TArray<FQuerySlot> QuerySlots;
     TArray<TSharedPtr<const VoxelOceanSpectrum::FQueryCascade, ESPMode::ThreadSafe>> Prototypes;
 

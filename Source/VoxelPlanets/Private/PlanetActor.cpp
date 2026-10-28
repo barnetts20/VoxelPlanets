@@ -26,6 +26,14 @@
 #include "Misc/ScopeExit.h"
 #include "VoxelBrickTerrain.h"
 
+// Stage P1h (S6): the atmosphere from a terrestrial planet's first tick.
+static TAutoConsoleVariable<int32> CVarVoxelPlanetEarlyAtmosphere(
+    TEXT("voxel.Planet.EarlyAtmosphere"), 1,
+    TEXT("Stage P1h. 1 (default): a terrestrial planet's first build shows its atmosphere from its first tick, over the sea's sphere and with no ")
+    TEXT("ground under its weather yet, while the land bakes; the climate capture then gives it the bake's ground and restarts its sim, as before. ")
+    TEXT("0: the atmosphere appears with the capture, once the bake is in (R1a)."),
+    ECVF_Default);
+
 namespace PlanetActorTimelineDetail
 {
     /** Stage P1a: adds a scope's game-thread time to the build's timeline. */
@@ -274,6 +282,19 @@ void APlanetActor::Tick(float DeltaTime)
     // Deferred init - safe to spawn actors here.
     if (bPendingInitialize)
     {
+        // Stage P1h (S6): on the first build, the atmosphere at once (the kickoff's "atmosphere
+        // first, as the placeholder"): nothing it draws needs the bake but its surface map, which
+        // it goes without until the capture below gives it one and restarts its sim. Its floor is
+        // the sea's sphere, the actor's radius, as the capture's configuration has it then
+        // (ConfigureAtmosphere: the terrestrial generator's floor is the sea), so it doesn't move.
+        if (Generator == EVoxelSurfaceGenerator::Terrestrial && !bInitialized && bEnableAtmosphere
+            && LastAtmosphereSeed == INDEX_NONE && CVarVoxelPlanetEarlyAtmosphere.GetValueOnGameThread() > 0)
+        {
+            SpawnChildActors();
+            const double SeaRadius = FMath::Max(1.0, GetActorScale3D().GetMax());
+            ConfigureAtmosphere(SeaRadius, SeaRadius);
+        }
+
         // A terrestrial planet is built once its bake is ready; until then it shows what it
         // showed (nothing on the first build).
         if (Generator == EVoxelSurfaceGenerator::Terrestrial && !TickLandBake())
