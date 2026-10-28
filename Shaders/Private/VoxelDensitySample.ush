@@ -1,18 +1,18 @@
 // VoxelDensitySample.ush - The planet density at a lattice point, in double-float precision:
-// what FVoxelDensityCPU::Sample computes in double, for the GPU. Shared subset (see
+// what FVoxelPlanetDensity::Sample computes in double, for the GPU. Shared subset (see
 // VoxelShaderCompat.h), so the C++ tests run it against the CPU backend.
 //
 // Include after VoxelDensityCore.ush, VoxelDF64.ush, VoxelCubeSphere.ush,
 // VoxelLandParameters.ush, VoxelLandSample.ush and VoxelLandGully.ush, and after declaring the
 // inputs below
 // (shader parameters on the GPU, globals in the C++ tests). Octave tables and every constant
-// come from FVoxelDensityCPU::BuildGPUData, so both backends evaluate the same octaves with
+// come from FVoxelPlanetDensity::BuildGPUData, so both backends evaluate the same octaves with
 // the same seeds, offsets, amplitudes and band limits.
 //
 // With LandMode 1 (the terrestrial generator) the height is the land bake's
 // (VoxelLandSample.ush) through the sampling warp, plus the gullies (VoxelLandGully.ush) and
 // the detail layer (VoxelLandDetail.ush: the pack's detail set since N1), offset to the height
-// above PlanetRadius (FVoxelDensityCPU::LandHeightAt); the continent, mountain and detail
+// above PlanetRadius (FVoxelTerrestrialDensity::LandHeightAt); the continent, mountain and detail
 // octave layers are empty (DetailOctaves 0) and the octave table holds the warp's.
 //
 //   StructuredBuffer<FVoxelOctave> Octaves;      continent, mountain, detail, then the land warp's octaves
@@ -301,13 +301,13 @@ VOXEL_FUNC float VoxelSampleDensityDF(VOXEL_LAND_ARGS_DECL int IndexX, int Index
         if (LandMode != 0u)
         {
             // The layers on the sea-level sphere (PlanetRadius is the bottom of the height range,
-            // which moves with their amplitudes: FVoxelDensityCPU's terrestrial constructor).
+            // which moves with their amplitudes: FVoxelTerrestrialDensity's constructor).
             const float2 LandScale = VoxelDFDiv(VoxelDFAdd(PlanetRadius, LandHeightOffset), Radius);
             const float2 LPX = VoxelDFMul(PX, LandScale);
             const float2 LPY = VoxelDFMul(PY, LandScale);
             const float2 LPZ = VoxelDFMul(PZ, LandScale);
             float2 Total = VoxelLandHeightDF(VOXEL_LAND_ARGS LPX, LPY, LPZ, Footprint, false).Height;
-            // Within [0, NoiseAmplitude], as FVoxelDensityCPU::LandHeightAt clamps.
+            // Within [0, NoiseAmplitude], as FVoxelTerrestrialDensity::LandHeightAt clamps.
             if (Total.x < 0.0f || (Total.x == 0.0f && Total.y < 0.0f)) Total = float2(0.0f, 0.0f);
             if (Total.x > NoiseAmplitude.x || (Total.x == NoiseAmplitude.x && Total.y > NoiseAmplitude.y)) Total = NoiseAmplitude;
             Height = Total;
@@ -318,7 +318,7 @@ VOXEL_FUNC float VoxelSampleDensityDF(VOXEL_LAND_ARGS_DECL int IndexX, int Index
             const float2 R = VoxelDFMul(VoxelLayerSumDF(VOXEL_LAND_ARGS ContinentOctaves, MountainOctaves, VoxelLayerRidged, SPX, SPY, SPZ, Footprint), InvNormMountain);
             const float2 D = VoxelDFMul(VoxelLayerSumDF(VOXEL_LAND_ARGS ContinentOctaves + MountainOctaves, DetailOctaves, VoxelLayerDamped, SPX, SPY, SPZ, Footprint), InvNormDetail);
 
-            // FVoxelDensityCPU::HeightAt.
+            // FVoxelNoiseSurfaceDensity::HeightAt.
             const float2 Base = VoxelDFAdd(float2(0.5f, 0.0f), VoxelDFMulFloat(VoxelDFMul(ContinentWeight, C), 0.5f));
             const float2 T = VoxelDFClamp01(VoxelDFDiv(VoxelDFSub(C, MountainStart), MountainBlend));
             const float2 Mask = VoxelDFMul(VoxelDFMul(T, T), VoxelDFSub(float2(3.0f, 0.0f), VoxelDFMulFloat(T, 2.0f)));

@@ -1,5 +1,5 @@
 // VoxelDensityGPU.h - The planet density on the GPU: the data the compute shader needs
-// (filled by FVoxelDensityCPU::BuildGPUData) and an asynchronous sampling call used to check
+// (filled by FVoxelPlanetDensity::BuildGPUData) and an asynchronous sampling call used to check
 // the GPU against the CPU. The shader is VoxelDensityGPU.usf (VoxelDensitySample.ush).
 
 #pragma once
@@ -78,7 +78,7 @@ struct FVoxelDensityGPUData
     uint32 LandHillOctaves = 0;
     uint32 LandHillSeed = 0;
     TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> LandNoise;   // the noise pack (null: no peaks, hill set or detail set)
-    float LandPeakStrength = 0.0f;       // VoxelLandPeaks.ush (FVoxelDensityCPU's)
+    float LandPeakStrength = 0.0f;       // VoxelLandPeaks.ush (FVoxelTerrestrialDensity's)
     float LandPeakTexelsPerCell = 0.0f;  // 0: none
     uint32 LandPeakSeed = 0;
     float LandPeakSpacingM = 0.0f;
@@ -134,7 +134,7 @@ struct FVoxelDensityGPUData
     float LandRiverRadiusM = 1.0f;
     float LandRiverWidthScale = 1.0f;
     float LandRiverValleyScale = 1.0f;
-    // R2: the rivers' and lakes' carve (VoxelLandCarve.ush; FVoxelDensityCPU's).
+    // R2: the rivers' and lakes' carve (VoxelLandCarve.ush; FVoxelTerrestrialDensity's).
     float LandRiverCarve = 0.0f;
     float LandRiverDepthScale = 1.0f;
     float LandRiverFloodplainScale = 1.0f;
@@ -143,7 +143,7 @@ struct FVoxelDensityGPUData
     float LandRiverMeander = 0.0f;
     float LandRiverFalls = 0.0f;
     uint32 LandHasWater = 0;               // 1: the bake's lake levels are bound (LandWater)
-    // N1: the detail layer from the pack's detail set (VoxelLandDetail.ush; FVoxelDensityCPU's).
+    // N1: the detail layer from the pack's detail set (VoxelLandDetail.ush; FVoxelTerrestrialDensity's).
     float LandDetailTexelsPerCell = 0.0f;
     uint32 LandDetailScales = 0;
     float LandDetailMeanA = 0.0f;
@@ -151,7 +151,7 @@ struct FVoxelDensityGPUData
     float LandDetailScaleGain = 0.0f;
     float LandDetailFade = 0.0f;
     uint32 LandDetailSeed = 0;
-    // T5c: the dunes (VoxelLandDunes.ush; FVoxelDensityCPU's; their chains: LandNoise's Dune* and Sand*), where the
+    // T5c: the dunes (VoxelLandDunes.ush; FVoxelTerrestrialDensity's; their chains: LandNoise's Dune* and Sand*), where the
     // climate (LandClimate: the land climate's cells and the sand's drift) makes desert.
     TSharedPtr<const FVoxelLandClimateField, ESPMode::ThreadSafe> LandClimate;   // null: none (no dunes)
     float LandClimateLapse = 6.5f;             // C per km
@@ -221,7 +221,7 @@ struct FVoxelDensityGPUData
 /** The planet density as the voxel engine's GPU mesher takes it (Design/PlanetPluginSplit.md,
  *  S1a): Data, and the planet's mesher passes (VoxelTerrestrialMesher.usf): the sample pass on
  *  the density (VoxelDensitySample.ush: the noise surface or the land chain) and the land debug
- *  views' colour pass (VoxelLandDebug.ush). FVoxelDensityCPU::MakeGPUSource makes one. */
+ *  views' colour pass (VoxelLandDebug.ush). FVoxelPlanetDensity::MakeGPUSource makes one. */
 class VOXELPLANETS_API FVoxelDensityGPUSource : public IVoxelDensitySourceGPU
 {
 public:
@@ -243,9 +243,9 @@ private:
 /** What SampleBlocksAsync returns per point. */
 enum class EVoxelDensityGPUOutput : uint8
 {
-    Density,   // the density without edits (FVoxelDensityCPU::Sample)
+    Density,   // the density without edits (FVoxelPlanetDensity::Sample)
     Radial,    // |p| - R only: the double-float position path alone
-    Edits      // the density with the edits (FSparseEditStore::Apply on FVoxelDensityCPU::Sample)
+    Edits      // the density with the edits (FSparseEditStore::Apply on FVoxelPlanetDensity::Sample)
 };
 
 /** A box of lattice points: Dim points per axis from Min, Step apart, all sampled at

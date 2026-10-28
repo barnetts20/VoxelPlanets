@@ -379,6 +379,9 @@ public:
     /** The finished bake (null until IsDone). */
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> GetResult() const { return Result; }
 
+    /** Stage P1a: where the bake came from (the disk cache, the GPU bake and solve, the CPU). */
+    const TCHAR* GetSource() const { return Source; }
+
 private:
     enum class EState : uint8
     {
@@ -408,6 +411,7 @@ private:
     TSharedPtr<FVoxelLandCpuProgress, ESPMode::ThreadSafe> CpuProgress;
     TFuture<TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe>> Pending;
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Result;
+    const TCHAR* Source = TEXT("");
 };
 
 namespace VoxelLand
@@ -533,6 +537,11 @@ namespace VoxelLand
      *  (made, or none to make). Else it builds them on the GPU (VoxelLandRiverBuild: a frame or
      *  a few) and is false meanwhile. A fresh bake comes with its baker's. */
     VOXELPLANETS_API bool TickRivers(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& Bake, const FVoxelTerrestrialSettings& Settings);
+
+    /** Drops a bake's GPU copy of its fields (on the render thread), for a bake no density samples
+     *  any more (the planet's, once the ice shelf's bake is the terrain's: R1, BAKE-1). They are
+     *  uploaded again if something needs them later (a river rebuild). Game thread. */
+    VOXELPLANETS_API void ReleaseBakeGPU(const FVoxelLandBake& Bake);
 
     /** The rivers' corridor reach (m) a tile list covers for a log2 drainage area (m^2): the
      *  valley's half-width and a quarter more (R2's profiles stay inside it). */

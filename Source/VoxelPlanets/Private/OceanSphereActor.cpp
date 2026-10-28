@@ -1,5 +1,8 @@
 #include "OceanSphereActor.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelDensity.h"
+#include "VoxelPlanetDensity.h"
+#include "VoxelTerrestrialDensity.h"
 #include "PlanetActor.h"
 #include "PlanetAtmosphereActor.h"
 #include "VoxelOceanAtmosphereWeather.h"
@@ -348,6 +351,7 @@ void AOceanSphereActor::CreateUnderwater()
 
 void AOceanSphereActor::UpdateUnderwater()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(AOceanSphereActor::UpdateUnderwater);
     if (!UnderwaterExtension.IsValid()) return;
 
     // A hidden ocean (disabled or parked by its planet) has no underwater view.
@@ -442,8 +446,8 @@ void AOceanSphereActor::SetSunLightOverride(UDirectionalLightComponent* InLight)
 void AOceanSphereActor::SetAtmosphere(APlanetAtmosphereActor* InAtmosphere)
 {
     Atmosphere = InAtmosphere;
-    // Stage A5: holding its weather's feed starts its read-backs.
-    AtmosphereWeatherFeed = InAtmosphere ? TSharedPtr<FAtmosphereWeatherFeed, ESPMode::ThreadSafe>(InAtmosphere->GetWeatherFeed()) : nullptr;
+    // (Stage A5: its weather's feed is taken by UpdateWeatherSource, while the weather is the
+    // atmosphere's: holding the feed starts its read-backs.)
     SetSunLightOverride(InAtmosphere ? InAtmosphere->GetSunLight() : nullptr);
 }
 
@@ -482,6 +486,7 @@ UDirectionalLightComponent* AOceanSphereActor::FindSunLight()
 
 void AOceanSphereActor::UpdateSurfacePass()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(AOceanSphereActor::UpdateSurfacePass);
     if (!SurfacePass.IsValid()) return;
     bool bVisible = !IsHidden();
 #if WITH_EDITOR
@@ -679,8 +684,16 @@ double AOceanSphereActor::GetOceanTime() const
 
 void AOceanSphereActor::UpdateWeatherSource()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(AOceanSphereActor::UpdateWeatherSource);
     const FVoxelOceanSettings& S = OceanSettings;
     const FVoxelOceanSettings& Was = WeatherSourceSettings;
+    // Stage A5: the atmosphere's weather feed, while the weather is its (holding the feed starts
+    // its read-backs, so it isn't held otherwise: R1, ATM-4). A feed only wanted and not held
+    // compared against the one held made the source start over every tick with the atmosphere's
+    // weather off (R1, OCW-6).
+    const APlanetAtmosphereActor* AtmosphereNow = Atmosphere.Get();
+    const TSharedPtr<FAtmosphereWeatherFeed, ESPMode::ThreadSafe> WantedFeed = S.bWeatherFromAtmosphere && AtmosphereNow
+        ? TSharedPtr<FAtmosphereWeatherFeed, ESPMode::ThreadSafe>(AtmosphereNow->GetWeatherFeed()) : nullptr;
     const bool bSame = WeatherSource.IsValid() && WeatherSourceRadius == OceanRadius && S.bProceduralWeather == Was.bProceduralWeather
         && (S.bProceduralWeather
             ? (S.WeatherSeed == Was.WeatherSeed && S.TradeWind == Was.TradeWind && S.Westerly == Was.Westerly && S.PolarWind == Was.PolarWind
@@ -692,7 +705,7 @@ void AOceanSphereActor::UpdateWeatherSource()
         // Stage A5: the atmosphere's weather: its settings, its feed, and once its first map lands
         // (the keys the fallback made are let go then, once).
         && S.bWeatherFromAtmosphere == Was.bWeatherFromAtmosphere && S.AtmosphereMeanWind == Was.AtmosphereMeanWind
-        && S.AtmosphereSwellShare == Was.AtmosphereSwellShare && AtmosphereWeatherFeed == WeatherSourceFeed
+        && S.AtmosphereSwellShare == Was.AtmosphereSwellShare && WantedFeed == WeatherSourceFeed
         && (!WeatherSourceFeed.IsValid() || bWeatherSourceHadMap || !WeatherSourceFeed->Latest().IsValid());
     if (bSame) return;
     if (S.bProceduralWeather)
@@ -721,7 +734,7 @@ void AOceanSphereActor::UpdateWeatherSource()
         WeatherSource = MakeShared<FVoxelOceanConstantWeather, ESPMode::ThreadSafe>(GetEnvironment());
     }
     // Stage A5: the atmosphere's weather over it, which answers from its first map on.
-    WeatherSourceFeed = S.bWeatherFromAtmosphere ? AtmosphereWeatherFeed : nullptr;
+    WeatherSourceFeed = WantedFeed;
     bWeatherSourceHadMap = WeatherSourceFeed.IsValid() && WeatherSourceFeed->Latest().IsValid();
     if (WeatherSourceFeed.IsValid())
     {
@@ -808,14 +821,20 @@ FVoxelOceanEnvironment AOceanSphereActor::GetEnvironment() const
     return Environment;
 }
 
+bool AOceanSphereActor::HasShoreFieldFor(uint32 BakeKey) const
+{
+    return ShoreField.IsValid() && ShoreField->BakeKey == BakeKey;
+}
+
 void AOceanSphereActor::UpdateShoreField()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(AOceanSphereActor::UpdateShoreField);
     if (!ShoreBuilder.IsValid())
         ShoreBuilder = MakeShared<FVoxelOceanShoreBuilder>();
     // The planet's land bake (none for a noise planet or a standalone ocean without one).
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake;
-    if (Compositor.IsValid() && FVoxelDensityCPU::Of(*Compositor).IsValid())
-        Bake = FVoxelDensityCPU::Of(*Compositor)->GetLandBake();
+    if (Compositor.IsValid() && FVoxelTerrestrialDensity::Of(*Compositor).IsValid())
+        Bake = FVoxelTerrestrialDensity::Of(*Compositor)->GetLandBake();
     // As last applied: a slider drag doesn't start a build every frame.
     const double ReachM = FMath::Max(AppliedSettings.ShoreFieldReach, 1.0) * 1000.0;
     const bool bHave = ShoreField.IsValid() && Bake.IsValid() && ShoreField->BakeKey == Bake->Key && ShoreField->N == Bake->N
@@ -829,8 +848,9 @@ void AOceanSphereActor::UpdateShoreField()
         ShoreRHI.Reset();
         return;
     }
+    // (The field held, when it is this bake's at this radius, lends its terrain heights.)
     if (!bHave && !ShoreBuilder->IsFor(Bake.Get(), OceanRadius, ReachM))
-        ShoreBuilder->Start(Bake, OceanRadius, ReachM);
+        ShoreBuilder->Start(Bake, OceanRadius, ReachM, ShoreField.Get());
     // (Stage W7d: the terrain's heights at the bake's cells sampled through the surface first.)
     ShoreBuilder->Tick([this](const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count)
         {
@@ -866,12 +886,13 @@ void AOceanSphereActor::UpdateShoreField()
 
 void AOceanSphereActor::UpdateCoastField()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(AOceanSphereActor::UpdateCoastField);
     if (!CoastBuilder.IsValid())
         CoastBuilder = MakeShared<FVoxelOceanCoastBuilder>();
     const FVoxelOceanSettings& S = AppliedSettings;
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake;
-    if (Compositor.IsValid() && FVoxelDensityCPU::Of(*Compositor).IsValid())
-        Bake = FVoxelDensityCPU::Of(*Compositor)->GetLandBake();
+    if (Compositor.IsValid() && FVoxelTerrestrialDensity::Of(*Compositor).IsValid())
+        Bake = FVoxelTerrestrialDensity::Of(*Compositor)->GetLandBake();
     // A field for another shore field (made again) is dropped: its texels went with that texture.
     if (CoastField.IsValid() && CoastField->Shore != ShoreField)
         CoastField.Reset();
@@ -984,6 +1005,7 @@ void AOceanSphereActor::DrawShoreDebug() const
 
 void AOceanSphereActor::PublishWaveFrame()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(AOceanSphereActor::PublishWaveFrame);
     TSharedPtr<FVoxelOceanWaveFrame, ESPMode::ThreadSafe> Frame = MakeShared<FVoxelOceanWaveFrame, ESPMode::ThreadSafe>();
     if (!Surface.IsValid() || !Surface->GetWaveFrame(*Frame)) return;
     // Depth inputs and depth queries read the planet density (planet frame).
@@ -1064,6 +1086,7 @@ void AOceanSphereActor::OnTransformUpdated(USceneComponent* Component, EUpdateTr
 void AOceanSphereActor::InitializeFromPlanet(TSharedPtr<FDensitySampleCompositor> InCompositor,
     USceneComponent* InAttachParent, FVector InScale)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(AOceanSphereActor::InitializeFromPlanet);
     bIsPlanetOwned = true;
 
     // Apply scale BEFORE binding the transform guard, so the old guard doesn't revert a scale
@@ -1101,6 +1124,7 @@ void AOceanSphereActor::CleanSceneRoot()
 
 void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> InCompositor)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(AOceanSphereActor::InitializeInternal);
     bInitialized = false;
     if (Surface.IsValid())
         Surface->Reset();
@@ -1121,12 +1145,8 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
 
     // The density the depth is sampled from: the compositor's own, as the terrain builds it.
     GPUDensity.Reset();
-    if (Compositor.IsValid() && FVoxelDensityCPU::Of(*Compositor).IsValid())
-    {
-        const TSharedRef<FVoxelDensityGPUData> Data = MakeShared<FVoxelDensityGPUData>();
-        FVoxelDensityCPU::Of(*Compositor)->BuildGPUData(*Data);
-        GPUDensity = Data;
-    }
+    if (Compositor.IsValid() && FVoxelPlanetDensity::Of(*Compositor).IsValid())
+        GPUDensity = FVoxelPlanetDensity::Of(*Compositor)->GetGPUData();
     AppliedSettings = OceanSettings;
 
     // The FFT cascades' textures: the arrays once, the chart table again for a new radius (the
@@ -1196,6 +1216,7 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
 
 void AOceanSphereActor::Tick(float DeltaTime)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(AOceanSphereActor::Tick);
     SCOPE_CYCLE_COUNTER(STAT_VoxelOceanActorTick);
     Super::Tick(DeltaTime);
     if (!bInitialized || !Surface.IsValid()) return;
@@ -1624,6 +1645,7 @@ void AOceanSphereActor::HandleTerrainEdit(uint32 Sequence, const FVector& Center
 
 FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const APlanetTerrainActor* Terrain) const
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(AOceanSphereActor::GatherInputs);
     FVoxelOceanSurfaceInputs Inputs;
     Inputs.Density.Density = GPUDensity;
     // As last applied, so a slider drag doesn't write the tiles again every frame.
@@ -1633,6 +1655,8 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const APlanetTerrainAct
     Inputs.Time = GetOceanTime();
     Inputs.Environment = GetEnvironment();
     const FVoxelOceanSettings& S = OceanSettings;
+    // The depth probe serves the underwater view alone (UpdateUnderwater).
+    Inputs.bProbeWanted = S.bUnderwaterView;
     // The weather and how the waves key it.
     Inputs.Weather = WeatherSource;
     Inputs.WeatherTiming.KeySeconds = S.WeatherKeySeconds;
@@ -1740,6 +1764,7 @@ FVoxelOceanSurfaceInputs AOceanSphereActor::GatherInputs(const APlanetTerrainAct
 
 void AOceanSphereActor::UpdateLandCache(const APlanetTerrainActor* Terrain)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(AOceanSphereActor::UpdateLandCache);
     const FVoxelLandCache* Cache = Terrain && CVarVoxelOceanDepthFromLandCache.GetValueOnGameThread() != 0 && FApp::CanEverRender()
         ? Terrain->GetLandCache() : nullptr;
     // Its heights are about its own sea level; one far from this ocean's isn't this planet's.

@@ -23,6 +23,8 @@
 #include "VoxelLandClimate.h"
 #include "PooledActor.h"
 #include "SeededAtmosphereActor.h"
+#include "PlanetSpawnTimeline.h"
+#include "Async/Future.h"
 #include "PlanetActor.generated.h"
 
 class APlanetGravityZone;
@@ -571,6 +573,12 @@ private:
     /** The terrestrial bake being made for the current settings (null when none is needed). */
     TSharedPtr<FVoxelLandBaker> LandBaker;
 
+    /** Stage P1a: the current build's timeline (measurement only: logged once per build, with
+     *  Insights bookmarks), and its per-tick milestones after Initialize (the terrain's first
+     *  bricks and settling, the ocean's fields). */
+    FPlanetSpawnTimeline SpawnTimeline;
+    void TickSpawnTimeline();
+
     /** The terrestrial bake the planet is built with: kept while a new one is made, so the
      *  planet shows the old surface until then. */
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> LandBake;
@@ -583,8 +591,15 @@ private:
     uint32 ShelfBakeHash = 0;
     /** Whether the planet asks for an ice shelf (a height, the land climate). */
     bool IceShelfOn() const;
-    /** Makes ShelfBake for the current bake, climate and settings (or drops it). */
-    void UpdateIceShelf();
+    /** Makes ShelfBake for the current bake, climate and settings (or drops it). Stage P1d: the
+     *  bake is made on a worker (ShelfFuture); false while it is under way, and the build waits
+     *  for it as for the land bake. */
+    bool UpdateIceShelf();
+    /** Stage P1d: the ice shelf bake in flight (VoxelLandClimate::MakeIceShelfBake on the thread
+     *  pool: 360-590 ms that were the spawn's longest game-thread tick), and the hash it is for. A
+     *  build for other inputs lets it finish unread. */
+    TFuture<TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>> ShelfFuture;
+    uint32 ShelfFutureHash = 0;
     /** The terrain's bake: ShelfBake, else LandBake. */
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> TerrainBake() const { return ShelfBake.IsValid() ? ShelfBake : LandBake; }
 

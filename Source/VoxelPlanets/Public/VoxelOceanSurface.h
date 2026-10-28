@@ -94,6 +94,9 @@ struct FVoxelOceanSurfaceInputs
     double LandCullMargin = 500.0;
     /** The ocean clock (s) and the environment constants, this frame (no rewrite on change). */
     double Time = 0.0;
+    /** Whether anything reads the depth probe (the underwater view, stage W8b); off, it isn't
+     *  made (R1, OCS-3). */
+    bool bProbeWanted = true;
     FVoxelOceanEnvironment Environment;
     /** The weather (a procedural or constant source, VoxelOceanWeather.h; the same object until
      *  its settings change: a new one starts its keys over) and how the FFT model keys it. */

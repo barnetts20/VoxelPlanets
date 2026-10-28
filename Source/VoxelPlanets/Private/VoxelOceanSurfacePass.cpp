@@ -1,4 +1,5 @@
 #include "VoxelOceanSurfacePass.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "RenderingThread.h"
 #include "VoxelOceanGPUTime.h"
 #include "VoxelOceanRingDraw.h"
@@ -542,6 +543,7 @@ bool FVoxelOceanSurfacePass::IsActiveThisFrame_Internal(const FSceneViewExtensio
 
 void FVoxelOceanSurfacePass::PreRenderView_RenderThread(FRDGBuilder& GraphBuilder, FSceneView& InView)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanSurfacePass::PreRenderView_RenderThread);
     // On the hook once (the delegate holds a weak reference: a pass gone stops being called).
     if (!PostOpaqueHandle.IsValid() && RendererModule)
     {
@@ -577,6 +579,7 @@ const FSceneView* FVoxelOceanSurfacePass::FindView(const FPostOpaqueRenderParame
 
 void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Parameters)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanSurfacePass::Render_RenderThread);
     using namespace VoxelOceanSurfacePassDetail;
     if (!bEnabled.load() || !bHasFrame || !Params.Rings.IsValid() || !Parameters.GraphBuilder || !Parameters.ColorTexture || !Parameters.DepthTexture)
         return;
@@ -1064,6 +1067,7 @@ void FVoxelOceanSurfacePass::Render_RenderThread(FPostOpaqueRenderParameters& Pa
 void FVoxelOceanSurfacePass::RenderSpray_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& View, const FSprayView& SV,
     FRDGTextureRef SceneColor, FRDGTextureRef SceneDepth, FRDGTextureRef BehindDepth, const FVoxelOceanSurfaceParameters& Surface)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanSurfacePass::RenderSpray_RenderThread);
     VoxelOceanGPUTime::FScope SprayTime(GraphBuilder, VoxelOceanGPUTime::Spray);
     FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(View.GetFeatureLevel());
     TShaderMapRef<FVoxelOceanSprayUpdateCS> UpdateShader(ShaderMap);

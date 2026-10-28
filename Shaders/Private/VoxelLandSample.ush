@@ -253,12 +253,6 @@ VOXEL_FUNC FVoxelLandFaceSample VoxelLandFaceSampleAt(VOXEL_LAND_ARGS_DECL uint 
     return Out;
 }
 
-/** One face's spline at the point's segments along U and V. */
-VOXEL_FUNC float VoxelLandFaceHeight(VOXEL_LAND_ARGS_DECL uint Face, FVoxelLandAxis U, FVoxelLandAxis V)
-{
-    return VoxelLandFaceSampleAt(VOXEL_LAND_ARGS Face, U, V, false).Height;
-}
-
 /** A face's frame at a point with tan coordinates A, B (u / n, v / n): the unit sphere's
  *  tangents along the face's two angles, d dir / d theta_U and d dir / d theta_V, and the
  *  inverse of their metric (G^-1: UU, UV, VV). A gradient covector (dh / dX, dh / dY, X and Y
@@ -392,12 +386,6 @@ VOXEL_FUNC FVoxelLandBakeSample VoxelLandBakeSampleDF(VOXEL_LAND_ARGS_DECL float
     Out.Province = WSum > 0.0f ? Province / WSum : 0.0f;
     Out.ProvinceGradient = WSum > 0.0f ? ProvinceGradient / WSum : float3(0.0f, 0.0f, 0.0f);
     return Out;
-}
-
-/** The bake's height (m) in the direction of the double-float point P (any length). */
-VOXEL_FUNC float VoxelLandBakeHeightDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ)
-{
-    return VoxelLandBakeSampleDF(VOXEL_LAND_ARGS PX, PY, PZ, false).Height;
 }
 
 #endif // VOXEL_LAND_SAMPLE_USH

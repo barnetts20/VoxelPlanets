@@ -502,6 +502,15 @@ namespace VoxelLandCachePlan
         {
             FRect R;
             if (!DirtyRectOf(Level, Min, Max, R)) return;
+            // A level being filled (step 5, rows from the window's first): the rows not written
+            // yet are written with the edit when their turn comes, so only the rows already
+            // written are dirty (R1, MAT-5).
+            if (!Level.bValid)
+            {
+                const int32_t Written = Level.OriginJ + Level.FillRow;
+                if (R.J0 >= Written) return;
+                R.Height = (std::min)(R.Height, Written - R.J0);
+            }
             // Coalesced: a rectangle inside one queued with it (both brush-sized, so written as
             // soon) adds nothing; past the limit, all merge into their bounds.
             for (const FRect& Q : Level.Dirty)

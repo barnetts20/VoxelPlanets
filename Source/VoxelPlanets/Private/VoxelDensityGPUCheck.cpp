@@ -2,7 +2,7 @@
 // lattice points around the surface below the camera, and logs how far they differ.
 
 #include "AdaptiveVoxelActor.h"
-#include "VoxelDensity.h"
+#include "VoxelPlanetDensity.h"
 #include "VoxelDensityGPU.h"
 #include "VoxelPlanets.h"
 #include "FSparseEditStore.h"
@@ -31,7 +31,7 @@ namespace VoxelDensityGPUCheck
         for (TActorIterator<AAdaptiveVoxelActor> It(World); It; ++It)
         {
             const TSharedPtr<FDensitySampleCompositor> Compositor = It->GetDensityCompositor();
-            if (Compositor.IsValid() && FVoxelDensityCPU::Of(*Compositor).IsValid())
+            if (Compositor.IsValid() && FVoxelPlanetDensity::Of(*Compositor).IsValid())
             {
                 Terrain = *It;
                 break;
@@ -43,9 +43,8 @@ namespace VoxelDensityGPUCheck
             return;
         }
 
-        const TSharedPtr<const FVoxelDensityCPU> Density = FVoxelDensityCPU::Of(*Terrain->GetDensityCompositor());
-        const TSharedRef<FVoxelDensityGPUData> Data = MakeShared<FVoxelDensityGPUData>();
-        Density->BuildGPUData(*Data);
+        const TSharedPtr<const FVoxelPlanetDensity> Density = FVoxelPlanetDensity::Of(*Terrain->GetDensityCompositor());
+        const TSharedRef<const FVoxelDensityGPUData> Data = Density->GetGPUData();
         const double HalfFinest = 0.5 * Terrain->ActualPrecision;
         const TSharedPtr<FSparseEditStore> EditStore = Terrain->GetDensityCompositor()->GetEditStore();
         const TSharedRef<FVoxelEditGPUData> EditData = FVoxelEditGPUData::Build(EditStore.Get(), HalfFinest, Terrain->MaxDepth);

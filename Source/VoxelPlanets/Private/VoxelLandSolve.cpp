@@ -1,4 +1,5 @@
 #include "VoxelLandSolve.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelGPUCommon.h"
 #include "VoxelPlanets.h"
 #include "GlobalShader.h"
@@ -954,6 +955,7 @@ VoxelLandSolve::FJob::~FJob() = default;
 
 void VoxelLandSolve::FJob::Tick(FRHICommandListImmediate& RHICmdList, const FPlateFields& Fields)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandSolve::FJob::Tick);
     using EPhase = FImpl::EPhase;
     FImpl& I = *Impl;
     if (Status.load(std::memory_order_acquire) != 0) return;

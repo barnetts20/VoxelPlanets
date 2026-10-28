@@ -1,4 +1,5 @@
 #include "VoxelLandClimate.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelPlanets.h"
 #include "Misc/ScopeLock.h"
 #include "VoxelLandClimateGrid.h"
@@ -11,6 +12,8 @@
 #include "Async/ParallelFor.h"
 #include "VoxelLandSettings.h"
 #include "VoxelLandShelf.h"
+#include "VoxelLandSea.h"
+#include <vector>
 #include <atomic>
 
 // The point's climate: the material's own code (VoxelLandClimate.ush).
@@ -79,6 +82,7 @@ int32 VoxelLandClimate::Height()
 void VoxelLandClimate::BuildBase(const FVoxelLandBake& Bake, double SeaRadiusM, TArray<float>& OutLand, TArray<float>& OutCoast,
     TArray<float>* OutHeight)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandClimate::BuildBase);
     constexpr int32 W = VOXEL_LAND_CLIMATE_WIDTH;
     constexpr int32 H = VOXEL_LAND_CLIMATE_HEIGHT;
     constexpr int32 Sub = 4;
@@ -129,6 +133,7 @@ bool VoxelLandClimate::BuildMap(const TArray<float>& Land, const TArray<float>& 
     const FVoxelLandClimateSettings& Settings, double SeaRadiusM, float EquatorTemperature, float PoleTemperature, float LatitudeExponent,
     float WarmthScale, FVoxelLandClimateMap& Out, const TArray<float>* LandHeight, const FVoxelLandShelfParams* Shelf)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandClimate::BuildMap);
     constexpr int32 W = VOXEL_LAND_CLIMATE_WIDTH;
     constexpr int32 H = VOXEL_LAND_CLIMATE_HEIGHT;
     Out.Cells.SetNumZeroed(W * H);
@@ -169,6 +174,7 @@ TSharedPtr<const FVoxelLandClimateField, ESPMode::ThreadSafe> VoxelLandClimate::
     const FAtmosphereClimateMap* Sim, float LapseRate, const TArray<float>& Land, const TArray<float>& LandHeight, double SeaRadiusM,
     float IceMaxThickness)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandClimate::MakeField);
     constexpr int32 W = VOXEL_LAND_CLIMATE_WIDTH;
     constexpr int32 H = VOXEL_LAND_CLIMATE_HEIGHT;
     // The drift's box filter (cells each way): 2 is about 400 km on an Earth-sized planet.
@@ -260,6 +266,14 @@ TSharedPtr<const FVoxelLandClimateField, ESPMode::ThreadSafe> VoxelLandClimate::
     }
     Out->LapseRate = LapseRate;
     Out->Hash = HashCombine(FCrc::MemCrc32(Out->Entries.GetData(), Out->Entries.Num() * sizeof(FVector4f)), GetTypeHash(LapseRate));
+    {
+        // The sea-level temperatures alone (the ice shelf's key).
+        const int32 Count = FMath::Min(Out->Entries.Num(), W * H);
+        uint32 Crc = 0;
+        for (int32 i = 0; i < Count; i++)
+            Crc = FCrc::MemCrc32(&Out->Entries[i].X, sizeof(float), Crc);
+        Out->SeaTemperatureHash = Crc;
+    }
     return Out;
 }
 
@@ -336,6 +350,7 @@ FVoxelLandShelfParams VoxelLandClimate::ShelfParamsFor(const FVoxelTerrestrialSe
 TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> VoxelLandClimate::MakeIceShelfBake(const FVoxelLandBake& Base,
     const FVoxelLandClimateField& Field, const FVoxelTerrestrialSettings& Settings)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandClimate::MakeIceShelfBake);
     const FVoxelLandShelfParams P = ShelfParamsFor(Settings, Base.PlateSeed);
     if (!P.bOn || !Field.IsValid() || Base.Height.Num() != Base.NumCells()) return nullptr;
     const double StartSeconds = FPlatformTime::Seconds();
@@ -407,9 +422,11 @@ TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> VoxelLandClimate::MakeIceS
     FrontTop.SetNumZeroed(NumCells);
     std::atomic<int32> RaisedCells(0);
     std::atomic<int32> TouchedCells(0);
-    // The kept lakes the shelf reaches (by their level: a lake's cells share it), removed whole.
+    // The kept lakes the shelf reaches, removed whole: by connectivity from the raised cells
+    // through cells at their level (not by the level alone: two lakes can share one, and two
+    // basins spilling through one sill do; R1, BAKE-2).
     FCriticalSection LakeLock;
-    TSet<float> ShelfLakeLevels;
+    std::vector<int> ShelfLakeSeeds;
     ParallelFor(6 * Side, [&](int32 Row)
         {
             const int32 Face = Row / Side;
@@ -448,7 +465,7 @@ TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> VoxelLandClimate::MakeIceS
                 if (bWater && Out->Water[Index] > -1.0e38f)
                 {
                     FScopeLock Lock(&LakeLock);
-                    ShelfLakeLevels.Add(Out->Water[Index]);
+                    ShelfLakeSeeds.push_back(Index);
                 }
             }
             RaisedCells.fetch_add(Raised);
@@ -461,17 +478,22 @@ TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> VoxelLandClimate::MakeIceS
         return nullptr;
     }
     // The lakes it reaches go whole (a lake cut where the shelf rises under it would stand in the ice).
-    if (ShelfLakeLevels.Num() > 0)
+    int32 LakesRemoved = 0;
+    if (!ShelfLakeSeeds.empty())
     {
+        const int32 LakesBefore = Out->Lakes.Num();
+        std::vector<unsigned char> Marked;
+        VoxelLandSea::FloodLakes(N, Pad, Out->Water.GetData(), ShelfLakeSeeds, Marked);
         ParallelFor(NumCells, [&](int32 Index)
             {
-                if (Out->Water[Index] > -1.0e38f && ShelfLakeLevels.Contains(Out->Water[Index]))
+                if (Marked[(size_t)Index] && Out->Water[Index] > -1.0e38f)
                 {
                     Out->Water[Index] = -3.0e38f;
                     if (bAttr) Out->Attr[Index] = (uint16)(Out->Attr[Index] & ~FVoxelLandBake::LakeBit);
                 }
             });
-        Out->Lakes.RemoveAll([&](const FVoxelLandLake& Lake) { return ShelfLakeLevels.Contains(Lake.Level); });
+        Out->Lakes.RemoveAll([&](const FVoxelLandLake& Lake) { return Lake.Cell < (uint32)NumCells && Marked[(size_t)Lake.Cell] != 0; });
+        LakesRemoved = LakesBefore - Out->Lakes.Num();
     }
 
     // The sea mask for the new heights, then the sea the shelf cut off (it was the sea's, now in no
@@ -520,8 +542,9 @@ TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> VoxelLandClimate::MakeIceS
     Out->ProvinceLand = Base.ProvinceLand;
 
     // A key of its own (the caches and fields made from a bake key on it): Base's, the shelf's
-    // settings and the climate's.
-    uint32 Key = HashCombine(Base.Key, Field.Hash);
+    // settings and the climate's (the sea-level temperatures it reads: not the lapse rate, the
+    // drift or the ice sheets, which can't move it: R1, BAKE-3).
+    uint32 Key = HashCombine(Base.Key, Field.SeaTemperatureHash);
     for (const double V : { P.Temperature, P.FrontNoise, P.Height, P.Rise, P.Roll, P.Draft })
         Key = HashCombine(Key, ::GetTypeHash(V));
     Key = HashCombine(Key, 0x5E1Fu);
@@ -532,7 +555,7 @@ TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> VoxelLandClimate::MakeIceS
         100.0 * (double)RaisedCells.load() / (double)FMath::Max(Interior, 1), P.Temperature, P.FrontNoise, P.Height, P.Rise, P.Roll, P.Draft,
         Out->MinHeight, Out->MaxHeight, Out->SeaCells, FPlatformTime::Seconds() - StartSeconds);
     UE_LOG(LogVoxelPlanets, Log, TEXT("[VoxelLand] Ice shelf: %d lakes under it removed; %d cells of sea it cut off filled, %d kept as enclosed sea."),
-        ShelfLakeLevels.Num(), Filled, Enclosed);
+        LakesRemoved, Filled, Enclosed);
     return Out;
 }
 

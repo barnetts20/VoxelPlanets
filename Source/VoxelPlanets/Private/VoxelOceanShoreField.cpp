@@ -1,4 +1,5 @@
 #include "VoxelOceanShoreField.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelOceanShoreCore.h"
 #include "VoxelOceanCoastField.h"
 #include "VoxelLandBake.h"
@@ -18,6 +19,8 @@
 #include "TextureResource.h"
 #include "Misc/App.h"
 #include "HAL/IConsoleManager.h"
+
+DECLARE_GPU_STAT(VoxelOceanShoreField);   // P1a: its own row in stat gpu
 
 // ---------------------------------------------------------------------------
 // Shaders (VoxelOceanShoreBuild.usf; parameter names must match it exactly)
@@ -189,6 +192,7 @@ bool FVoxelOceanShoreField::IsValid() const
 
 UTexture2DArray* FVoxelOceanShoreField::MakeTexture(const uint32* Extra, int32 ExtraSlices) const
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanShoreField::MakeTexture);
     if (!IsValid() || !FApp::CanEverRender()) return nullptr;
     const int32 Side = VoxelOceanShoreCore::Side(N);
     if (!Extra || ExtraSlices <= 0 || 6 + ExtraSlices > 2048) ExtraSlices = 0;
@@ -270,7 +274,8 @@ struct FVoxelOceanShoreBuilder::FJob
     TArray<uint16> Attr;
     int32 SeaCells = 0;
     int32 BakeSeaCells = 0;
-    double SampleSeconds = 0.0;
+    double SampleSeconds = 0.0;   // from the start to the terrain's heights (0: the bake's)
+    double IssueSeconds = 0.0;    // from the start to the GPU passes' issue (the mask made)
 
     ~FJob()
     {
@@ -298,8 +303,10 @@ void FVoxelOceanShoreBuilder::Reset()
     SampleWaitFrames = 0;
 }
 
-void FVoxelOceanShoreBuilder::Start(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& InBake, double InRadiusCm, double InReachM)
+void FVoxelOceanShoreBuilder::Start(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& InBake, double InRadiusCm, double InReachM,
+    const FVoxelOceanShoreField* Known)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanShoreBuilder::Start);
     Reset();
     Bake = InBake;
     RadiusCm = InRadiusCm;
@@ -324,6 +331,16 @@ void FVoxelOceanShoreBuilder::Start(const TSharedPtr<const FVoxelLandBake, ESPMo
         // Stage W7d: the terrain's own heights at the bake's cells first (the GPU's), unless off.
         if (CVarVoxelOceanShoreFromTerrain.GetValueOnGameThread() != 0)
         {
+            // A field made for the same bake, resolution and radius already holds them (only the
+            // reach differs: the jump flood's): they are taken as they are, not sampled again
+            // (R1, OCW-1: the sampling is seconds of the GPU's time).
+            if (Known && Known->BakeKey == Bake->Key && Known->N == Bake->N && Known->RadiusCm == RadiusCm
+                && Known->Height.Num() == Bake->NumCells())
+            {
+                Job->Height = Known->Height;
+                FromTerrain();
+                return;
+            }
             bGpu = true;
             bSampling = true;
             Issued = 0;
@@ -344,20 +361,25 @@ void FVoxelOceanShoreBuilder::Start(const TSharedPtr<const FVoxelLandBake, ESPMo
 
 void FVoxelOceanShoreBuilder::FromTerrain()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanShoreBuilder::FromTerrain);
     bSampling = false;
     bGpu = true;
     TSharedPtr<FJob, ESPMode::ThreadSafe> InJob = Job;
     Job->SampleSeconds = FPlatformTime::Seconds() - StartSeconds;
-    // The heights (m), the bake's other bits with the sea's from them (VoxelLandSea::Mark, as the
-    // bake marks its own: the same share, bridge, spill and lakes), the GPU's mask.
+    // The heights (m; sampled, or a known field's), the bake's other bits with the sea's from them
+    // (VoxelLandSea::Mark, as the bake marks its own: the same share, bridge, spill and lakes),
+    // the GPU's mask.
     Job->SeaMaskReady = Async(EAsyncExecution::ThreadPool, [InJob]()
         {
             const FVoxelLandBake& B = *InJob->Bake;
             const int32 Count = B.NumCells();
-            InJob->Height.SetNumUninitialized(Count);
-            const float* Depth = InJob->Depth->DepthCm.GetData();
-            for (int32 i = 0; i < Count; i++) InJob->Height[i] = -0.01f * Depth[i];
-            InJob->Depth.Reset();
+            if (InJob->Depth.IsValid())
+            {
+                InJob->Height.SetNumUninitialized(Count);
+                const float* Depth = InJob->Depth->DepthCm.GetData();
+                for (int32 i = 0; i < Count; i++) InJob->Height[i] = -0.01f * Depth[i];
+                InJob->Depth.Reset();
+            }
             InJob->Attr = B.Attr;
             const VoxelLandSea::FStats Stats = VoxelLandSea::Mark(B.N, FVoxelLandBake::Pad, InJob->Height.GetData(), InJob->Attr.GetData(),
                 FVoxelLandBake::SeaBit, FVoxelLandBake::SeaMinShare, 3, B.Water.Num() == Count ? B.Water.GetData() : nullptr, FVoxelLandBake::SeaSpillLevel);
@@ -416,6 +438,7 @@ void FVoxelOceanShoreBuilder::StartCpu()
 
 void FVoxelOceanShoreBuilder::Tick(const FSampler& Sampler)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanShoreBuilder::Tick);
     if (bDone || !Job.IsValid()) return;
     if (bSampling)
     {
@@ -467,9 +490,11 @@ void FVoxelOceanShoreBuilder::Tick(const FSampler& Sampler)
             }
             return;
         }
+        Job->IssueSeconds = FPlatformTime::Seconds() - StartSeconds;
         TSharedPtr<FJob, ESPMode::ThreadSafe> InJob = Job;
         ENQUEUE_RENDER_COMMAND(VoxelOceanShoreBuild)([InJob](FRHICommandListImmediate& RHICmdList)
             {
+                TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelOceanShoreBuild");
                 if (!VOSF::AreShadersReady())
                 {
                     InJob->Status.store(-1, std::memory_order_release);
@@ -482,6 +507,9 @@ void FVoxelOceanShoreBuilder::Tick(const FSampler& Sampler)
                 const FIntVector Groups = VOSF::GroupsFor(Count, GroupsX);
                 FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
                 FRDGBuilder GraphBuilder(RHICmdList);
+                {
+                    // (Closed before Execute: RDG asserts on an event scope left open.)
+                    RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanShoreField, "VoxelOceanShoreField");
                 // (Stage W7d: the terrain's heights where sampled.)
                 const TArray<float>& Heights = InJob->Height.Num() == B.NumCells() ? InJob->Height : B.Height;
                 const FRDGBufferRef Height = VoxelGPUCommon::UploadStructuredBuffer<float>(GraphBuilder, TEXT("Voxel.ShoreHeight"), MakeConstArrayView(Heights));
@@ -543,6 +571,7 @@ void FVoxelOceanShoreBuilder::Tick(const FSampler& Sampler)
                 }
                 InJob->Readback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.ShoreReadback"));
                 AddEnqueueCopyPass(GraphBuilder, InJob->Readback.Get(), Texels[CurrentTexels], Count * (uint32)sizeof(uint32));
+                }
                 GraphBuilder.Execute();
                 // Read back once it's there (polled on the render thread).
                 VoxelGPUCommon::PollRenderThread([InJob, Count]() -> bool
@@ -576,6 +605,7 @@ void FVoxelOceanShoreBuilder::Tick(const FSampler& Sampler)
 
 void FVoxelOceanShoreBuilder::Finish(TSharedPtr<FVoxelOceanShoreField, ESPMode::ThreadSafe> Field)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanShoreBuilder::Finish);
     Field->N = Bake->N;
     Field->RadiusCm = RadiusCm;
     Field->ReachM = ReachM;
@@ -585,6 +615,7 @@ void FVoxelOceanShoreBuilder::Finish(TSharedPtr<FVoxelOceanShoreField, ESPMode::
     const bool bTerrain = Job.IsValid() && Job->Height.Num() == Bake->NumCells();
     const int32 BakeSeaCells = Job.IsValid() ? Job->BakeSeaCells : 0;
     const double SampleSeconds = Job.IsValid() ? Job->SampleSeconds : 0.0;
+    const double IssueSeconds = Job.IsValid() ? Job->IssueSeconds : 0.0;
     if (bTerrain)
     {
         Field->Height = MoveTemp(Job->Height);
@@ -599,9 +630,23 @@ void FVoxelOceanShoreBuilder::Finish(TSharedPtr<FVoxelOceanShoreField, ESPMode::
         return;
     }
     Result = Field;
-    UE_LOG(LogVoxelPlanets, Log, TEXT("[VoxelOcean] Shore field of bake %08x: 6 x %d^2 cells, reach %.0f km, %s in %.2f s."),
-        Bake->Key, Field->N, ReachM * 1.0e-3, Field->bFromGpu ? TEXT("on the GPU") : TEXT("on the CPU"), Field->BuildSeconds);
+    // The phases apart (R1, OCW-2: the total used to read as the GPU's own time, with the
+    // sampling inside it): the terrain's heights, the sea mask, then the field's passes and
+    // readback.
+    if (Field->bFromGpu)
+    {
+        UE_LOG(LogVoxelPlanets, Log, TEXT("[VoxelOcean] Shore field of bake %08x: 6 x %d^2 cells, reach %.0f km, on the GPU: %.2f s in all (the terrain's heights %.2f s, the sea mask %.2f s, the field's passes and readback %.2f s)."),
+            Bake->Key, Field->N, ReachM * 1.0e-3, Field->BuildSeconds,
+            SampleSeconds, FMath::Max(IssueSeconds - SampleSeconds, 0.0), FMath::Max(Field->BuildSeconds - FMath::Max(IssueSeconds, SampleSeconds), 0.0));
+    }
+    else
+    {
+        UE_LOG(LogVoxelPlanets, Log, TEXT("[VoxelOcean] Shore field of bake %08x: 6 x %d^2 cells, reach %.0f km, on the CPU in %.2f s."),
+            Bake->Key, Field->N, ReachM * 1.0e-3, Field->BuildSeconds);
+    }
     if (bTerrain)
-        UE_LOG(LogVoxelPlanets, Log, TEXT("[VoxelOcean] Shore field from the terrain's own heights (sampled in %.2f s): %d sea cells (the land bake's: %d)."),
-            SampleSeconds, Field->SeaCells, BakeSeaCells);
+    {
+        UE_LOG(LogVoxelPlanets, Log, TEXT("[VoxelOcean] Shore field from the terrain's own heights: %d sea cells (the land bake's: %d)."),
+            Field->SeaCells, BakeSeaCells);
+    }
 }

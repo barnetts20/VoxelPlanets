@@ -1,4 +1,5 @@
 #include "VoxelLandRiverBuild.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelLandRivers.h"
 #include "VoxelPlanets.h"
 #include "GlobalShader.h"
@@ -280,6 +281,7 @@ VoxelLandRiverBuild::FCaps VoxelLandRiverBuild::GrowCaps(const FCaps& Caps, cons
 
 VoxelLandRiverBuild::FOutputs VoxelLandRiverBuild::AddPasses(FRDGBuilder& GraphBuilder, const FInputs& Inputs, const FSettings& S, const FCaps& Caps)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandRiverBuild::AddPasses);
     RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelLandRivers, "VoxelLand rivers");
     const uint32 Side = (uint32)(S.N + 2 * S.Pad);
     const uint32 NumCells = 6u * Side * Side;
@@ -479,6 +481,7 @@ void VoxelLandRiverBuild::FPending::Reset()
 
 bool VoxelLandRiverBuild::FPending::Read(FResult& Out)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandRiverBuild::FPending::Read);
     Out = FResult();
     if (!IsReady())
     {

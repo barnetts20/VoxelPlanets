@@ -10,7 +10,7 @@
 //     and own gradient on the terms' exact and differenced ones) against central differences
 //     of the height, near rivers and lakes, carve on and off;
 //   - backends: the global shaders' chain (VoxelLandHeightDF) against the CPU density's
-//     (FVoxelDensityCPU::LandHeightAt, as gully_harness's Terms);
+//     (FVoxelTerrestrialDensity::LandHeightAt, as gully_harness's Terms);
 //   - cost: the CPU sample's time with and without the carve.
 // Views: hillshades around rivers of a few sizes and a lake shore, carve on and off.
 //
@@ -649,7 +649,7 @@ int main(int argc, char** argv)
     }
     if (Mode == "water")
     {
-        // The water query's inputs (FVoxelDensityCPU::WaterAt's rules on the shared carve's
+        // The water query's inputs (FVoxelTerrestrialDensity::WaterAt's rules on the shared carve's
         // outputs): on the rivers' lines, the river's water over the ground and its depth; in the
         // lakes' cells, the lake over the ground.
         FSampler Smp = P.S;

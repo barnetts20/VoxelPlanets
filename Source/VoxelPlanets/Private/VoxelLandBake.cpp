@@ -1,4 +1,5 @@
 #include "VoxelLandBake.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "Misc/ScopeLock.h"
 #include "VoxelLandGPU.h"
 #include "VoxelLandClimate.h"
@@ -35,6 +36,11 @@ namespace VoxelShader
 {
 #include "VoxelDensityCore.ush"
 #include "VoxelCubeSphere.ush"
+// MAT-8: VoxelLandAccess.ush's free functions (VoxelLandUnpackForm, VoxelLandDecodeRelief,
+// VoxelLandUnpackProvince) at namespace scope first, as VoxelTerrestrialDensity.cpp has them: the
+// land code includes it again inside the struct (a no-op then), and in a unity build a first
+// include inside either host struct would make them its members and leave the other without.
+#include "VoxelLandAccess.ush"
 
     /** The plate model on the CPU: VoxelLandPlates.ush with its inputs as members. */
     struct FVoxelLandPlatesCPU
@@ -53,6 +59,8 @@ namespace VoxelShader
 #include "VoxelLandPlates.ush"
     };
 }
+
+DECLARE_GPU_STAT(VoxelLandBakeGPU);   // P1a: its own row in stat gpu
 
 static TAutoConsoleVariable<int32> CVarVoxelLandCache(
     TEXT("voxel.Land.Cache"), 1,
@@ -455,6 +463,7 @@ void FVoxelLandBake::UpdateRange()
 
 void FVoxelLandBake::BuildRelief()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelLandBake::BuildRelief);
     const int32 S = Side();
     Relief.SetNumZeroed(Height.Num());
     MaxRelief = 0.0f;
@@ -480,6 +489,7 @@ void FVoxelLandBake::BuildProvinceStats()
 
 void FVoxelLandBake::BuildSeaConnected()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelLandBake::BuildSeaConnected);
     SeaCells = 0;
     SeaRegions = 0;
     BasinRegions = 0;
@@ -743,6 +753,7 @@ namespace VoxelLandNoiseDetail
      *  in its texels; checked again). False (and Error) if it can't be used. */
     bool Read(const FString& Name, FRead& Out, FString& Error, ESetKind Kind = ESetKind::Peaks, uint32 MaxN = 0)
     {
+        TRACE_CPUPROFILER_EVENT_SCOPE_STR("VoxelLandNoise::Read");
         const double Start = FPlatformTime::Seconds();
         const FString Folder = VoxelLand::NoiseSetDirectory();
         if (Folder.IsEmpty())
@@ -814,6 +825,7 @@ namespace VoxelLandNoiseDetail
      *  DuneMaxSetN; the sand without the dunes is left out). Null if it holds nothing. */
     TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> MakePackLocked(const FString& Key)
     {
+        TRACE_CPUPROFILER_EVENT_SCOPE_STR("VoxelLandNoise::MakePackLocked");
         TArray<FString> Parts;
         Key.ParseIntoArray(Parts, TEXT("|"), false);
         const FString PeakName = Parts.Num() > 0 ? Parts[0] : FString();
@@ -1482,6 +1494,7 @@ FString VoxelLand::LandNoiseNameFor(const FVoxelTerrestrialSettings& Settings)
 
 TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> VoxelLand::GetLandNoise(const FString& Key)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLand::GetLandNoise);
     using namespace VoxelLandNoiseDetail;
     TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Pack;
     if (Key.IsEmpty()) return Pack;
@@ -1754,6 +1767,7 @@ double VoxelLand::GullyReach(const FVoxelTerrestrialSettings& Settings, const FV
 void VoxelLand::ShapeFor(const FVoxelTerrestrialSettings& Settings, const FVoxelLandBake& Bake, const FVoxelLandNoiseSet* Noise,
     double& OutPlanetRadius, double& OutNoiseAmplitude)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLand::ShapeFor);
     // The B-spline and the face blend are convex combinations of the cells, so the bake's
     // range holds; the detail layer reaches at most its set's bound times its amplitude (N1:
     // VoxelNoiseTiles::DetailStatsOf, a percent over; 2.5 without the pack's detail set), the
@@ -1913,6 +1927,7 @@ namespace VoxelLandCache
 
     bool Save(const FVoxelLandBake& Bake)
     {
+        TRACE_CPUPROFILER_EVENT_SCOPE_STR("VoxelLandCache::Save");
         const int64 NumCells = Bake.Height.Num();
         const int64 Total = RawBytes(NumCells, Bake.bEroded, Bake.Lakes.Num());
         if (Total >= MAX_int32) return false;
@@ -1984,6 +1999,7 @@ namespace VoxelLandCache
 
     TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe> Load(uint32 Key, uint32 SettingsCheck, int32 N, double SeaRadius)
     {
+        TRACE_CPUPROFILER_EVENT_SCOPE_STR("VoxelLandCache::Load");
         const FString Path = PathFor(Key, N);
         TArray<uint8> File;
         if (!IFileManager::Get().FileExists(*Path) || !FFileHelper::LoadFileToArray(File, *Path) || File.Num() < (int32)sizeof(FHeader))
@@ -2254,6 +2270,7 @@ namespace VoxelLandBakeDetail
      *  chunk of the fields (the last copies the threshold for readback). */
     void RunStep(FRHICommandListImmediate& RHICmdList, FVoxelLandBakeJob& Job, int32 Step)
     {
+        TRACE_CPUPROFILER_EVENT_SCOPE_STR("VoxelLandBake::RunStep");
         if (Job.Status.load(std::memory_order_acquire) != 0) return;
         if (!AreShadersReady())
         {
@@ -2266,6 +2283,9 @@ namespace VoxelLandBakeDetail
         const uint32 NumInterior = (uint32)Job.NumInterior();
         const uint32 Chunk = (uint32)Job.Chunk();
         FRDGBuilder GraphBuilder(RHICmdList);
+        {
+            // (Closed before Execute: RDG asserts on an event scope left open.)
+            RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelLandBakeGPU, "VoxelLand bake / river upload");
 
         FRDGBufferRef Plates;
         FRDGBufferRef Histogram;
@@ -2381,6 +2401,7 @@ namespace VoxelLandBakeDetail
             Job.Crust = GraphBuilder.ConvertToExternalBuffer(Crust);
             Job.Form = GraphBuilder.ConvertToExternalBuffer(Form);
         }
+        }
         GraphBuilder.Execute();
     }
 
@@ -2389,6 +2410,7 @@ namespace VoxelLandBakeDetail
      *  buffers are released either way. */
     void TickSolve(FRHICommandListImmediate& RHICmdList, FVoxelLandBakeJob& Job)
     {
+        TRACE_CPUPROFILER_EVENT_SCOPE_STR("VoxelLandBake::TickSolve");
         if (Job.Status.load(std::memory_order_acquire) != 0 || !Job.Solve.IsValid()) return;
         if (!Job.bThresholdRead && Job.ThresholdReadback.IsValid() && Job.ThresholdReadback->IsReady())
         {
@@ -2503,6 +2525,7 @@ float FVoxelLandBaker::GetProgress() const
 
 void FVoxelLandBaker::Tick()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelLandBaker::Tick);
     using namespace VoxelLandBakeDetail;
     switch (State)
     {
@@ -2535,6 +2558,7 @@ void FVoxelLandBaker::Tick()
         Pending = TFuture<TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe>>();
         if (Loaded.IsValid())
         {
+            Source = TEXT("disk cache");
             Finish(Loaded);
             break;
         }
@@ -2565,6 +2589,7 @@ void FVoxelLandBaker::Tick()
         TSharedPtr<FVoxelLandBakeJob, ESPMode::ThreadSafe> InJob = Job;
         ENQUEUE_RENDER_COMMAND(VoxelLandBakeStep)([InJob, Step](FRHICommandListImmediate& RHICmdList)
             {
+                TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelLandBakeStep");
                 RunStep(RHICmdList, *InJob, Step);
             });
         if (GpuStep >= GpuSteps)
@@ -2580,6 +2605,7 @@ void FVoxelLandBaker::Tick()
             TSharedPtr<FVoxelLandBakeJob, ESPMode::ThreadSafe> InJob = Job;
             ENQUEUE_RENDER_COMMAND(VoxelLandSolveTick)([InJob](FRHICommandListImmediate& RHICmdList)
                 {
+                    TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelLandSolveTick");
                     TickSolve(RHICmdList, *InJob);
                 });
             break;
@@ -2706,6 +2732,8 @@ void FVoxelLandBaker::Tick()
 
 void FVoxelLandBaker::StartGpu()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelLandBaker::StartGpu);
+    Source = TEXT("GPU bake");
     Job = MakeShared<FVoxelLandBakeJob, ESPMode::ThreadSafe>();
     Job->Inputs = VoxelLandBakeDetail::MakeInputs(Settings, SeaRadius, Key);
     Job->CellsPerStep = FMath::Max(CVarVoxelLandBakeCellsPerFrame.GetValueOnGameThread(), 4096);
@@ -2726,6 +2754,8 @@ void FVoxelLandBaker::StartGpu()
 
 void FVoxelLandBaker::StartCpu()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelLandBaker::StartCpu);
+    Source = TEXT("CPU bake");
     using namespace VoxelLandBakeDetail;
     ReleaseJob(Job);
     const TSharedPtr<FVoxelLandCpuProgress, ESPMode::ThreadSafe> Progress = MakeShared<FVoxelLandCpuProgress, ESPMode::ThreadSafe>();
@@ -2746,6 +2776,7 @@ void FVoxelLandBaker::StartCpu()
 
 void FVoxelLandBaker::Finish(TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe> Bake)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelLandBaker::Finish);
     State = EState::Done;
     // The plates, for the debug views (a cached bake doesn't store them; they follow from the
     // seed).
@@ -2947,6 +2978,9 @@ namespace VoxelLandBakeDetail
             return;
         }
         FRDGBuilder GraphBuilder(RHICmdList);
+        {
+            // (Closed before Execute: RDG asserts on an event scope left open.)
+            RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelLandBakeGPU, "VoxelLand bake / river upload");
         if (Job.Builds == 0)
         {
             UploadFields(GraphBuilder, *Bake, *Job.BakeGPU, true);
@@ -2977,6 +3011,7 @@ namespace VoxelLandBakeDetail
                 RecordRiverJob(GraphBuilder, Job, R.Needed);
             }
         }
+        }
         GraphBuilder.Execute();
     }
 
@@ -2997,8 +3032,20 @@ TSharedPtr<const FVoxelLandRiverSet, ESPMode::ThreadSafe> VoxelLand::GetRivers(c
     return Bake.Rivers.IsValid() && Bake.Rivers->Key == Key && Bake.Rivers->TilesPerFace > 0 ? Bake.Rivers : nullptr;
 }
 
+void VoxelLand::ReleaseBakeGPU(const FVoxelLandBake& Bake)
+{
+    // Not while a river build reads them (it uploads what it needs itself).
+    if (!Bake.GPU.IsValid()) return;
+    ENQUEUE_RENDER_COMMAND(VoxelLandReleaseBakeGPU)([GPU = Bake.GPU](FRHICommandListImmediate&)
+        {
+            if (!GPU.IsValid()) return;
+            *GPU = FVoxelLandBakeGPU();
+        });
+}
+
 bool VoxelLand::TickRivers(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& BakePtr, const FVoxelTerrestrialSettings& Settings)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLand::TickRivers);
     using namespace VoxelLandBakeDetail;
     check(IsInGameThread());
     if (!BakePtr.IsValid()) return true;
@@ -3040,6 +3087,7 @@ bool VoxelLand::TickRivers(const TSharedPtr<const FVoxelLandBake, ESPMode::Threa
         Bake.RiverJob = Job;
         ENQUEUE_RENDER_COMMAND(VoxelLandRiverStart)([Job](FRHICommandListImmediate& RHICmdList)
             {
+                TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelLandRiverStart");
                 TickRiverJob(RHICmdList, *Job);
             });
         return false;
@@ -3051,6 +3099,7 @@ bool VoxelLand::TickRivers(const TSharedPtr<const FVoxelLandBake, ESPMode::Threa
     {
         ENQUEUE_RENDER_COMMAND(VoxelLandRiverTick)([InJob = Bake.RiverJob](FRHICommandListImmediate& RHICmdList)
             {
+                TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelLandRiverTick");
                 TickRiverJob(RHICmdList, *InJob);
             });
         return false;
@@ -3072,6 +3121,7 @@ bool VoxelLand::TickRivers(const TSharedPtr<const FVoxelLandBake, ESPMode::Threa
 
 FVoxelLandShaderParameters VoxelLandGPU::GetParameters(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandGPU::GetParameters);
     FVoxelLandShaderParameters Parameters;
     Parameters.LandMode = 0;
     Parameters.LandN = 1;

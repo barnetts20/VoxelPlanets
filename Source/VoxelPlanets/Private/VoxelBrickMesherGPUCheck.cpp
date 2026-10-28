@@ -4,7 +4,7 @@
 #include "AdaptiveVoxelActor.h"
 #include "VoxelBrickMesherGPU.h"
 #include "VoxelBrickTerrain.h"
-#include "VoxelDensity.h"
+#include "VoxelPlanetDensity.h"
 #include "VoxelDensityGPU.h"
 #include "VoxelPlanets.h"
 #include "FSparseEditStore.h"
@@ -135,7 +135,7 @@ namespace VoxelBrickMesherGPUCheck
         {
             const TSharedPtr<FVoxelBrickTerrain> Bricks = It->GetBrickTerrain();
             if (Bricks.IsValid() && Bricks->GetWantedSignatures().Num() > 0 && It->GetDensityCompositor().IsValid()
-                && FVoxelDensityCPU::Of(*It->GetDensityCompositor()).IsValid())
+                && FVoxelPlanetDensity::Of(*It->GetDensityCompositor()).IsValid())
             {
                 Terrain = *It;
                 break;
@@ -218,8 +218,7 @@ namespace VoxelBrickMesherGPUCheck
 
         // The terrain's own GPU settings, so the check meshes what the pages mesh.
         const FVoxelBrickMesherGPUSettings GpuSettings = BrickTerrain->GetMesherSettings();
-        const TSharedRef<FVoxelDensityGPUData> DensityData = MakeShared<FVoxelDensityGPUData>();
-        FVoxelDensityCPU::Of(*Compositor)->BuildGPUData(*DensityData);
+        const TSharedRef<const FVoxelDensityGPUData> DensityData = FVoxelPlanetDensity::Of(*Compositor)->GetGPUData();
         const TSharedPtr<FSparseEditStore> EditStore = Compositor->GetEditStore();
         const TSharedRef<FVoxelEditGPUData> EditData = FVoxelEditGPUData::Build(EditStore.Get(), 0.5 * GpuSettings.FinestCell, GpuSettings.MaxDepth);
 

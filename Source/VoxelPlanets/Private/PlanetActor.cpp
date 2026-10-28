@@ -1,5 +1,8 @@
 #include "PlanetActor.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelDensity.h"
+#include "VoxelPlanetDensity.h"
+#include "VoxelTerrestrialDensity.h"
 #include "PlanetGravityZone.h"
 #include "Components/DirectionalLightComponent.h"
 #include "VoxelLandBake.h"
@@ -12,6 +15,7 @@
 #include "AtmosphereWeather.h"
 #include "VoxelOceanProfile.h"
 #include "Async/ParallelFor.h"
+#include "Async/Async.h"
 #include "VoxelPlanets.h"
 #include "EngineUtils.h"
 #include "HAL/FileManager.h"
@@ -19,6 +23,29 @@
 #include "Kismet/GameplayStatics.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
+#include "VoxelBrickTerrain.h"
+
+namespace PlanetActorTimelineDetail
+{
+    /** Stage P1a: adds a scope's game-thread time to the build's timeline. */
+    struct FSpentScope
+    {
+        FPlanetSpawnTimeline& Timeline;
+        FPlanetSpawnTimeline::ESpent What;
+        double Start;
+        FSpentScope(FPlanetSpawnTimeline& InTimeline, FPlanetSpawnTimeline::ESpent InWhat)
+            : Timeline(InTimeline), What(InWhat), Start(FPlatformTime::Seconds()) {}
+        ~FSpentScope() { Timeline.AddSpent(What, FPlatformTime::Seconds() - Start); }
+    };
+
+    /** Seconds after Initialize the timeline waits for the terrain to settle and the shore field. */
+    constexpr double SettleWaitSeconds = 90.0;
+
+    using ESpawnMark = FPlanetSpawnTimeline::EMark;
+    using ESpawnSpent = FPlanetSpawnTimeline::ESpent;
+}
+using namespace PlanetActorTimelineDetail;
 
 APlanetActor::APlanetActor()
 {
@@ -174,9 +201,11 @@ void APlanetActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChanged
     }
 
     // Scale, NoiseAmplitudeRatio, SurfaceSettings, SeaLevel, and toggle changes are handled
-    // by FlagPendingWork via the bPendingInitialize / bPendingOceanUpdate flags. Anything else
-    // (an undo reports no property) forwards the children's settings again.
-    if (!bInteractive)
+    // by FlagPendingWork via the bPendingInitialize / bPendingOceanUpdate flags. An undo or redo
+    // (it reports no property) forwards the children's settings again; any other property
+    // (a climate, terrain or gravity one) has nothing of the children's to forward (R1, PLN-6:
+    // it used to regenerate and re-apply the ocean's seeded settings on every such edit).
+    if (!bInteractive && PropName.IsNone())
         ForwardChildSettings();
 }
 
@@ -228,7 +257,19 @@ void APlanetActor::OceanPresetGodot()
 
 void APlanetActor::Tick(float DeltaTime)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::Tick);
     Super::Tick(DeltaTime);
+
+    // Stage P1a: the build's timeline (measurement only). A build starts with the pending flag;
+    // one flagged again after Initialize (a climate landing late, a settings change) starts anew.
+    const double TickStart = FPlatformTime::Seconds();
+    if (bPendingInitialize && (!SpawnTimeline.IsRunning() || SpawnTimeline.Has(ESpawnMark::Initialize)))
+        SpawnTimeline.Begin(GetName(), bInitialized ? TEXT("rebuild") : TEXT("first build"));
+    ON_SCOPE_EXIT
+    {
+        SpawnTimeline.NoteTick(FPlatformTime::Seconds() - TickStart);
+        TickSpawnTimeline();
+    };
 
     // Deferred init - safe to spawn actors here.
     if (bPendingInitialize)
@@ -241,6 +282,13 @@ void APlanetActor::Tick(float DeltaTime)
         // the biomes it makes shape the terrain, which is built once, after it).
         if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandClimate.bWaitForClimate && !UpdateClimateCapture())
             return;
+        if (!SpawnTimeline.Has(ESpawnMark::Climate))
+        {
+            SpawnTimeline.SetClimateOutcome(Generator != EVoxelSurfaceGenerator::Terrestrial || !LandClimate.bEnabled ? TEXT("off")
+                : !LandClimate.bWaitForClimate ? TEXT("not waited for")
+                : ClimateSim.IsValid() ? TEXT("snapshot") : TEXT("provisional model"));
+            SpawnTimeline.Mark(ESpawnMark::Climate);
+        }
         // Stage T5d2: the land chain's climate for the settings the build has (the lapse rate, the
         // ice sheets on or off), so a settings change rebuilds once, not again when the climate
         // catches up.
@@ -251,9 +299,11 @@ void APlanetActor::Tick(float DeltaTime)
         if (Generator == EVoxelSurfaceGenerator::Terrestrial && (IsLandClimateFieldStale()
             || (LandClimateField.IsValid() && ClimateMapHash != LandClimateMapHash() && ClimateBaseKey == CurrentClimateBaseKey())))
             RebuildLandClimateTarget();
-        // T5e: the ice shelf in the terrain's bake, by the climate captured.
-        if (Generator == EVoxelSurfaceGenerator::Terrestrial)
-            UpdateIceShelf();
+        // T5e: the ice shelf in the terrain's bake, by the climate captured. Stage P1d: made on a
+        // worker; the build waits for it (a few frames) as it waits for the bake, so the field's
+        // tick and Initialize's are no longer one tick with the shelf in it.
+        if (Generator == EVoxelSurfaceGenerator::Terrestrial && !UpdateIceShelf())
+            return;
         bPendingInitialize = false;
         bPendingOceanUpdate = false;
         Initialize();
@@ -277,8 +327,10 @@ void APlanetActor::Tick(float DeltaTime)
         const bool bSeaLevelChanged = Generator != EVoxelSurfaceGenerator::Terrestrial && SeaLevel != LastSeaLevel;
         if (bSeaLevelChanged || bEnableOcean != bLastEnableOcean)
             ConfigureOcean(PlanetRadius, NoiseAmplitude, OceanRadius);
-        // (Stage A1: the atmosphere at the new surface, or on or off; and the ocean's sun again.)
-        ConfigureAtmosphere(PlanetRadius, OceanRadius);
+        // (Stage A1: the atmosphere at the new surface, or on or off; and the ocean's sun again.
+        // Not for a gravity toggle alone: R1, PLN-7.)
+        if (bSeaLevelChanged || bEnableOcean != bLastEnableOcean || bEnableAtmosphere != bLastEnableAtmosphere)
+            ConfigureAtmosphere(PlanetRadius, OceanRadius);
         // The elevation debug view measures from the new sea level.
         if (bSeaLevelChanged && TerrainActor)
             TerrainActor->SetDebugSeaRadius(OceanRadius);
@@ -310,6 +362,8 @@ void APlanetActor::Tick(float DeltaTime)
 
 bool APlanetActor::TickLandBake()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::TickLandBake);
+    FSpentScope Spent(SpawnTimeline, ESpawnSpent::BakeGate);
     const double SeaRadius = GetActorScale3D().GetMax();
     const uint32 Key = VoxelLand::BakeKey(TerrestrialSettings, SeaRadius);
     // The shared noise pack (the peaks', detail, hills' and strata's sets): the density takes it when it is
@@ -318,7 +372,11 @@ bool APlanetActor::TickLandBake()
     auto NoiseReady = [this]()
     {
         const FString Name = VoxelLand::LandNoiseNameFor(TerrestrialSettings);
-        if (VoxelLand::TryGetLandNoise(Name, LandNoise)) return true;
+        if (VoxelLand::TryGetLandNoise(Name, LandNoise))
+        {
+            SpawnTimeline.Mark(ESpawnMark::Noise);
+            return true;
+        }
         VoxelLand::PrewarmLandNoise(Name);
         return false;
     };
@@ -326,12 +384,20 @@ bool APlanetActor::TickLandBake()
     // settings, build them on the GPU first (a few frames).
     auto RiversReady = [this]()
     {
-        return VoxelLand::TickRivers(LandBake, TerrestrialSettings);
+        const bool bReady = VoxelLand::TickRivers(LandBake, TerrestrialSettings);
+        if (bReady)
+            SpawnTimeline.Mark(ESpawnMark::Rivers);
+        return bReady;
     };
     if (LandBake.IsValid() && LandBake->Key == Key && LandBake->N == VoxelLand::BakeResolutionFor(TerrestrialSettings))
     {
         // Only the per-sample settings changed: the bake is reused.
         LandBaker.Reset();
+        if (!SpawnTimeline.Has(ESpawnMark::Bake))
+        {
+            SpawnTimeline.SetBakeSource(TEXT("held"));
+            SpawnTimeline.Mark(ESpawnMark::Bake);
+        }
         const bool bRivers = RiversReady();
         return NoiseReady() && bRivers;
     }
@@ -341,8 +407,10 @@ bool APlanetActor::TickLandBake()
     if (!LandBaker->IsDone())
         return false;
     LandBake = LandBaker->GetResult();
+    SpawnTimeline.SetBakeSource(LandBaker->GetSource());
     LandBaker.Reset();
     if (!LandBake.IsValid()) return false;
+    SpawnTimeline.Mark(ESpawnMark::Bake);
     const bool bRivers = RiversReady();
     return NoiseReady() && bRivers;
 }
@@ -386,12 +454,16 @@ double APlanetActor::ChildNoiseAmplitudeRatio(double PlanetRadius, double NoiseA
 
 void APlanetActor::Initialize()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::Initialize);
+    FSpentScope Spent(SpawnTimeline, ESpawnSpent::Initialize);
     if (Generator != EVoxelSurfaceGenerator::Terrestrial)
     {
         // The noise surface needs no bake: release one a terrestrial build left.
         LandBake.Reset();
         ShelfBake.Reset();
         ShelfBakeHash = 0;
+        ShelfFuture = TFuture<TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>>();
+        ShelfFutureHash = 0;
         LandBaker.Reset();
         LandNoise.Reset();
     }
@@ -413,10 +485,22 @@ void APlanetActor::Initialize()
     SharedCompositor = NewCompositor;
 
     // --- Terrain actor ---
-    TerrainActor->SetSurfaceMaterial(TerrainMaterial);
+    // The material is resolved by the rebuild below (InitializeFromOwner), against the new
+    // density; SetSurfaceMaterial would resolve it now against the old one (R1, ENG-7). It is set
+    // through the setter only before the first terrain exists (the default when none is given).
+    if (TerrainActor->GetBrickTerrain().IsValid())
+    {
+        if (TerrainMaterial)
+            TerrainActor->SurfaceMaterial = TerrainMaterial;
+    }
+    else
+        TerrainActor->SetSurfaceMaterial(TerrainMaterial);
     TerrainActor->NoiseAmplitudeRatio = ChildNoiseAmplitudeRatio(PlanetRadius, NoiseAmplitude);
     TerrainActor->SetDebugSeaRadius(OceanRadius);
-    TerrainActor->InitializeFromOwner(SharedCompositor, PlanetRoot, FVector(PlanetRadius));
+    {
+        FSpentScope TerrainSpent(SpawnTimeline, ESpawnSpent::Terrain);
+        TerrainActor->InitializeFromOwner(SharedCompositor, PlanetRoot, FVector(PlanetRadius));
+    }
     // Re-activate after a pool park: shown, ticking, and with collision (dormancy dropped it).
     TerrainActor->SetActorHiddenInGame(false);
     TerrainActor->SetActorTickEnabled(true);
@@ -429,10 +513,13 @@ void APlanetActor::Initialize()
 
     RecordAppliedState();
     bInitialized = true;
+    SpawnTimeline.Mark(ESpawnMark::Initialize);
 }
 
 void APlanetActor::ConfigureOcean(double PlanetRadius, double NoiseAmplitude, double OceanRadius)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::ConfigureOcean);
+    FSpentScope Spent(SpawnTimeline, ESpawnSpent::Ocean);
     if (!OceanActor) return;
     if (!bEnableOcean)
     {
@@ -460,11 +547,11 @@ void APlanetActor::ConfigureOcean(double PlanetRadius, double NoiseAmplitude, do
 
 void APlanetActor::ConfigureGravity(double PlanetRadius, double OceanRadius)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::ConfigureGravity);
     if (!GravityZone) return;
     if (!bEnableGravity)
     {
         GravityZone->SetActorHiddenInGame(true);
-        GravityZone->SetActorTickEnabled(false);
         GravityZone->SetActorEnableCollision(false);
         return;
     }
@@ -473,7 +560,6 @@ void APlanetActor::ConfigureGravity(double PlanetRadius, double OceanRadius)
     GravityZone->SetActorScale3D(FVector(FMath::Max(OceanRadius, PlanetRadius)));
     GravityZone->InitializeFromPlanet();
     GravityZone->SetActorHiddenInGame(false);
-    GravityZone->SetActorTickEnabled(true);
     GravityZone->SetActorEnableCollision(true);
 }
 
@@ -517,6 +603,7 @@ namespace VoxelPlanetClimate
 
 void APlanetActor::ConfigureAtmosphereSurface()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::ConfigureAtmosphereSurface);
     if (!AtmosphereActor) return;
     const FVoxelLandBake* Bake = Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid() && AtmosphereTerrainHeight > 0.0f
         ? LandBake.Get() : nullptr;
@@ -756,6 +843,7 @@ uint32 APlanetActor::CurrentClimateBaseKey() const
 
 bool APlanetActor::EnsureLandClimateBase()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::EnsureLandClimateBase);
     if (Generator != EVoxelSurfaceGenerator::Terrestrial || !LandBake.IsValid() || LandBake->Height.Num() != LandBake->NumCells())
         return false;
     // The base for the bake (the land's share and the distance to the sea).
@@ -764,6 +852,7 @@ bool APlanetActor::EnsureLandClimateBase()
     if (BaseKey != ClimateBaseKey || ClimateLand.Num() != VoxelLandClimate::Width() * VoxelLandClimate::Height())
     {
         const double StartSeconds = FPlatformTime::Seconds();
+        FSpentScope Spent(SpawnTimeline, ESpawnSpent::ClimateBase);
         VoxelLandClimate::BuildBase(*LandBake, SeaRadiusM, ClimateLand, ClimateCoast, &ClimateHeight);
         UE_LOG(LogVoxelPlanets, Log, TEXT("[Planet] %s: the land climate's base (%dx%d: the land's share, the distance to the sea) in %.0f ms."),
             *GetName(), VoxelLandClimate::Width(), VoxelLandClimate::Height(), (FPlatformTime::Seconds() - StartSeconds) * 1000.0);
@@ -774,11 +863,15 @@ bool APlanetActor::EnsureLandClimateBase()
 
 bool APlanetActor::UpdateClimateCapture()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::UpdateClimateCapture);
     if (!LandClimate.bEnabled || !EnsureLandClimateBase()) return true;
 
     // ONE SNAPSHOT PER SEED (Design/LandClimate.md): what the climate is captured for, the bake and
     // the atmosphere (seed, model, on), and how (the source). A change captures again, once.
-    const bool bSnapshot = LandClimate.Source == EVoxelLandClimateSource::Snapshot && bEnableAtmosphere;
+    // (An air-only atmosphere never drives the sim: the provisional model at once, not after
+    // ClimateWaitSeconds: R1, PLN-3.)
+    const bool bSnapshot = LandClimate.Source == EVoxelLandClimateSource::Snapshot && bEnableAtmosphere
+        && AtmosphereType != EPlanetAtmosphereType::AirOnly;
     uint32 Key = HashCombine(ClimateBaseKey, GetTypeHash((uint8)LandClimate.Source));
     if (bSnapshot)
         Key = HashCombine(Key, HashCombine(HashCombine(GetTypeHash(GetAtmosphereSeed()), GetTypeHash((uint8)AtmosphereType)),
@@ -794,7 +887,9 @@ bool APlanetActor::UpdateClimateCapture()
         {
             ClimateCaptureState = EVoxelPlanetClimateCapture::Captured;
             RebuildLandClimateTarget();
-            LandClimateStatus = bEnableAtmosphere ? TEXT("Provisional model (the source asks for it).") : TEXT("Provisional model (no atmosphere).");
+            LandClimateStatus = !bEnableAtmosphere ? TEXT("Provisional model (no atmosphere).")
+                : AtmosphereType == EPlanetAtmosphereType::AirOnly && LandClimate.Source == EVoxelLandClimateSource::Snapshot
+                    ? TEXT("Provisional model (an air-only atmosphere runs no sim).") : TEXT("Provisional model (the source asks for it).");
             return true;
         }
         // The atmosphere at the planet with this bake's ground (its surface map), and its sim
@@ -802,6 +897,7 @@ bool APlanetActor::UpdateClimateCapture()
         // the first build too: the children are spawned (the terrain isn't built until the capture).
         ClimateCaptureState = EVoxelPlanetClimateCapture::Waiting;
         ClimateCaptureStart = Now;
+        SpawnTimeline.Mark(ESpawnMark::ClimateStart);
         ClimateProgressTime = Now;
         ClimateProgressSteps = -1;
         ClimateOtherOwnerSince = 0.0;
@@ -869,6 +965,8 @@ bool APlanetActor::UpdateClimateCapture()
     FString Reason;
     if (bDriving && !AtmosphereActor->CanProvideClimateSnapshot())
         Reason = TEXT("the sim can't give one (paused, its config's bClimateSnapshot off, or the atmosphere's ClimateReadbackSeconds 0)");
+    else if (!bDriving && AtmosphereActor && !AtmosphereActor->BidsForSimulation())
+        Reason = TEXT("the atmosphere doesn't drive a sim (air only, its claiming off, or no sim config)");
     else if (bOtherOwner && Now - ClimateOtherOwnerSince > 3.0)
         Reason = TEXT("this planet's atmosphere doesn't drive the sim (another planet is nearer the camera)");
     else if (Now - ClimateProgressTime > (double)LandClimate.ClimateWaitSeconds)
@@ -888,6 +986,8 @@ bool APlanetActor::UpdateClimateCapture()
 
 void APlanetActor::RebuildLandClimateTarget()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::RebuildLandClimateTarget);
+    FSpentScope Spent(SpawnTimeline, ESpawnSpent::Field);
     if (ClimateLand.Num() != VoxelLandClimate::Width() * VoxelLandClimate::Height()) return;
     FVoxelLandClimateMap Map;
     // T5e: the ice shelf's share in the map (the material's whitening, the chain's ice and rivers).
@@ -922,17 +1022,23 @@ bool APlanetActor::IceShelfOn() const
     return Generator == EVoxelSurfaceGenerator::Terrestrial && LandClimate.bEnabled && TerrestrialSettings.IceShelfHeight > 0.0;
 }
 
-void APlanetActor::UpdateIceShelf()
+bool APlanetActor::UpdateIceShelf()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::UpdateIceShelf);
+    FSpentScope Spent(SpawnTimeline, ESpawnSpent::Shelf);
     // (A field made for the current bake only: see LandClimateFieldBaseKey.)
     if (!IceShelfOn() || !LandBake.IsValid() || !LandClimateField.IsValid() || !LandClimateField->IsValid()
         || LandClimateFieldBaseKey != CurrentClimateBaseKey())
     {
         ShelfBake.Reset();
         ShelfBakeHash = 0;
-        return;
+        // (One in flight finishes unread: it holds its inputs.)
+        ShelfFuture = TFuture<TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>>();
+        ShelfFutureHash = 0;
+        return true;
     }
-    uint32 Hash = HashCombine(LandBake->Key, LandClimateField->Hash);
+    // (The field's sea-level temperatures, not its whole hash: R1, BAKE-3.)
+    uint32 Hash = HashCombine(LandBake->Key, LandClimateField->SeaTemperatureHash);
     for (const double V : { TerrestrialSettings.IceShelfHeight, TerrestrialSettings.IceShelfTemperature, TerrestrialSettings.IceShelfFrontNoise,
         TerrestrialSettings.IceShelfRise, TerrestrialSettings.IceShelfRoll, TerrestrialSettings.IceShelfDraft })
         Hash = HashCombine(Hash, ::GetTypeHash(V));
@@ -946,12 +1052,40 @@ void APlanetActor::UpdateIceShelf()
             FScopeLock RiverLock(&LandBake->RiverLock);
             Rivers = LandBake->Rivers;
         }
-        FScopeLock ShelfLock(&ShelfBake->RiverLock);
-        ShelfBake->Rivers = Rivers;
-        return;
+        {
+            FScopeLock ShelfLock(&ShelfBake->RiverLock);
+            ShelfBake->Rivers = Rivers;
+        }
+        // (A river rebuild uploaded the planet's bake's fields again: let go, as below.)
+        VoxelLand::ReleaseBakeGPU(*LandBake);
+        return true;
     }
-    ShelfBake = VoxelLandClimate::MakeIceShelfBake(*LandBake, *LandClimateField, TerrestrialSettings);
+    // Stage P1d: on the thread pool (MakeIceShelfBake runs on any thread: it reads its inputs,
+    // holds them by pointer and value, and takes Base's rivers under their lock). The same
+    // function with the same inputs: the same shelf, a few frames later and off the game thread.
+    if (!ShelfFuture.IsValid() || ShelfFutureHash != Hash)
+    {
+        ShelfFutureHash = Hash;
+        ShelfFuture = Async(EAsyncExecution::ThreadPool,
+            [Base = LandBake, Field = LandClimateField, Settings = TerrestrialSettings]() -> TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>
+            {
+                return VoxelLandClimate::MakeIceShelfBake(*Base, *Field, Settings);
+            });
+        return false;
+    }
+    if (!ShelfFuture.IsReady())
+        return false;
+    ShelfBake = ShelfFuture.Get();
+    ShelfFuture = TFuture<TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>>();
+    ShelfFutureHash = 0;
     ShelfBakeHash = ShelfBake.IsValid() ? Hash : 0u;
+    // The terrain samples the shelf's bake from now on (its own GPU copy, uploaded on first use):
+    // the planet's bake's GPU fields (the solve's, 64 MB at N 1024) would stay resident unread
+    // for the planet's life (R1, BAKE-1). Not while its rivers are being built (TickRivers reads
+    // them): TickLandBake finished them before this.
+    if (ShelfBake.IsValid())
+        VoxelLand::ReleaseBakeGPU(*LandBake);
+    return true;
 }
 
 bool APlanetActor::IsLandClimateFieldStale() const
@@ -999,6 +1133,7 @@ uint32 APlanetActor::LandClimateMapHash() const
 
 void APlanetActor::UploadLandClimate()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::UploadLandClimate);
     if (!ClimateShown.IsValid()) return;
     if (!LandClimateTexture)
         LandClimateTexture = VoxelLandMaterial::MakeClimateTexture();
@@ -1008,6 +1143,7 @@ void APlanetActor::UploadLandClimate()
 
 void APlanetActor::TickLandClimate(float DeltaTime)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::TickLandClimate);
     const bool bOn = LandClimate.bEnabled && bInitialized && TerrainActor && Generator == EVoxelSurfaceGenerator::Terrestrial
         && LandBake.IsValid() && LandBake->Height.Num() == LandBake->NumCells();
     if (!bOn)
@@ -1082,6 +1218,8 @@ void APlanetActor::TickLandClimate(float DeltaTime)
 
 void APlanetActor::ConfigureAtmosphere(double PlanetRadius, double OceanRadius, bool bRegenerate)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::ConfigureAtmosphere);
+    FSpentScope Spent(SpawnTimeline, ESpawnSpent::AtmosphereConfig);
     if (!AtmosphereActor) return;
     if (!bEnableAtmosphere)
     {
@@ -1118,6 +1256,7 @@ void APlanetActor::ConfigureAtmosphere(double PlanetRadius, double OceanRadius, 
     AtmosphereActor->SetAtmosphereActive(true);
     AtmosphereActor->SetActorHiddenInGame(false);
     AtmosphereActor->SetActorTickEnabled(true);
+    SpawnTimeline.Mark(ESpawnMark::Atmosphere);
 #if WITH_EDITOR
     AtmosphereActor->SetIsTemporarilyHiddenInEditor(false);
 #endif
@@ -1135,6 +1274,32 @@ void APlanetActor::ConfigureAtmosphere(double PlanetRadius, double OceanRadius, 
     // the sea's pixels left to the ocean.
     if (OceanActor)
         OceanActor->SetAtmosphere(AtmosphereActor);
+}
+
+void APlanetActor::TickSpawnTimeline()
+{
+    // Stage P1a: after Initialize, the terrain's first bricks and its first fill settling (and
+    // the ocean's fields on a terrestrial planet, made from its bake); then the line is logged.
+    if (!SpawnTimeline.IsRunning() || !SpawnTimeline.Has(ESpawnMark::Initialize)) return;
+    const TSharedPtr<FVoxelBrickTerrain> Bricks = TerrainActor ? TerrainActor->GetBrickTerrain() : nullptr;
+    if (Bricks.IsValid())
+    {
+        if (Bricks->NumOnScreen() > 0)
+            SpawnTimeline.Mark(ESpawnMark::TerrainFirst);
+        if (SpawnTimeline.Has(ESpawnMark::TerrainFirst) && Bricks->IsSettled())
+            SpawnTimeline.Mark(ESpawnMark::TerrainSettled);
+    }
+    const bool bShoreExpected = OceanActor && bEnableOcean && Generator == EVoxelSurfaceGenerator::Terrestrial;
+    // (Stage P1d: this build's field, by its bake's key: a reseed holds the old seed's until then.)
+    const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> ShoreBake = TerrainBake();
+    if (bShoreExpected && ShoreBake.IsValid() && OceanActor->HasShoreFieldFor(ShoreBake->Key))
+        SpawnTimeline.Mark(ESpawnMark::Shore);
+    if (bShoreExpected && OceanActor->HasCoastField())
+        SpawnTimeline.Mark(ESpawnMark::Coast);
+    if (SpawnTimeline.Has(ESpawnMark::TerrainSettled) && (!bShoreExpected || SpawnTimeline.Has(ESpawnMark::Shore)))
+        SpawnTimeline.End();
+    else if (SpawnTimeline.Elapsed() - SpawnTimeline.When(ESpawnMark::Initialize) > PlanetActorTimelineDetail::SettleWaitSeconds)
+        SpawnTimeline.End(TEXT("stopped waiting 90 s after Initialize: the camera kept the terrain busy, or the shore field didn't come"));
 }
 
 void APlanetActor::RecordAppliedState()
@@ -1157,8 +1322,18 @@ void APlanetActor::RecordAppliedState()
 TSharedPtr<FDensitySampleCompositor> APlanetActor::BuildCompositor(
     double PlanetRadius, double NoiseAmplitude, double RootExtent, int32 MaxDepth)
 {
-    TSharedPtr<FSparseEditStore> EditStore = MakeShared<FSparseEditStore>(
-        FVector::ZeroVector, RootExtent, MaxDepth);
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::BuildCompositor);
+    FSpentScope Spent(SpawnTimeline, ESpawnSpent::Compositor);
+    // The edit store: kept across a rebuild of the same planet that leaves the lattice as it is
+    // (the same generator and surface settings, root box and depth: a climate landing after the
+    // build, a recapture, the climate's settings), so the edits dug meanwhile survive it (R1,
+    // PLN-4); a new one for another planet (a seed or shape change) or a new lattice.
+    const bool bSamePlanet = Generator == LastGenerator && (Generator == EVoxelSurfaceGenerator::Terrestrial
+        ? TerrestrialSettings.GetSettingsHash() == LastTerrestrialHash : SurfaceSettings.GetSettingsHash() == LastSurfaceSettingsHash);
+    TSharedPtr<FSparseEditStore> EditStore = bSamePlanet && SharedCompositor.IsValid() ? SharedCompositor->GetEditStore() : nullptr;
+    const double HalfFinest = RootExtent / FMath::Pow(2.0, (double)FMath::Max(MaxDepth, 0));
+    if (!EditStore.IsValid() || !EditStore->GetCenter().IsZero() || EditStore->GetExtent() != RootExtent || EditStore->GetHalfFinest() != HalfFinest)
+        EditStore = MakeShared<FSparseEditStore>(FVector::ZeroVector, RootExtent, MaxDepth);
 
     const double Finest = VoxelDensity::TerrainFinestCell(PlanetRadius, NoiseAmplitude, MaxDepth);
     if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid())
@@ -1179,6 +1354,7 @@ TSharedPtr<FDensitySampleCompositor> APlanetActor::BuildCompositor(
 
 void APlanetActor::SpawnChildActors()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetActor::SpawnChildActors);
     UWorld* World = GetWorld();
     if (!World) return;
 
@@ -1236,9 +1412,8 @@ void APlanetActor::SpawnChildActors()
                 FAttachmentTransformRules::KeepWorldTransform);
         }
         // Stage T5b: off until ConfigureGravity sizes it (the climate capture spawns the children
-        // before the build).
+        // before the build). (It never ticks: the manager's tick applies the gravity.)
         GravityZone->SetActorEnableCollision(false);
-        GravityZone->SetActorTickEnabled(false);
     }
 
     // Stage A1: no second atmosphere. A level saved before the atmosphere was detached (or by
@@ -1344,7 +1519,7 @@ FVoxelWaterSample APlanetActor::GetWaterAt(const FVector& WorldLocation) const
 {
     FVoxelWaterSample Out;
     if (!SharedCompositor.IsValid()) return Out;
-    const TSharedPtr<const FVoxelDensityCPU> Density = FVoxelDensityCPU::Of(*SharedCompositor);
+    const TSharedPtr<const FVoxelPlanetDensity> Density = FVoxelPlanetDensity::Of(*SharedCompositor);
     if (!Density.IsValid()) return Out;
     // The planet's frame (no scale: the density's positions are cm from the centre).
     const FTransform Frame(GetActorRotation(), GetActorLocation());
@@ -1353,9 +1528,10 @@ FVoxelWaterSample APlanetActor::GetWaterAt(const FVector& WorldLocation) const
     if (Radius < 1.0) return Out;
     Out = Density->WaterAt(Local);
     double SeaRadius = 0.0;
-    if (Density->GetLandBake().IsValid())
+    const TSharedPtr<const FVoxelTerrestrialDensity> Land = FVoxelTerrestrialDensity::Of(*SharedCompositor);
+    if (Land.IsValid())
     {
-        SeaRadius = Density->GetLandBake()->SeaRadius;
+        SeaRadius = Land->GetLandBake()->SeaRadius;
     }
     else
     {
@@ -1415,7 +1591,6 @@ void APlanetActor::SetDormant(bool bDormant)
     {
         const bool bOn = bActive && bEnableGravity;
         GravityZone->SetActorHiddenInGame(!bOn);
-        GravityZone->SetActorTickEnabled(bOn);
         GravityZone->SetActorEnableCollision(bOn);
     }
     if (AtmosphereActor)
@@ -1432,8 +1607,9 @@ void APlanetActor::SetStarWorldPosition(const FVector& StarWorldPos)
 {
     StarWorldPosition = StarWorldPos;
     bHasStarWorldPosition = true;
-    // Stage A1: the atmosphere's light and march toward the star.
-    if (AtmosphereActor && bEnableAtmosphere && bInitialized)
+    // Stage A1: the atmosphere's light and march toward the star: from the capture on, when the
+    // atmosphere already draws, not only once the planet is built (R1, PLN-5).
+    if (AtmosphereActor && bEnableAtmosphere)
         AtmosphereActor->OrientToStar(StarWorldPos);
 }
 

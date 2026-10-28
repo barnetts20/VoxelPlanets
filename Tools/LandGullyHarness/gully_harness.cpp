@@ -123,7 +123,7 @@ namespace VoxelShader
 #include "VoxelLandGully.ush"
 #include "VoxelDensitySample.ush"
 
-    // The CPU backend's sampler (VoxelDensity.cpp's FVoxelLandSamplerCPU).
+    // The CPU backend's sampler (VoxelTerrestrialDensity.cpp's FVoxelLandSamplerCPU).
     struct FSampler
     {
         const float* LandHeight = nullptr;
@@ -215,7 +215,7 @@ static void ParallelFor(int N, const std::function<void(int)>& F)
     for (auto& t : Th) t.join();
 }
 
-// MakeLayer / EvaluateLayerGradient from VoxelDensity.cpp, in std types.
+// MakeLayer / EvaluateLayerGradient from VoxelDensityLayers.cpp, in std types.
 struct FOct { double Freq; double Off[3]; float Wave; float Amp; uint32_t Seed; uint32_t Shift = 0xffffffffu; uint32_t OffCell[3]{}, OffFrac[3]{}; };
 struct FLay { uint32_t Kind = 0; double InvNorm = 0; std::vector<FOct> O; };
 static FVoxelFixed ToFixed(double V) { double F = std::floor(V); FVoxelFixed O; O.Cell = (uint32_t)(int64_t)F; O.Frac = (uint32_t)std::min((V - F) * 4294967296.0, 4294967295.0); return O; }
@@ -296,7 +296,7 @@ static uint16_t ToHalf(float F)
 }
 
 // ---------------------------------------------------------------------------------------------
-// The planet: a dumped bake and the CPU density's land path (FVoxelDensityCPU::LandHeightAt).
+// The planet: a dumped bake and the CPU density's land path (FVoxelTerrestrialDensity::LandHeightAt).
 // ---------------------------------------------------------------------------------------------
 
 struct FPlanet
@@ -471,7 +471,7 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     const double HillFinest = getenv("HILL_FINEST") ? atof(getenv("HILL_FINEST")) : 25.0;
     const int HillOctaves = P.Form.empty() || HillRelief <= 0 ? 0 : std::clamp((int)std::floor(std::log2(HillLongest / HillFinest)) + 1, 1, 12);
     const double HillFrequency = 1.0 / (HillLongest * 100.0 / std::pow(2.0, std::max(HillOctaves, 1) - 1));
-    // The peaks (VoxelLand::PeakTexelsPerCell, PeakReach; FVoxelDensityCPU), from the environment.
+    // The peaks (VoxelLand::PeakTexelsPerCell, PeakReach; FVoxelTerrestrialDensity), from the environment.
     const double PeakStrength = getenv("PEAK_STRENGTH") ? atof(getenv("PEAK_STRENGTH")) : 1.0;
     const double PeakSpacing = getenv("PEAK_SPACING") ? atof(getenv("PEAK_SPACING")) : 6000.0;
     const bool bPeaks = !P.Form.empty() && PeakStrength > 0;
@@ -503,7 +503,7 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     S.LandHillSeed = VoxelHashSeed(7, 0x31u);
     S.LandRelief = P.ReliefPacked.data();
     S.LandProvince = P.ProvincePacked.data();
-    // N1: the detail layer (FVoxelDensityCPU's terrestrial constructor): DETAIL_WAVELENGTH (m),
+    // N1: the detail layer (FVoxelTerrestrialDensity's constructor): DETAIL_WAVELENGTH (m),
     // DETAIL_AMP (m, above).
     if (P.DetailAmp > 0 && P.DetailStats.StdA > 0)
     {
@@ -541,7 +541,7 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
             S.LandRiverTiles = P.Rivers.Tiles.data(); S.LandRiverData = P.Rivers.Data.data();
             S.LandRiverTilesPerFace = (uint)P.Rivers.TilesPerFace;
             S.LandRiverRadiusM = (float)RadiusM; S.LandRiverWidthScale = (float)WidthScale; S.LandRiverValleyScale = (float)ValleyScale;
-            // R2: the carve (FVoxelDensityCPU's terrestrial constructor): CARVE (0 off), RIVER_DEPTH,
+            // R2: the carve (FVoxelTerrestrialDensity's constructor): CARVE (0 off), RIVER_DEPTH,
             // FLOODPLAIN, LAKE_SHORE (m).
             S.LandRiverCarve = getenv("CARVE") ? (float)atof(getenv("CARVE")) : 1.0f;
             S.LandRiverDepthScale = getenv("RIVER_DEPTH") ? (float)atof(getenv("RIVER_DEPTH")) : 1.0f;
@@ -565,7 +565,7 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     S.LandNoiseN = P.NoiseSet.N; S.LandNoiseMips = P.NoiseSet.Mips;
     if (bPeaks)
     {
-        // FVoxelDensityCPU's terrestrial constructor (VoxelLand::PeakTexelsPerCell).
+        // FVoxelTerrestrialDensity's constructor (VoxelLand::PeakTexelsPerCell).
         const auto& Set = P.NoiseSet;
         auto Unit = [&](int c, double V) { const auto& C = Set.Channel[c]; return (V - (double)C.Min) / std::max((double)C.Max - (double)C.Min, 1e-12); };
         const double TexelM = PeakSpacing / (double)(Set.N / Set.Channel[0].CellsPerTile);
@@ -580,7 +580,7 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
         S.LandPeakScaleR = RangeR / Range;
         S.LandPeakScaleG = RangeG / Range;
         S.LandPeakScaleB = RangeB / Range;
-        // FVoxelDensityCPU's detail (VoxelLand::PeakDetailTexelsPerCell).
+        // FVoxelTerrestrialDensity's detail (VoxelLand::PeakDetailTexelsPerCell).
         if (PeakDetail > 0)
         {
             const auto& D = P.Detail;
@@ -600,7 +600,7 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
     S.LandDetailBase = P.DetailBase; S.LandDetailN = P.Detail.N; S.LandDetailMips = P.Detail.Mips;
     S.LandDetailMeanHard = (float)P.DetailStats.MeanHard;
     S.LandDetailMeanSoft = (float)P.DetailStats.MeanSoft;
-    // T4a: the hills from the set (FVoxelDensityCPU's; VoxelLand::HillTexelsPerCell), from the
+    // T4a: the hills from the set (FVoxelTerrestrialDensity's; VoxelLand::HillTexelsPerCell), from the
     // environment: HILL_SPACING (m), HILL_STRENGTH, HILL_SWELL (m), HILL_SWELL_SCALE (the swells'
     // spacing over the hills'), HILL_DETAIL (strength), HILL_DETAIL_WAVELENGTH (m).
     if (!P.HillSet.Texels.empty() && S.LandHasForm && HillRelief > 0)
@@ -647,7 +647,7 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
         }
         printf("hills from %s: spacing %.0f m (texel %.1f m), relief %.0f m at strength %.2f; swells %.0f m at %.1fx; detail %.2f from %.0f m\n",
             getenv("HILL_SET"), Spacing, TexelMF, S.LandHillRelief, HStrength, S.LandHillSwellM, SwellScale, HDetail, HDetailWave);
-        // T4c: the strata (FVoxelDensityCPU's; VoxelLand::StrataTexelsPerCell), from the
+        // T4c: the strata (FVoxelTerrestrialDensity's; VoxelLand::StrataTexelsPerCell), from the
         // environment: STRATA_SPACING (m), STRATA_STRENGTH, STRATA_COVERAGE (share of the land),
         // STRATA_WIDTH (the switch's half-width), STRATA_FLAT, STRATA_DETAIL, STRATA_DETAIL_WAVELENGTH.
         const double Coverage = getenv("STRATA_COVERAGE") ? atof(getenv("STRATA_COVERAGE")) : 0.3;
@@ -689,7 +689,7 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
                     if (Above + C >= Wanted && C > 0.0) { Th = (float)((q + 0.5 - (Wanted - Above) / C) / 63.0); break; }
                     Above += C;
                 }
-                S.LandStrataThreshold = Total > 0 ? std::max(Th, S.LandStrataWidth) : 2.0f;   // as FVoxelDensityCPU
+                S.LandStrataThreshold = Total > 0 ? std::max(Th, S.LandStrataWidth) : 2.0f;   // as FVoxelTerrestrialDensity
             }
             if (SDetail > 0)
             {
@@ -716,7 +716,7 @@ static void Load(FPlanet& P, const std::string& Tag, int N, double RadiusM, doub
 
 struct FTerms { double Bake, Hills, Peaks, Gully, Detail, Height, Carve; float DetailScale; };
 
-/** FVoxelDensityCPU::LandHeightAt at direction D (unit), Footprint (cm). Height in m above sea. */
+/** FVoxelTerrestrialDensity::LandHeightAt at direction D (unit), Footprint (cm). Height in m above sea. */
 /** The strata mode's switch: Terms leaves the strata out while set (T4c). */
 static bool GNoStrata = false;
 
@@ -1877,7 +1877,7 @@ int main(int argc, char** argv)
     else if (Mode == "dcost")
     {
         // N1: the detail layer's CPU cost (VoxelLandDetailDF) against the procedural slope-damped
-        // fBm it replaced (sixteen octaves from 20 km, gain 0.5, as FVoxelDensityCPU made it), at
+        // fBm it replaced (sixteen octaves from 20 km, gain 0.5, as FVoxelTerrestrialDensity made it), at
         // land points over the planet, at four footprints; and (built with
         // -DVOXEL_HARNESS_COUNT_NOISE) its noise word loads a sample.
         std::mt19937 Rng(31);

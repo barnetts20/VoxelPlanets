@@ -437,7 +437,7 @@ VOXEL_FUNC float VoxelLandDetailScale(VOXEL_LAND_ARGS_DECL float Bake)
  *  isotropic detail. Uniform over the land, not by slope: a scale that follows the slope dips
  *  across every valley floor and crest, and the detail draws a groove there). DWX, DWY, DWZ as
  *  VoxelLandWarpedGradient (zero without a warp). Both density backends add the detail
- *  themselves (VoxelDensitySample.ush, FVoxelDensityCPU::LandHeightAt). */
+ *  themselves (VoxelDensitySample.ush, FVoxelTerrestrialDensity::LandHeightAt). */
 struct FVoxelLandSurface
 {
     float Bake;

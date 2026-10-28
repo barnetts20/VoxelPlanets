@@ -1,5 +1,6 @@
 #include "VoxelLandCache.h"
-#include "VoxelDensity.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "VoxelTerrestrialDensity.h"
 #include "VoxelDensityGPU.h"
 #include "VoxelGPUCommon.h"
 #include "VoxelLandBake.h"
@@ -20,6 +21,8 @@
 // The constants the shaders share (VoxelLandCache.ush), and the plan.
 #include "VoxelLandCacheLayout.ush"
 #include "VoxelLandCachePlan.h"
+
+DECLARE_GPU_STAT(VoxelLandCacheWrite);   // P1a: its own row in stat gpu
 
 static TAutoConsoleVariable<int32> CVarVoxelLandCacheTexelsPerFrame(
     TEXT("voxel.Land.CacheTexelsPerFrame"), 131072,
@@ -151,6 +154,7 @@ int32 FVoxelLandCache::TilesFor(int32 InLevels)
 
 bool FVoxelLandCache::MakeTextures(int32 InLevels, UObject* Outer, FVoxelLandCacheTextures& Out)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelLandCache::MakeTextures);
     using namespace VoxelLandCacheDetail;
     Out = FVoxelLandCacheTextures();
     const int32 Rows = (TilesFor(InLevels) + VOXEL_LAND_CACHE_COLUMNS - 1) / VOXEL_LAND_CACHE_COLUMNS;
@@ -179,12 +183,12 @@ bool FVoxelLandCache::MakeTextures(int32 InLevels, UObject* Outer, FVoxelLandCac
 FVoxelLandCache::FVoxelLandCache() = default;
 FVoxelLandCache::~FVoxelLandCache() = default;
 
-bool FVoxelLandCache::Initialize(const FVoxelDensityCPU& Density, const FVoxelLandCacheTextures& InTextures)
+bool FVoxelLandCache::Initialize(const FVoxelTerrestrialDensity& Density, const FVoxelLandCacheTextures& InTextures)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelLandCache::Initialize);
     Reset();
-    TSharedRef<FVoxelDensityGPUData, ESPMode::ThreadSafe> Data = MakeShared<FVoxelDensityGPUData, ESPMode::ThreadSafe>();
-    Density.BuildGPUData(*Data);
-    if (Data->LandMode == 0 || !Data->Land.IsValid() || !InTextures.IsValid()) return false;
+    const TSharedRef<const FVoxelDensityGPUData, ESPMode::ThreadSafe> Data = Density.GetGPUData();
+    if (!Data->Land.IsValid() || !InTextures.IsValid()) return false;
     SeaRadius = Data->Land->SeaRadius;
     const int32 Count = LevelsFor(SeaRadius);
     const int32 Capacity = (InTextures.Height->SizeY / VOXEL_LAND_CACHE_N) * VOXEL_LAND_CACHE_COLUMNS;
@@ -195,6 +199,7 @@ bool FVoxelLandCache::Initialize(const FVoxelDensityCPU& Density, const FVoxelLa
     Plan->Init(Count, SeaRadius);
     Generation = 0;
     FailedGeneration = MakeShared<std::atomic<uint32>, ESPMode::ThreadSafe>(0u);
+    UploadZeroed = MakeShared<std::atomic<bool>, ESPMode::ThreadSafe>(false);
     // The state the material reads from the first frame (the texture starts undefined): no
     // level valid yet. Render commands run in order, so every frame drawn after this reads it.
     if (!Dispatch(nullptr, 0))
@@ -221,6 +226,9 @@ void FVoxelLandCache::Reset()
     Unsettled.Reset();
     Generation = 0;
     FailedGeneration.Reset();
+    UploadZeroed.Reset();
+    StateUploaded.Reset();
+    StateUploadedGeneration = MAX_uint32;
 }
 
 bool FVoxelLandCache::IsLive() const
@@ -308,6 +316,7 @@ bool FVoxelLandCache::IsWritable() const
 
 void FVoxelLandCache::Tick(const FVector& CameraPlanet)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelLandCache::Tick);
     if (!IsInitialized() || !Plan.IsValid() || CameraPlanet.IsNearlyZero() || !FMath::IsFinite(CameraPlanet.SizeSquared())) return;
     // Once a frame (the actor's material update can run twice in one).
     if (LastTickFrame == GFrameCounter) return;
@@ -381,6 +390,7 @@ void FVoxelLandCache::Tick(const FVector& CameraPlanet)
 
 bool FVoxelLandCache::Dispatch(const VoxelLandCachePlan::FJob* InJobs, int32 NumJobs)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelLandCache::Dispatch);
     using namespace VoxelLandCacheDetail;
     using FJob = VoxelLandCachePlan::FJob;
     if (!Plan.IsValid()) return false;
@@ -422,6 +432,14 @@ bool FVoxelLandCache::Dispatch(const VoxelLandCachePlan::FJob* InJobs, int32 Num
     TArray<FJob> Jobs;
     if (InJobs && NumJobs > 0)
         Jobs.Append(InJobs, NumJobs);
+    // Nothing to write and the state last uploaded the same (the camera still, every level
+    // written): no render command, no state upload (R1, MAT-1). Not when the render thread
+    // zeroed the levels of the last upload (its shader or textures not there that frame): the
+    // texture then says "no level valid" and must be written again; and a failed frame's
+    // generation changes the state (its levels invalidated), so that goes out too.
+    if (Jobs.Num() == 0 && Generation == StateUploadedGeneration && State == StateUploaded
+        && UploadZeroed.IsValid() && !UploadZeroed->load(std::memory_order_acquire))
+        return true;
     for (const FJob& Job : Jobs)
         TexelsWritten += (uint64)Job.Width * (uint64)Job.Height;
 
@@ -430,11 +448,14 @@ bool FVoxelLandCache::Dispatch(const VoxelLandCachePlan::FJob* InJobs, int32 Num
     FTextureRenderTargetResource* FieldsResource = Textures.Fields->GameThread_GetRenderTargetResource();
     FTextureResource* StateResource = Textures.State->GetResource();
     if (!HeightResource || !SlopeResource || !FieldsResource || !StateResource) return false;
+    StateUploaded = State;
+    StateUploadedGeneration = Generation;
 
     ENQUEUE_RENDER_COMMAND(VoxelLandCacheWrite)(
-        [Data = GPUData, EditData = Edits, Jobs = MoveTemp(Jobs), Frames = MoveTemp(Frames), State = MoveTemp(State), Sea = SeaRadius, Failed = FailedGeneration,
+        [Data = GPUData, EditData = Edits, Jobs = MoveTemp(Jobs), Frames = MoveTemp(Frames), State = MoveTemp(State), Sea = SeaRadius, Failed = FailedGeneration, Zeroed = UploadZeroed,
          Gen = Generation, HeightResource, SlopeResource, FieldsResource, StateResource](FRHICommandListImmediate& RHICmdList) mutable
         {
+            TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelLandCacheWrite");
             FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
             const bool bCanRun = Data.IsValid() && ShaderMap && ShaderMap->GetShader(&FVoxelLandCacheWriteCS::GetStaticType(), 0).IsValid()
                 && HeightResource->GetRenderTargetTexture() && SlopeResource->GetRenderTargetTexture() && FieldsResource->GetRenderTargetTexture();
@@ -444,14 +465,20 @@ bool FVoxelLandCache::Dispatch(const VoxelLandCachePlan::FJob* InJobs, int32 Num
                 Failed->store(Gen + 1);
             // No level is read while what this state claims may not be written: this frame's
             // writes didn't run, or it was planned before the game thread saw an earlier failure.
-            if (!bCanRun || (Failed.IsValid() && Gen < Failed->load()))
+            const bool bZeroed = !bCanRun || (Failed.IsValid() && Gen < Failed->load());
+            if (bZeroed)
             {
                 for (int32 k = 0; k < VOXEL_LAND_CACHE_MAX_LEVELS; k++)
                     State[VOXEL_LAND_CACHE_STATE_WIDTH * (1 + k)].W = 0.0f;
             }
+            if (Zeroed.IsValid())
+                Zeroed->store(bZeroed, std::memory_order_release);
             if (Jobs.Num() > 0 && bCanRun)
             {
                 FRDGBuilder GraphBuilder(RHICmdList);
+                {
+                    // (Closed before Execute: RDG asserts on an event scope left open.)
+                    RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelLandCacheWrite, "VoxelLandCache write");
                 FRDGTextureRef Height = GraphBuilder.RegisterExternalTexture(CreateRenderTarget(HeightResource->GetRenderTargetTexture(), TEXT("Voxel.LandCacheHeight")));
                 FRDGTextureRef Slope = GraphBuilder.RegisterExternalTexture(CreateRenderTarget(SlopeResource->GetRenderTargetTexture(), TEXT("Voxel.LandCacheSlope")));
                 FRDGTextureRef Fields = GraphBuilder.RegisterExternalTexture(CreateRenderTarget(FieldsResource->GetRenderTargetTexture(), TEXT("Voxel.LandCacheFields")));
@@ -525,6 +552,7 @@ bool FVoxelLandCache::Dispatch(const VoxelLandCachePlan::FJob* InJobs, int32 Num
                 GraphBuilder.SetTextureAccessFinal(Height, ERHIAccess::SRVMask);
                 GraphBuilder.SetTextureAccessFinal(Slope, ERHIAccess::SRVMask);
                 GraphBuilder.SetTextureAccessFinal(Fields, ERHIAccess::SRVMask);
+                }
                 GraphBuilder.Execute();
             }
             if (StateResource->TextureRHI.IsValid())

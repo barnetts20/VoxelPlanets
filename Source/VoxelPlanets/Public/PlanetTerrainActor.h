@@ -12,6 +12,7 @@
 #include "VoxelLandCache.h"
 #include "PlanetTerrainActor.generated.h"
 
+class FVoxelTerrestrialDensity;
 class UMaterialInstanceDynamic;
 class UTexture2DDynamic;
 class UTextureRenderTarget2D;
@@ -108,8 +109,8 @@ protected:
     TObjectPtr<UMaterialInterface> LandMaterialParent;
 
     TWeakPtr<const FVoxelLandBake, ESPMode::ThreadSafe> LandTexturesBake;   // the height and field textures'
-    TWeakPtr<const FVoxelDensityCPU> LandTexturesDensity;                   // the constants'
-    TWeakPtr<const FVoxelDensityCPU> LandTexturesFailed;                    // the textures couldn't be made for it
+    TWeakPtr<const FVoxelTerrestrialDensity> LandTexturesDensity;           // the constants'
+    TWeakPtr<const FVoxelTerrestrialDensity> LandTexturesFailed;            // the textures couldn't be made for it
     /** The instance's land node is bound to the textures. */
     bool bLandMaterialBound = false;
     FDelegateHandle LandMaterialTickHandle;
@@ -137,13 +138,13 @@ protected:
     TObjectPtr<UTexture2DDynamic> LandCacheState;
 
     TUniquePtr<FVoxelLandCache> LandCache;
-    TWeakPtr<const FVoxelDensityCPU> LandCacheDensity;   // the density the cache was made for
-    TWeakPtr<const FVoxelDensityCPU> LandCacheFailed;    // the cache couldn't be made for it
+    TWeakPtr<const FVoxelTerrestrialDensity> LandCacheDensity;   // the density the cache was made for
+    TWeakPtr<const FVoxelTerrestrialDensity> LandCacheFailed;    // the cache couldn't be made for it
     double LandCacheUnwritableSince = -1.0;              // when the made cache was first found unwritable (-1: it is writable)
     bool bLandCacheUnwritableLogged = false;             // the warning given for that cache
 
     /** Makes the cache for Density (or keeps it), and binds it; false when it can't be made. */
-    bool ResolveLandCache(const TSharedPtr<const FVoxelDensityCPU>& Density);
+    bool ResolveLandCache(const TSharedPtr<const FVoxelTerrestrialDensity>& Density);
     void ReleaseLandCache();
     /** The camera the land surface cache follows, in the planet's frame (cm, no scale). */
     bool GetLandCacheCamera(const FTransform& PlanetFrame, FVector& OutCameraPlanet) const;

@@ -1,4 +1,5 @@
 #include "VoxelOceanCoastField.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelOceanShoreField.h"
 #include "VoxelLandBake.h"
 #include "VoxelPlanets.h"
@@ -9,6 +10,8 @@
 #include "RenderGraphUtils.h"
 #include "RenderingThread.h"
 #include "TextureResource.h"
+
+DECLARE_GPU_STAT(VoxelOceanCoastWrite);   // P1a: its own row in stat gpu
 
 namespace VoxelOceanCoastFieldDetail
 {
@@ -83,6 +86,7 @@ FVoxelOceanShore FVoxelOceanCoastField::Sample(const FVector& PlanetPoint) const
 
 bool FVoxelOceanCoastField::WriteInto(UTexture2DArray* Texture, const TSharedPtr<const FVoxelOceanCoastField, ESPMode::ThreadSafe>& Made, const FVoxelOceanCoastField* Last)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanCoastField::WriteInto);
     check(IsInGameThread());
     if (!Texture || !Made.IsValid() || !Made->IsValid()) return false;
     FTextureResource* Resource = Texture->GetResource();
@@ -113,6 +117,7 @@ bool FVoxelOceanCoastField::WriteInto(UTexture2DArray* Texture, const TSharedPtr
         Rects.Add({ VOXEL_OCEAN_COAST_ATLAS_SLICE + s, 0, 0, Side, Side });
     ENQUEUE_RENDER_COMMAND(VoxelOceanCoastWrite)([Resource, Made, Rects = MoveTemp(Rects), Side](FRHICommandListImmediate& RHICmdList)
         {
+            TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelOceanCoastWrite");
             FRHITexture* Dest = Resource->TextureRHI;
             if (!Dest) return;
             // Each rectangle into a staging texture of its own, then copied into its slice.
@@ -129,6 +134,9 @@ bool FVoxelOceanCoastField::WriteInto(UTexture2DArray* Texture, const TSharedPtr
                 Staging.Add(Tex);
             }
             FRDGBuilder GraphBuilder(RHICmdList);
+            {
+                // (Closed before Execute: RDG asserts on an event scope left open.)
+                RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelOceanCoastWrite, "VoxelOceanCoast write");
             FRDGTextureRef DestRDG = RegisterExternalTexture(GraphBuilder, Dest, TEXT("Voxel.OceanShore"));
             for (int32 i = 0; i < Rects.Num(); i++)
             {
@@ -143,6 +151,7 @@ bool FVoxelOceanCoastField::WriteInto(UTexture2DArray* Texture, const TSharedPtr
                 AddCopyTexturePass(GraphBuilder, Source, DestRDG, Copy);
             }
             GraphBuilder.SetTextureAccessFinal(DestRDG, ERHIAccess::SRVMask);
+            }
             GraphBuilder.Execute();
         });
     return true;
@@ -180,6 +189,7 @@ void FVoxelOceanCoastBuilder::Start(const TSharedPtr<const FVoxelOceanShoreField
     const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& InBake, const VoxelOceanCoastCore::FSettings& InSettings, const FVector3d& CentreDir,
     const TSharedPtr<const FVoxelOceanCoastField, ESPMode::ThreadSafe>& InPrevious)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanCoastBuilder::Start);
     Reset();
     Shore = InShore;
     Bake = InBake;
@@ -233,6 +243,7 @@ void FVoxelOceanCoastBuilder::Start(const TSharedPtr<const FVoxelOceanShoreField
 
 void FVoxelOceanCoastBuilder::Tick(const FSampler& Sampler)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanCoastBuilder::Tick);
     if (Phase == EPhase::Planning)
     {
         if (!Planned.IsReady()) return;

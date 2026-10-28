@@ -2,7 +2,8 @@
 
 #include "AtmosphereGenerator.h"
 
-namespace
+// (A per-file namespace: unity builds merge .cpp files.)
+namespace VoxelOceanProfileDetail
 {
     FAtmosphereDraw MakeDraw(const TCHAR* Path, EAtmosphereDrawDistribution Distribution, float Min, float Max)
     {
@@ -14,6 +15,7 @@ namespace
         return Entry;
     }
 }
+using namespace VoxelOceanProfileDetail;
 
 void UVoxelOceanProfile::AddStarterDraws()
 {

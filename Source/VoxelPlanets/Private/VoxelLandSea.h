@@ -287,4 +287,92 @@ namespace VoxelLandSea
         }
         return Stats;
     }
+
+    /** The lakes some cells belong to, whole (R1, BAKE-2: by connectivity, not by their level:
+     *  two lakes can share a level). Water: the bake's lake levels (6 faces of (N + 2 Pad)^2 cells,
+     *  below -1e30 where there is no lake); Seeds: padded cell indices with a lake. Marks (in
+     *  OutMarked, one byte a padded cell) every cell 4-connected (across the faces' edges) to a
+     *  seed through cells at the seed's level, the apron cells with their interior cells. */
+    inline void FloodLakes(int N, int Pad, const float* Water, const std::vector<int>& Seeds, std::vector<unsigned char>& OutMarked)
+    {
+        const int S = N + 2 * Pad;
+        const int Cells = 6 * S * S;
+        OutMarked.assign(size_t(Cells), 0);
+        if (N <= 0 || !Water || Seeds.empty()) return;
+        auto Padded = [S, Pad](int F, int I, int J) { return (F * S + J + Pad) * S + I + Pad; };
+        auto Interior = [N](int F, int I, int J) { return (F * N + J) * N + I; };
+        std::vector<int> Across(size_t(24) * N);
+        for (int F = 0; F < 6; F++)
+        {
+            for (int K = 0; K < N; K++)
+            {
+                const int Apron[4][2] = { { N, K }, { -1, K }, { K, N }, { K, -1 } };
+                for (int E = 0; E < 4; E++)
+                {
+                    int F2 = 0, I2 = 0, J2 = 0;
+                    Detail::CellOf(F, Apron[E][0], Apron[E][1], N, F2, I2, J2);
+                    Across[size_t(F * 4 + E) * N + K] = Interior(F2, I2, J2);
+                }
+            }
+        }
+        // Over the interior cells; a seed in an apron is its interior cell's.
+        std::vector<unsigned char> Inner(size_t(6) * N * N, 0);
+        std::vector<int> Queue;
+        Queue.reserve(1 << 12);
+        for (const int Seed : Seeds)
+        {
+            int F = Seed / (S * S), J = (Seed / S) % S - Pad, I = Seed % S - Pad;
+            if (I < 0 || I >= N || J < 0 || J >= N)
+            {
+                int F2 = 0, I2 = 0, J2 = 0;
+                Detail::CellOf(F, I, J, N, F2, I2, J2);
+                F = F2; I = I2; J = J2;
+            }
+            const int Start = Interior(F, I, J);
+            const float Level = Water[Padded(F, I, J)];
+            if (Inner[size_t(Start)] || Level < -1.0e30f) continue;
+            Inner[size_t(Start)] = 1;
+            Queue.clear();
+            Queue.push_back(Start);
+            for (size_t Head = 0; Head < Queue.size(); Head++)
+            {
+                const int Cell = Queue[Head];
+                const int CF = Cell / (N * N), CJ = (Cell / N) % N, CI = Cell % N;
+                const int Next[4] = {
+                    CI + 1 < N ? Cell + 1 : Across[size_t(CF * 4 + 0) * N + CJ],
+                    CI > 0 ? Cell - 1 : Across[size_t(CF * 4 + 1) * N + CJ],
+                    CJ + 1 < N ? Cell + N : Across[size_t(CF * 4 + 2) * N + CI],
+                    CJ > 0 ? Cell - N : Across[size_t(CF * 4 + 3) * N + CI] };
+                for (int E = 0; E < 4; E++)
+                {
+                    const int Other = Next[E];
+                    if (Inner[size_t(Other)]) continue;
+                    const int OF = Other / (N * N), OJ = (Other / N) % N, OI = Other % N;
+                    if (Water[Padded(OF, OI, OJ)] != Level) continue;
+                    Inner[size_t(Other)] = 1;
+                    Queue.push_back(Other);
+                }
+            }
+        }
+        // Every padded cell: its own mark, or its interior cell's for an apron cell.
+        for (int F = 0; F < 6; F++)
+        {
+            for (int J = -Pad; J < N + Pad; J++)
+            {
+                for (int I = -Pad; I < N + Pad; I++)
+                {
+                    unsigned char M = 0;
+                    if (I >= 0 && I < N && J >= 0 && J < N)
+                        M = Inner[size_t(Interior(F, I, J))];
+                    else
+                    {
+                        int F2 = 0, I2 = 0, J2 = 0;
+                        Detail::CellOf(F, I, J, N, F2, I2, J2);
+                        M = Inner[size_t(Interior(F2, I2, J2))];
+                    }
+                    OutMarked[size_t(Padded(F, I, J))] = M;
+                }
+            }
+        }
+    }
 }

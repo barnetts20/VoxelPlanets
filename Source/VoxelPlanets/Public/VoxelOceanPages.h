@@ -52,7 +52,7 @@ namespace VoxelOceanDepthProbe { struct FLevels; }
 /** What the page writes sample the terrain depth from. */
 struct FVoxelOceanDensityInputs
 {
-    /** The planet density without edits (FVoxelDensityCPU::BuildGPUData). Null: no terrain,
+    /** The planet density without edits (FVoxelPlanetDensity::GetGPUData). Null: no terrain,
      *  every vertex deep water. */
     TSharedPtr<const FVoxelDensityGPUData> Density;
     /** The edit tree as the terrain meshes with it. Null: no edits. */
@@ -238,8 +238,9 @@ public:
      *  surface's: once the terrain's edit data, and the land surface cache, hold it): the static
      *  layer writes it again. */
     void NotifyClipEdit(const FVector& Center, double Reach);
-    /** Game thread. The static layer and the waves written again everywhere (the edits replaced). */
-    void InvalidateClip();
+    /** Game thread. The static layer and the waves written again everywhere (the edits replaced);
+     *  bAndFarSphere: the far sphere's land sampled again too (a new density version). */
+    void InvalidateClip(bool bAndFarSphere = false);
     /** The clipmap's last second (the surface's log): levels, static texels written, re-anchors. */
     FString TakeClipPerf();
 

@@ -1,5 +1,6 @@
 #include "VoxelLandMaterial.h"
-#include "VoxelDensity.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "VoxelTerrestrialDensity.h"
 #include "VoxelDensityGPU.h"
 #include "VoxelLandBake.h"
 #include "VoxelNoiseTiles.h"
@@ -129,6 +130,7 @@ namespace VoxelLandMaterialDetail
         if (!Resource) return;
         ENQUEUE_RENDER_COMMAND(VoxelLandMaterialUpload)([Resource, Owner = MoveTemp(Owner), GetData, Width, Height, BytesPerTexel](FRHICommandListImmediate& RHICmdList)
             {
+                TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelLandMaterialUpload");
                 if (!Resource->TextureRHI.IsValid()) return;
                 const FUpdateTextureRegion2D Region(0, 0, 0, 0, (uint32)Width, (uint32)Height);
                 RHICmdList.UpdateTexture2D(Resource->TextureRHI, 0, Region, (uint32)(Width * BytesPerTexel), (const uint8*)GetData(Owner));
@@ -187,6 +189,7 @@ namespace VoxelLandMaterialDetail
 
 void VoxelLandMaterial::BuildFieldTexels(const FVoxelLandBake& Bake, TArray<FFloat16Color>& Out)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandMaterial::BuildFieldTexels);
     const int32 NumCells = Bake.NumCells();
     // The fields: drainage, the lake's level above the cell's own height (small, so the half
     // keeps it to centimetres in shallow lakes where an absolute level would round to metres),
@@ -220,6 +223,7 @@ void VoxelLandMaterial::BuildFieldTexels(const FVoxelLandBake& Bake, TArray<FFlo
 
 void VoxelLandMaterial::BuildHeightTexels(const FVoxelLandBake& Bake, TArray<FVector2f>& Out)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandMaterial::BuildHeightTexels);
     const int32 NumCells = Bake.NumCells();
     const bool bForm = Bake.Form.Num() == NumCells && Bake.Relief.Num() == NumCells;
     Out.SetNumUninitialized(NumCells);
@@ -234,6 +238,7 @@ void VoxelLandMaterial::BuildHeightTexels(const FVoxelLandBake& Bake, TArray<FVe
 
 void VoxelLandMaterial::BuildConstantTexels(const FVoxelDensityGPUData& Density, const FVoxelLandBake& Bake, TArray<FVector4f>& Out, int32& OutRows)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandMaterial::BuildConstantTexels);
     using namespace VoxelLandMaterialDetail;
     const int32 NumCells = Bake.NumCells();
     const bool bFlow = Bake.Flow.Num() == NumCells;
@@ -480,6 +485,7 @@ bool VoxelLandMaterial::HasLandNode(const UMaterialInterface* Material)
 bool VoxelLandMaterial::MakeBakeTextures(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& Bake,
     UTexture2DDynamic*& OutHeight, UTexture2DDynamic*& OutFields)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandMaterial::MakeBakeTextures);
     using namespace VoxelLandMaterialDetail;
     OutHeight = nullptr;
     OutFields = nullptr;
@@ -514,16 +520,16 @@ bool VoxelLandMaterial::MakeBakeTextures(const TSharedPtr<const FVoxelLandBake, 
     return true;
 }
 
-UTexture2DDynamic* VoxelLandMaterial::MakeConstantTexture(const FVoxelDensityCPU& Density)
+UTexture2DDynamic* VoxelLandMaterial::MakeConstantTexture(const FVoxelTerrestrialDensity& Density)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandMaterial::MakeConstantTexture);
     using namespace VoxelLandMaterialDetail;
-    FVoxelDensityGPUData Data;
-    Density.BuildGPUData(Data);
-    const FVoxelLandBake* Bake = Data.LandMode != 0 ? Data.Land.Get() : nullptr;
+    const TSharedRef<const FVoxelDensityGPUData> Data = Density.GetGPUData();
+    const FVoxelLandBake* Bake = Data->Land.Get();
     if (!Bake || Bake->TanTable.Num() != Bake->Side()) return nullptr;
     TArray<FVector4f> Texels;
     int32 Rows = 0;
-    BuildConstantTexels(Data, *Bake, Texels, Rows);
+    BuildConstantTexels(*Data, *Bake, Texels, Rows);
     UTexture2DDynamic* Constants = Make(VOXEL_LAND_MATERIAL_CONST_WIDTH, Rows, PF_A32B32G32R32F);
     if (!Constants)
     {
@@ -535,8 +541,9 @@ UTexture2DDynamic* VoxelLandMaterial::MakeConstantTexture(const FVoxelDensityCPU
     return Constants;
 }
 
-UTexture2DDynamic* VoxelLandMaterial::MakeNoiseTexture(const FVoxelDensityCPU& Density)
+UTexture2DDynamic* VoxelLandMaterial::MakeNoiseTexture(const FVoxelTerrestrialDensity& Density)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandMaterial::MakeNoiseTexture);
     using namespace VoxelLandMaterialDetail;
     const TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Noise = Density.GetLandNoise();
     const bool bSet = NoiseFits(Noise.Get());
@@ -591,6 +598,7 @@ UTexture2DDynamic* VoxelLandMaterial::MakeClimateTexture()
 
 void VoxelLandMaterial::UploadClimateTexture(UTexture2DDynamic* Texture, const TArray<FVector4f>& Cells)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLandMaterial::UploadClimateTexture);
     using namespace VoxelLandMaterialDetail;
     constexpr int32 W = VOXEL_LAND_CLIMATE_WIDTH;
     constexpr int32 H = VOXEL_LAND_CLIMATE_HEIGHT;

@@ -6,16 +6,16 @@
 //   - Planet (inner): display only, unit radius scaled by actor transform.
 //     Effective radius = GetActorScale3D().GetMax(). Marks the boundary
 //     at which gravity reaches full strength.
-//   - Sphere (outer): overlap events, sized explicitly to
-//     GetActorScale3D().GetMax() * InfluenceRatio. Uses absolute scale
-//     so it is not affected by the actor transform.
+//   - Sphere (outer): overlap events, a local radius of InfluenceRatio
+//     under the actor's scale, so its world radius is
+//     GetActorScale3D().GetMax() * InfluenceRatio.
 //
 // GetGravityVector:
 //   InnerRadius = GetActorScale3D().GetMax()
 //   Direction   = Normalize(ActorLocation - WorldPosition)
 //   Magnitude   = BaseVector.Size()
 //   If distance <= InnerRadius: full strength (Direction * Magnitude)
-//   If distance >  InnerRadius: Direction * Magnitude * Pow(Distance/InnerRadius, Falloff)
+//   If distance >  InnerRadius: Direction * Magnitude * Pow(InnerRadius/Distance, Falloff)
 //
 // Inherits Priority, ExcludeTags, and BaseVector from AGravityZone.
 

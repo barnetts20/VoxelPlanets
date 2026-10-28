@@ -1,4 +1,5 @@
 #include "VoxelOceanFoamTexture.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelNoiseTiles.h"
 #include "VoxelOceanFoamTable.h"
 #include "VoxelLandBake.h"
@@ -44,6 +45,7 @@ namespace VoxelOceanFoamTextureDetail
         TSharedPtr<std::vector<uint16_t>, ESPMode::ThreadSafe> Texels = MakeShared<std::vector<uint16_t>, ESPMode::ThreadSafe>(MoveTemp(Set.Texels));
         ENQUEUE_RENDER_COMMAND(VoxelOceanFoamUpload)([Out, Texels, Table, N, Mips](FRHICommandListImmediate& RHICmdList)
             {
+                TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelOceanFoamUpload");
                 const FRHITextureCreateDesc SetDesc = FRHITextureCreateDesc::Create2D(TEXT("VoxelOceanFoamSet"), (int32)N, (int32)N, PF_R16G16B16A16_UNORM)
                     .SetNumMips((uint8)Mips)
                     .SetFlags(ETextureCreateFlags::ShaderResource)
@@ -70,6 +72,7 @@ namespace VoxelOceanFoamTextureDetail
 
 TSharedPtr<FVoxelOceanFoamTexture, ESPMode::ThreadSafe> VoxelOceanFoamTexture::Load(const FString& Name, FString& OutError)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelOceanFoamTexture::Load);
     const FString Folder = VoxelLand::NoiseSetDirectory();
     if (Folder.IsEmpty())
     {

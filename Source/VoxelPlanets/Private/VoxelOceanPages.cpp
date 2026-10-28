@@ -1,4 +1,5 @@
 #include "VoxelOceanPages.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelOceanGPUTime.h"
 #include "VoxelPlanets.h"
 #include "VoxelGPUCommon.h"
@@ -932,6 +933,7 @@ private:
 
 void FVoxelOceanPageProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, const FRealtimeMeshComputeContext& Context)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanPageProvider::BuildComputePasses);
     SCOPE_CYCLE_COUNTER(STAT_VoxelOceanProvider);
     const uint64 StartCycles = FPlatformTime::Cycles64();
     ON_SCOPE_EXIT
@@ -1263,6 +1265,7 @@ private:
 
 void FVoxelOceanRingProvider::BuildComputePasses(FRDGBuilder& GraphBuilder, const FRealtimeMeshComputeContext& Context)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanRingProvider::BuildComputePasses);
     FRDGBufferUAVRef Positions = Context.GetStreamUAV(FRealtimeMeshStreams::Position, PF_R32_FLOAT);
     FRDGBufferUAVRef Tangents = Context.GetStreamUAV(FRealtimeMeshStreams::Tangents, PF_R32_UINT);
     FRDGBufferUAVRef TexCoords = Context.GetStreamUAV(FRealtimeMeshStreams::TexCoords, PF_R32_UINT);
@@ -1366,6 +1369,7 @@ bool FVoxelOceanRingProvider::Write(FRDGBuilder& GraphBuilder, FRDGBufferUAVRef 
 
 bool FVoxelOceanRingProvider::PrepareDraw_RenderThread(FRDGBuilder& GraphBuilder, FVoxelOceanRingDrawFrame& Out)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanRingProvider::PrepareDraw_RenderThread);
     check(IsInRenderingThread());
     const FVoxelOceanDisplaceState& D = *Displace;
     // Nothing until the frame's numbers have come (UpdateRings), and only with triangles to draw.
@@ -1520,6 +1524,7 @@ void FVoxelOceanPages::SetDisplaceFrame(const FVoxelOceanDisplaceFrame& InFrame)
 
 void FVoxelOceanPages::ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, double InRadius)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanPages::ProbeDepth);
     check(IsInGameThread());
     if (!FApp::CanEverRender()) return;
     TArray<int32> Lattice;
@@ -1532,6 +1537,7 @@ void FVoxelOceanPages::ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, d
         Shore = DensityInputs.Shore, Margin = DensityInputs.ShoreMarginCm, DepthFootprintCm = DensityInputs.DepthFootprintCm, InRadius, Lattice = MoveTemp(Lattice),
         Footprint, Levels, LandCache = DensityInputs.LandCache](FRHICommandListImmediate& RHICmdList)
         {
+            TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelOceanProbeDepth");
             FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
             if (!ShaderMap || !ShaderMap->GetShader(&FVoxelOceanProbeCS::GetStaticType(), 0).IsValid())
             {
@@ -1566,6 +1572,7 @@ void FVoxelOceanPages::ProbeDepth(const VoxelOceanDepthProbe::FLevels& Levels, d
 
 bool FVoxelOceanPages::SampleCoastDepths(const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count, double InRadius)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanPages::SampleCoastDepths);
     check(IsInGameThread());
     if (!FApp::CanEverRender() || !Job.IsValid() || Count <= 0 || First < 0 || First + Count > Job->Cells) return false;
     // The terrain's density must be there (the stand-in has no terrain: every point deep water),
@@ -1581,6 +1588,7 @@ bool FVoxelOceanPages::SampleCoastDepths(const TSharedPtr<FVoxelOceanCoastDepthJ
     ENQUEUE_RENDER_COMMAND(VoxelOceanCoastDepths)([Job, Cache = InputCache, Density, Edits, HalfFinest, Shore = DensityInputs.Shore,
         Margin = DensityInputs.ShoreMarginCm, DepthFootprintCm = DensityInputs.DepthFootprintCm, InRadius, First, Count](FRHICommandListImmediate& RHICmdList)
         {
+            TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelOceanCoastDepths");
             FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
             if (!ShaderMap || !ShaderMap->GetShader(&FVoxelOceanCoastDepthCS::GetStaticType(), 0).IsValid())
             {
@@ -1752,6 +1760,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
     double OceanTime, double FoamDecayPerSecond, double FoamGrowthPerSecond, bool bWavesStepped, int32 FoamDetailLevels,
     double SurfFoamDecayPerSecond, double FoamBreakup, double FoamCutCm, bool bFineFromClip)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanPages::UpdateClipmap);
     // (Aliased: UE has a global FFrame.)
     using namespace VoxelOceanClipmap;
     using FClipFrame = VoxelOceanClipmap::FFrame;
@@ -2070,6 +2079,7 @@ void FVoxelOceanPages::UpdateClipmap(const FVector& CameraPlanet, const FVoxelOc
         Shore = DensityInputs.Shore, Margin = DensityInputs.ShoreMarginCm, DepthFootprintCm = DensityInputs.DepthFootprintCm, LandCache = DensityInputs.LandCache,
         DispResource, NormalResource, WhitecapResource, InfoResource, Foam](FRHICommandListImmediate& RHICmdList)
         {
+            TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelOceanClipmap");
             FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
             auto Has = [ShaderMap](FShaderType& Type) { return ShaderMap && ShaderMap->GetShader(&Type, 0).IsValid(); };
             FRHITexture* DispRHI = DispResource->TextureRHI;
@@ -2490,9 +2500,12 @@ void FVoxelOceanPages::NotifyClipEdit(const FVector& Center, double Reach)
     ClipPlan->Edits.Add({ Center, Reach });
 }
 
-void FVoxelOceanPages::InvalidateClip()
+void FVoxelOceanPages::InvalidateClip(bool bAndFarSphere)
 {
     check(IsInGameThread());
+    // The far sphere's land is sampled again on the next version (AdvanceRings).
+    if (bAndFarSphere)
+        DensityVersion++;
     if (!ClipPlan.IsValid()) return;
     for (FVoxelOceanClipPlan::FSlot& Slot : ClipPlan->Slots) Slot = FVoxelOceanClipPlan::FSlot();
     ClipPlan->Edits.Reset();
@@ -2538,6 +2551,7 @@ TSharedPtr<IVoxelOceanRingDraw, ESPMode::ThreadSafe> FVoxelOceanPages::GetRingDr
 
 void FVoxelOceanPages::SetRings(bool bOn)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanPages::SetRings);
     check(IsInGameThread());
     if (!bOn || !CanDrawRings())
     {
@@ -2737,6 +2751,7 @@ FVector FVoxelOceanPages::AdvanceRings(const FVector& CameraPlanet)
 
 void FVoxelOceanPages::UpdateRings(const FVector& CameraPlanet, const FVector4f& Cull)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanPages::UpdateRings);
     check(IsInGameThread());
     if (!Rings.IsValid()) return;
     const FVector CamToOrigin = AdvanceRings(CameraPlanet);
@@ -2796,6 +2811,7 @@ bool FVoxelOceanLandCacheRHI::IsFor(const FVoxelLandCacheTextures& Textures, dou
 void FVoxelOceanPages::Initialize(AActor* InOwner, USceneComponent* InAttachRoot, UMaterialInterface* InMaterial, double InRadius, int32 InTileQuads,
     double InMorphEnd0, bool bInFlipWinding)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanPages::Initialize);
     Reset();
     DestroyRings();
     Owner = InOwner;
@@ -3091,6 +3107,7 @@ int32 FVoxelOceanPages::DrawSlotsOf(const FPage& Page)
 
 void FVoxelOceanPages::Commit(TConstArrayView<FTileWrite> Writes, TConstArrayView<FVoxelOceanTileKey> Clears)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanPages::Commit);
     SCOPE_CYCLE_COUNTER(STAT_VoxelOceanCommit);
     struct FPageWork
     {
@@ -3250,6 +3267,7 @@ void FVoxelOceanPages::CollectCounters(const FInstance& Instance)
 
 void FVoxelOceanPages::Flush(int32 SpareTarget)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanPages::Flush);
     SCOPE_CYCLE_COUNTER(STAT_VoxelOceanFlush);
     Perf.Frames++;
     BeginCreates();

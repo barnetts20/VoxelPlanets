@@ -16,7 +16,7 @@
 #include "CoreMinimal.h"
 #include <atomic>
 
-class FVoxelDensityCPU;
+class FVoxelTerrestrialDensity;
 struct FVoxelDensityGPUData;
 struct FVoxelEditGPUData;
 class UMaterialInstanceDynamic;
@@ -63,8 +63,8 @@ public:
     FVoxelLandCache& operator=(const FVoxelLandCache&) = delete;
 
     /** Game thread. Starts the cache for a terrestrial density's land (empty: every level is
-     *  written as the camera is first seen). False for the noise surface. */
-    bool Initialize(const FVoxelDensityCPU& Density, const FVoxelLandCacheTextures& InTextures);
+     *  written as the camera is first seen). False when the textures can't hold its levels. */
+    bool Initialize(const FVoxelTerrestrialDensity& Density, const FVoxelLandCacheTextures& InTextures);
     void Reset();
     /** Initialized: the state the material reads is uploaded (no level valid until written). */
     bool IsInitialized() const { return GPUData.IsValid(); }
@@ -131,6 +131,10 @@ private:
     FVoxelLandCacheTextures Textures;
     uint64 TexelsWritten = 0;
     uint64 LastTickFrame = MAX_uint64;
+    /** The state last uploaded (Dispatch), and the generation then: an unchanged one with no job
+     *  isn't uploaded again. */
+    TArray<FVector4f> StateUploaded;
+    uint32 StateUploadedGeneration = MAX_uint32;
     /** The last frame whose writes were enqueued (IsLive), and GetSettledEditSequence's. */
     uint64 LastLiveFrame = 0;
     uint32 SettledEditSequence = 0;
@@ -142,4 +146,7 @@ private:
      *  state uploaded shows no level valid (frames planned before it noticed). */
     uint32 Generation = 0;
     TSharedPtr<std::atomic<uint32>, ESPMode::ThreadSafe> FailedGeneration;
+    /** Whether the last upload's levels were zeroed by the render thread (the writes couldn't
+     *  run): the state is uploaded again then, even unchanged (MAT-1's skip). */
+    TSharedPtr<std::atomic<bool>, ESPMode::ThreadSafe> UploadZeroed;
 };

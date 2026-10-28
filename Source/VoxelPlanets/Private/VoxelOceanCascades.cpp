@@ -1,4 +1,5 @@
 #include "VoxelOceanCascades.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelOceanGPUTime.h"
 #include "VoxelGPUCommon.h"
 #include "VoxelPlanets.h"
@@ -257,6 +258,7 @@ namespace VoxelOceanCascadesDetail
 
 bool VoxelOceanCascades::MakeTextures(const UObject* Owner, const VoxelOceanCharts::FTable& Charts, FVoxelOceanCascadeTextures& InOut)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(VoxelOceanCascades::MakeTextures);
     // The arrays don't depend on the planet: kept when given; the chart table always new.
     FVoxelOceanCascadeTextures Made = InOut;
     if (!Made.Displacement)
@@ -338,6 +340,7 @@ void FVoxelOceanCascades::SetSlots(TConstArrayView<VoxelOceanSpectrum::FSlotGPU>
 
 void FVoxelOceanCascades::Update(uint32 Tick, double Time, const FVector4f& FineFoam)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanCascades::Update);
     check(IsInGameThread());
     if (!Textures.IsValid() || Slots.Num() != VoxelOceanSpectrum::SlotCount) return;
     FTextureResource* DisplacementResource = Textures.Displacement->GetResource();
@@ -376,6 +379,7 @@ void FVoxelOceanCascades::Update(uint32 Tick, double Time, const FVector4f& Fine
     ENQUEUE_RENDER_COMMAND(VoxelOceanCascades)(
         [RenderState = State, SlotTable = Slots, Gen = Generation, Tick, Targets, bFoam, FoamRule](FRHICommandListImmediate& RHICmdList)
         {
+            TRACE_CPUPROFILER_EVENT_SCOPE_STR("RT VoxelOceanCascades");
             FRHITexture* DisplacementRHI = Targets.Displacement->TextureRHI;
             FRHITexture* DerivativesRHI = Targets.Derivatives->TextureRHI;
             FRHITexture* FoamRHI = Targets.Foam->TextureRHI;

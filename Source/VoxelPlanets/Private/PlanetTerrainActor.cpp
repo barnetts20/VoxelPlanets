@@ -1,5 +1,7 @@
 #include "PlanetTerrainActor.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelPlanets.h"
+#include "VoxelTerrestrialDensity.h"
 #include "VoxelLandMaterial.h"
 #include "VoxelLandBake.h"
 #include "VoxelLandCacheLayout.ush"
@@ -26,15 +28,17 @@ void APlanetTerrainActor::BeginDestroy()
 
 void APlanetTerrainActor::Tick(float DeltaTime)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetTerrainActor::Tick);
     Super::Tick(DeltaTime);
     // The land view's legend while one is on (VoxelLandDebugViews.h), once the terrain runs.
     if (!BrickTerrain.IsValid() || !BrickTerrain->IsRunning() || !DensityCompositor.IsValid()) return;
-    const TSharedPtr<const FVoxelDensityCPU> Density = FVoxelDensityCPU::Of(*DensityCompositor);
+    const TSharedPtr<const FVoxelTerrestrialDensity> Density = FVoxelTerrestrialDensity::Of(*DensityCompositor);
     VoxelLandDebugViews::ShowLegend(Density.IsValid() && Density->GetLandBake().IsValid(), bLandMaterialBound);
 }
 
-bool APlanetTerrainActor::ResolveLandCache(const TSharedPtr<const FVoxelDensityCPU>& Density)
+bool APlanetTerrainActor::ResolveLandCache(const TSharedPtr<const FVoxelTerrestrialDensity>& Density)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetTerrainActor::ResolveLandCache);
     if (!Density.IsValid()) return false;
     if (LandCache.IsValid() && LandCache->IsInitialized() && LandCacheDensity.Pin() == Density)
         return true;
@@ -115,6 +119,7 @@ void APlanetTerrainActor::ReleaseLandTextures()
 
 UMaterialInterface* APlanetTerrainActor::ResolveBrickMaterial()
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetTerrainActor::ResolveBrickMaterial);
     bLandMaterialBound = false;
     if (!SurfaceMaterial)
     {
@@ -135,7 +140,7 @@ UMaterialInterface* APlanetTerrainActor::ResolveBrickMaterial()
     // The textures, on a terrestrial planet whose material has the land node: the bake's (kept
     // while the bake is, across densities rebuilt with other sample settings) and the density's
     // constants. A failure is remembered, so a later call doesn't build them again.
-    const TSharedPtr<const FVoxelDensityCPU> Density = DensityCompositor.IsValid() ? FVoxelDensityCPU::Of(*DensityCompositor) : nullptr;
+    const TSharedPtr<const FVoxelTerrestrialDensity> Density = DensityCompositor.IsValid() ? FVoxelTerrestrialDensity::Of(*DensityCompositor) : nullptr;
     const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake = Density.IsValid() ? Density->GetLandBake() : nullptr;
     if (!FApp::CanEverRender() || !Bake.IsValid() || !VoxelLandMaterial::HasLandNode(SurfaceMaterial) || LandTexturesFailed.Pin() == Density)
     {
@@ -189,12 +194,15 @@ UMaterialInterface* APlanetTerrainActor::ResolveBrickMaterial()
 
 void APlanetTerrainActor::OnWorldPostActorTick(UWorld* World, ELevelTick TickType, float DeltaSeconds)
 {
-    if (World == GetWorld() && !IsTerrainDestroyed())
+    // A world delegate, not the actor's tick: a parked planet (SetDormant: hidden, tick off) must
+    // not keep writing its land cache and pushing material parameters every frame (R1, PLN-1).
+    if (World == GetWorld() && !IsTerrainDestroyed() && IsActorTickEnabled() && !IsHidden())
         UpdateLandMaterial(true);
 }
 
 void APlanetTerrainActor::UpdateLandMaterial(bool bTickCache)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(APlanetTerrainActor::UpdateLandMaterial);
     if (!LandMaterialInstance) return;
     const FTransform PlanetFrame(GetActorRotation(), GetActorLocation());
     // The land surface cache follows the primary camera, kept warm whenever it's bound (so

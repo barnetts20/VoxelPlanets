@@ -274,6 +274,13 @@ public:
      *  features off in turn (the camera held still), logged as a table; the settings restored. */
     void StartPerfSweep(int32 FramesPerStep, int32 Rounds = 3);
 
+    /** Stage P1a (the planet's spawn timeline): the shore field, and the coastal field, are in. */
+    bool HasShoreField() const { return ShoreField.IsValid(); }
+    /** Stage P1d: the shore field is in and made from the bake with this key (on a reseed the old
+     *  seed's field is held until the new one lands). */
+    bool HasShoreFieldFor(uint32 BakeKey) const;
+    bool HasCoastField() const { return CoastField.IsValid(); }
+
 private:
     struct FPerfSweep
     {
@@ -421,9 +428,8 @@ private:
     TSharedPtr<const IVoxelOceanEnvironmentSource, ESPMode::ThreadSafe> WeatherSource;
     /** The procedural weather, when that's the source or the atmosphere's fallback. */
     TSharedPtr<const FVoxelOceanProceduralWeather, ESPMode::ThreadSafe> ProceduralWeather;
-    /** Stage A5: the planet's atmosphere's weather feed (held: its read-backs run while held), the
-     *  one WeatherSource was made over, and whether a map had landed then. */
-    TSharedPtr<FAtmosphereWeatherFeed, ESPMode::ThreadSafe> AtmosphereWeatherFeed;
+    /** Stage A5: the atmosphere's weather feed WeatherSource was made over, while the weather is
+     *  the atmosphere's (held: its read-backs run while held), and whether a map had landed then. */
     TSharedPtr<FAtmosphereWeatherFeed, ESPMode::ThreadSafe> WeatherSourceFeed;
     bool bWeatherSourceHadMap = false;
     /** The settings and radius WeatherSource was made for. */

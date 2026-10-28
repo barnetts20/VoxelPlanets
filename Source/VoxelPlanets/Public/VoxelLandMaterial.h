@@ -9,7 +9,7 @@
 #include "CoreMinimal.h"
 #include "Math/Float16Color.h"
 
-class FVoxelDensityCPU;
+class FVoxelTerrestrialDensity;
 struct FVoxelDensityGPUData;
 struct FVoxelLandBake;
 class UMaterialInterface;
@@ -84,13 +84,13 @@ namespace VoxelLandMaterial
     VOXELPLANETS_API bool MakeBakeTextures(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& Bake,
         UTexture2DDynamic*& OutHeight, UTexture2DDynamic*& OutFields);
 
-    /** Game thread. The constants texture of a terrestrial density (null for the noise surface). */
-    VOXELPLANETS_API UTexture2DDynamic* MakeConstantTexture(const FVoxelDensityCPU& Density);
+    /** Game thread. The constants texture of a terrestrial density (null when the RHI can't hold it). */
+    VOXELPLANETS_API UTexture2DDynamic* MakeConstantTexture(const FVoxelTerrestrialDensity& Density);
 
     /** Game thread. The peaks' noise set as a texture (RGBA16 unsigned normalised: its packed mip
      *  chain in rows of N texels, VoxelLandNoise.ush), one for every planet sharing the set, or a
      *  1 x 1 stand-in when the density has none (the constants then turn the peaks off). */
-    VOXELPLANETS_API UTexture2DDynamic* MakeNoiseTexture(const FVoxelDensityCPU& Density);
+    VOXELPLANETS_API UTexture2DDynamic* MakeNoiseTexture(const FVoxelTerrestrialDensity& Density);
 
     /** Game thread. The textures on a material instance. */
     VOXELPLANETS_API void SetTextureParameters(UMaterialInstanceDynamic* Material, UTexture2DDynamic* Height, UTexture2DDynamic* Fields,

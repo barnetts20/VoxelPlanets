@@ -158,6 +158,9 @@ struct VOXELPLANETS_API FVoxelLandClimateField
     TArray<FVector4f> Entries;   // 3 x Width x Height
     float LapseRate = 6.5f;      // C per km (the planet's ClimateLapseRate)
     uint32 Hash = 0;             // of the entries and the lapse rate
+    /** Of the map's year's mean at sea level alone (the first block's x): what the ice shelf is
+     *  placed by, so a lapse rate or an ice-sheet change doesn't rebake it (R1, BAKE-3). */
+    uint32 SeaTemperatureHash = 0;
     bool bDriftFromSim = false;  // the drift's source: the sim's (else the provisional winds)
     float IceMaxThickness = 0.0f;  // T5d2: above 0 when it holds the ice block (the cap is the density's)
 

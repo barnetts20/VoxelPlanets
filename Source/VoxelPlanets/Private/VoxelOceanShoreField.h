@@ -98,8 +98,10 @@ public:
     ~FVoxelOceanShoreBuilder();
 
     /** Starts over for a bake (the field's reach in m). Without a bake, or one without the
-     *  sea-connected bit's inputs, it is done at once with no field. */
-    void Start(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& InBake, double InRadiusCm, double InReachM);
+     *  sea-connected bit's inputs, it is done at once with no field. Known: a field made for the
+     *  same bake and radius (another reach), whose terrain heights are reused instead of sampled. */
+    void Start(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& InBake, double InRadiusCm, double InReachM,
+        const FVoxelOceanShoreField* Known = nullptr);
 
     /** Enqueues the GPU's sampling of Count cells from First (the terrain's depth at the bake's
      *  cells: FVoxelOceanPages::SampleCoastDepths, mode 1); false if it can't yet. */

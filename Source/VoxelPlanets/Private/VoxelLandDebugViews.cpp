@@ -13,12 +13,12 @@ namespace VoxelShader
 #include "VoxelLandDebugPalette.ush"
 }
 
-TAutoConsoleVariable<int32> CVarVoxelDebugLandViewSource(
+static TAutoConsoleVariable<int32> CVarVoxelDebugLandViewSource(
     TEXT("voxel.Debug.LandViewSource"), 0,
     TEXT("Where voxel.Debug.LandView colours terrestrial terrain. 0: per pixel, in the terrain material's land node (VoxelLandMaterial.ush; STAGE_M1_NOTES.md): a view change is instant (where the material has no land node, or it isn't bound, the vertex colours show it). 1: per vertex, in the vertex colour with alpha 0 (STAGE_L1b_NOTES.md): a view change meshes the terrain again. The noise surface always uses the vertex colour."),
     ECVF_Default);
 
-TAutoConsoleVariable<int32> CVarVoxelDebugLandView(
+static TAutoConsoleVariable<int32> CVarVoxelDebugLandView(
     TEXT("voxel.Debug.LandView"), 0,
     TEXT("Colours the terrain by a component of the generator: per pixel in the terrain material's land node, or per vertex in the vertex colour (voxel.Debug.LandViewSource). A legend is on screen while a view is on.\n")
     TEXT(" 0: off\n")

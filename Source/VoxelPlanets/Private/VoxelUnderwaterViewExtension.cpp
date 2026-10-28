@@ -1,4 +1,5 @@
 #include "VoxelUnderwaterViewExtension.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "VoxelOceanGPUTime.h"
 #include "VoxelUnderwaterMap.h"
 #include "VoxelOceanShoreField.h"
@@ -341,6 +342,7 @@ void FVoxelUnderwaterViewExtension::SubscribeToPostProcessingPass(EPostProcessin
 FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
     FRDGBuilder& GraphBuilder, const FSceneView& View, const FPostProcessMaterialInputs& Inputs)
 {
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelUnderwaterViewExtension::Render_RenderThread);
     const FScreenPassTextureSlice SceneColorSlice = Inputs.GetInput(EPostProcessMaterialInput::SceneColor);
 
     const FSceneTextureUniformParameters* SceneTextures = Inputs.SceneTextures.SceneTextures
@@ -350,6 +352,9 @@ FScreenPassTexture FVoxelUnderwaterViewExtension::Render_RenderThread(
     if (!bHasFrame || !Params.IsUsable() || !SceneColorSlice.IsValid()
         || !SceneTextures || !SceneTextures->SceneDepthTexture
         || View.bIsReflectionCapture || View.bIsPlanarReflection
+        // Scene captures: the surface pass skips them (nothing draws the sea into them), so
+        // the water's fog and caustics would fog a scene without a sea (R1, OCS-4).
+        || View.bIsSceneCapture
         || !View.IsPerspectiveProjection()
         || View.GetFeatureLevel() < ERHIFeatureLevel::SM5)
     {
