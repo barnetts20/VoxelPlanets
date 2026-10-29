@@ -1383,7 +1383,11 @@ VOXEL_FUNC void VoxelSolveAccJumpCopyPass(uint Slot, uint NumSlots)
     JumpYOut[Slot] = JumpY[Slot];
     AccHiOut[Slot] = AccHi[Slot];
     const uint P = JumpP[Slot];
-    JumpPOut[Slot] = P != VOXEL_SOLVE_NONE ? JumpP[P] : VOXEL_SOLVE_NONE;
+    // (R2, C6: if/else, not ?:, around an index: HLSL may evaluate both sides.)
+    uint DoubledJump = VOXEL_SOLVE_NONE;
+    if (P != VOXEL_SOLVE_NONE)
+        DoubledJump = JumpP[P];
+    JumpPOut[Slot] = DoubledJump;
 }
 
 /** A round's adds (after the copy): each slot's window into the node its jump reaches. */

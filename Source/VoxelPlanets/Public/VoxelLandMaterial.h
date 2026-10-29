@@ -79,7 +79,8 @@ namespace VoxelLandMaterial
 
     /** Game thread. The height and field textures of a bake (they depend on nothing else, so a
      *  rebuilt density with the same bake keeps them): dynamic textures filled on the render
-     *  thread, from the bake's own heights (held until the upload ran), so no CPU copy stays.
+     *  thread from texel copies made here (about 76 MB at N 1024), held until the upload ran,
+     *  then freed: no CPU copy stays.
      *  False (and null) when the RHI can't hold them. */
     VOXELPLANETS_API bool MakeBakeTextures(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& Bake,
         UTexture2DDynamic*& OutHeight, UTexture2DDynamic*& OutFields);

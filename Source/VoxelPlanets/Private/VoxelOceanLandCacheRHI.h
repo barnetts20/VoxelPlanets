@@ -29,14 +29,17 @@ struct FVoxelOceanLandCacheRHI
     double LandSeaRadiusCm = 0.0;
     /** The ocean's sea sphere over the cache's (cm): a depth is this less the height. */
     double SeaOffsetCm = 0.0;
-    /** The textures it was made from (game thread: whether it must be made again). */
+    /** The textures it was made from (game thread: whether it must be made again), and the
+     *  cache's initialisation they were written for (R2, G4: FVoxelLandCache::GetInitSerial). */
     TWeakObjectPtr<UObject> Sources[4];
+    uint32 CacheSerial = 0;
 
     /** Render thread: every texture resolved. */
     bool IsReady() const { return Height.IsValid() && Slope.IsValid() && Fields.IsValid() && State.IsValid(); }
 
     /** Game thread. For a cache's textures (null without their resources). */
-    static TSharedPtr<FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> Make(const FVoxelLandCacheTextures& Textures, double LandSeaRadiusCm, double OceanRadiusCm);
-    /** Game thread. Made from these textures and spheres. */
-    bool IsFor(const FVoxelLandCacheTextures& Textures, double LandSeaRadiusCm, double OceanRadiusCm) const;
+    static TSharedPtr<FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> Make(const FVoxelLandCacheTextures& Textures, uint32 InCacheSerial, double LandSeaRadiusCm, double OceanRadiusCm);
+    /** Game thread. Made from these textures, this initialisation and these spheres (a new
+     *  handle is new inputs to the ocean's static layer, probe and far sphere). */
+    bool IsFor(const FVoxelLandCacheTextures& Textures, uint32 InCacheSerial, double LandSeaRadiusCm, double OceanRadiusCm) const;
 };

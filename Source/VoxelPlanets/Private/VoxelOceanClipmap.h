@@ -381,7 +381,9 @@ namespace VoxelOceanClipmap
     /** The info rows (VoxelOceanClip.ush): the plane's, then for each level in use, (the camera in
      *  the window its waves were evaluated for, the spacing, the slot) and (the camera's texel
      *  coordinate in the toroidal storage, valid, K). Evaluated: each level's window as last
-     *  evaluated (Valid false: never: the level is skipped). */
+     *  evaluated. Valid is always true today (UpdateClipmap evaluates every level before it
+     *  writes the rows), so the shaders' Valid tests never fire; kept for a level that may be
+     *  skipped later. */
     inline void MakeInfoRows(const FFrame& Frame, const FIntPoint* Evaluated, const bool* Valid, FVector4f Out[InfoRows])
     {
         for (int32 r = 0; r < InfoRows; r++) Out[r] = FVector4f(0.0f, 0.0f, 0.0f, 0.0f);

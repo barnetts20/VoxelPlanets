@@ -379,7 +379,14 @@ VOXEL_FUNC void VoxelRiverFloorInitPass(uint Node)
 {
     if (Node >= VoxelRiverNodes()) return;
     const uint D = NodeDown[Node];
-    NodeJumpOut[Node] = D != VOXEL_RIVER_NONE && NodeKind[D] != VOXEL_RIVER_KIND_INLET ? D : VOXEL_RIVER_NONE;
+    // (R2, C6: no read at the none sentinel: HLSL 2018's && evaluates both sides.)
+    uint FirstJump = VOXEL_RIVER_NONE;
+    if (D != VOXEL_RIVER_NONE)
+    {
+        if (NodeKind[D] != VOXEL_RIVER_KIND_INLET)
+            FirstJump = D;
+    }
+    NodeJumpOut[Node] = FirstJump;
 }
 
 /** Round k of the floors: each node's floor (the minimum over 2^k nodes above it, by the earlier
@@ -398,7 +405,11 @@ VOXEL_FUNC void VoxelRiverJumpPass(uint Node)
 {
     if (Node >= VoxelRiverNodes()) return;
     const uint J = NodeJumpIn[Node];
-    NodeJumpOut[Node] = J != VOXEL_RIVER_NONE ? NodeJumpIn[J] : VOXEL_RIVER_NONE;
+    // (R2, C6: if/else, not ?:, around an index: HLSL may evaluate both sides.)
+    uint DoubledJump = VOXEL_RIVER_NONE;
+    if (J != VOXEL_RIVER_NONE)
+        DoubledJump = NodeJumpIn[J];
+    NodeJumpOut[Node] = DoubledJump;
 }
 
 /** A river's meander wavelength (m) at a log2 drainage area: 11 channel widths
@@ -416,10 +427,16 @@ VOXEL_FUNC void VoxelRiverChainInitPass(uint Node)
 {
     if (Node >= VoxelRiverNodes()) return;
     const uint P = NodeUp[Node] == 1u ? NodePred[Node] : VOXEL_RIVER_NONE;
-    const float Arc = P != VOXEL_RIVER_NONE ? VoxelRiverArc(P, Node) : 0.0f;
-    NodeSOut[Node] = Arc;
-    NodeSOut[RiverNodeCap + Node] = P != VOXEL_RIVER_NONE
-        ? Arc / VoxelRiverMeanderWavelength(0.5f * (asfloat(NodeArea[P]) + asfloat(NodeArea[Node]))) : 0.0f;
+    // (R2, C6: if/else, not ?:, around an index: HLSL may evaluate both sides.)
+    float ChainArc = 0.0f;
+    float ChainPhase = 0.0f;
+    if (P != VOXEL_RIVER_NONE)
+    {
+        ChainArc = VoxelRiverArc(P, Node);
+        ChainPhase = ChainArc / VoxelRiverMeanderWavelength(0.5f * (asfloat(NodeArea[P]) + asfloat(NodeArea[Node])));
+    }
+    NodeSOut[Node] = ChainArc;
+    NodeSOut[RiverNodeCap + Node] = ChainPhase;
     NodeIdxOut[Node] = P != VOXEL_RIVER_NONE ? 1u : 0u;
     NodeJumpOut[Node] = P;
 }

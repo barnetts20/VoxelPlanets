@@ -59,22 +59,19 @@
 // THE SURF (stages O9a to O9i; VoxelOceanSurf.ush): near the coast the long bands hand part of
 // their energy (down to the FFT's floor) to directed trains timed and steered by the coastal
 // travel-time field (stage O9h, VoxelOceanCoast.ush: read with the shore field, its layout from
-// the table's rows 19 to 21), which shoal by the real depth, break into bores and run up the
+// the table's rows 19 to 23), which shoal by the real depth, break into bores and run up the
 // beach as swash; added to the FFT's sum (height, gradient, the vertical rate) before its normal
 // is made, their slope variance to the open sea's foam. Its settings are the chart table's
 // constants rows 15, 16 and 18 (written with the shore frame by the surface), the clock
 // W.SlopeVar.w (seconds modulo VOXEL_OCEAN_SURF_WRAP).
 //
-// THE FOAM (stage O9b; VoxelOceanFoam.ush): with VOXEL_OCEAN_LOOKUP_FOAM (the pixel shader) each
-// lookup of a band also reads its slot's foam envelope (the foam texture's (Z, Z^2) at the same
-// coordinates and mip): its deviation from the slot's mean and the variance the mip leaves
-// unresolved, summed per band by the waves' weights (the long bands' sea states normalised, the
-// charts' and the headings' blends as the waves'; a band not looked up is all unresolved). The
-// bands, weighed by their steepness, give the open sea's foam (VoxelOceanFoamOf); the surf's
-// (VoxelOceanSurf.ush) is taken where larger: FVoxelOceanWaveOutput.Foam. The foam texture is an
-// extra argument (VOXEL_OCEAN_FOAM_TEXTURE_PARAMS): the pixel shader's, and the underwater
-// map's inversion (stage O9c: its last lookup); the evaluations without it (the vertex shader,
-// the underwater pass's other inversions) pass the displacement texture in its place, never read.
+// THE FOAM (stage W3v, replacing O9b's per-band envelope; VoxelOceanFoam.ush): with
+// VOXEL_OCEAN_LOOKUP_FOAM (the pixel shader) the foam comes from the summed surface's Jacobian:
+// its compression past the whitecap threshold, and the fresh foam it makes, the surf's
+// (VoxelOceanSurf.ush) taken where larger: FVoxelOceanWaveOutput.Foam and Whitecap. No band
+// looks the foam texture up for it; the texture (VOXEL_OCEAN_FOAM_TEXTURE_PARAMS, an extra
+// argument) holds only the fine foam (W3w). The evaluations without it (the vertex shader, the
+// underwater pass's inversions) pass the displacement texture in its place, never read.
 //
 // The test model (voxel.Ocean.WaveModel 1): three Gerstner waves along fixed planet directions.
 // Wave i: height A sin(theta), horizontal C A cos(theta) along its tangent direction, theta =
@@ -1094,7 +1091,8 @@ FVoxelOceanFFTSurf VoxelOceanFFTSurfAt(float3 D, float Depth, FVoxelOceanShore S
 // point's sea state from the field, each chart's headings, turning from the previous key's over
 // the interval's first seconds (W.Shape.z). With VOXEL_OCEAN_LOOKUP_FOAM in Mask (and the normals),
 // the foam too (stage W3v; VoxelOceanFoam.ush): the summed surface's compression past the whitecap
-// threshold and the fresh foam it makes; the foam texture (OceanFoam) is no longer read.
+// threshold and the fresh foam it makes; the foam texture (OceanFoam) holds only the fine foam
+// (W3w: slot 7, or the fine cascade's own array).
 FVoxelOceanFFTPoint VoxelOceanFFTEvaluate(float3 P, float3 Up, float Spacing, float Footprint, float SmoothDepth, FVoxelOceanShore Shore,
     FVoxelOceanWaveParams W, VOXEL_OCEAN_TEXTURE_PARAMS, VOXEL_OCEAN_FOAM_TEXTURE_PARAMS, uint Mask)
 {

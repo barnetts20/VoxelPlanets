@@ -2,7 +2,7 @@
 // VoxelLandDebug.ush writes them into the terrain's vertex colours). One function per view,
 // from the value shown to a display (sRGB) colour in 0..1.
 //
-// Shared subset (VoxelShaderCompat.h): the terrain's on-screen legend (VoxelBrickTerrain.cpp)
+// Shared subset (VoxelShaderCompat.h): the terrain's on-screen legend (VoxelLandDebugViews.cpp)
 // calls the same functions, so it shows exactly the colours the mesher writes. No static data
 // (constants are #defines).
 

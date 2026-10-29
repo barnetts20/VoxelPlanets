@@ -2,17 +2,19 @@
 // land bake cell, the signed distance to the coast, the direction toward it and the beach slope
 // (VoxelOceanShore.ush has the layout and the sampling).
 //
-// MADE AT LOAD from the land bake (heights and the sea-connected bit), derived, not cached
-// (decision 4): on the GPU (VoxelOceanShoreBuild.usf, 9 passes or so, a few ms) and read back
-// once, so the queries sample the very texels the GPU does; on the CPU where there is no GPU (a
-// dedicated server; the same shared functions, VoxelOceanShoreCore.h, in parallel: seconds at the
-// default resolution).
+// MADE AT LOAD per land bake and drawn terrain, derived, not cached (decision 4): from the
+// terrain's own heights at the bake's cells (stage W7d: sampled on the GPU; the bake's on a
+// server) and the sea-connected bit marked from them (VoxelLandSea::Mark); then on the GPU
+// (VoxelOceanShoreBuild.usf, 9 passes or so, a few ms) and read back once, so the queries sample
+// the very texels the GPU does; or on the CPU (no GPU, or voxel.Ocean.ShoreFieldOnCpu; the same
+// shared functions, VoxelOceanShoreCore.h, in parallel: seconds at the default resolution).
 //
 // USED BY:
 // - the wave model (the hook samples the texture, the CPU model this copy, the same code): the
 //   warp that slows the waves toward the coast, and the beach slope;
 // - the ocean pages: a vertex in an inland basin (below sea level, its field distance below minus
-//   the margin) is land, its triangles culled;
+//   the margin) drains (sinks below the bottom), and past 1.5 times the margin is land, its
+//   triangles culled (stage O9b3);
 // - the underwater view: a camera in such a basin isn't under water.
 //
 // THE TEXTURE: a transient Texture 2D Array, 6 slices of (N + 2 Pad)^2, R32F holding each texel's
@@ -28,6 +30,7 @@
 #include <vector>
 
 struct FVoxelLandBake;
+struct FVoxelDensityGPUData;
 struct FVoxelOceanCoastDepthJob;
 class UTexture2DArray;
 class FTextureResource;
@@ -40,6 +43,11 @@ public:
     double RadiusCm = 0.0;       // the sea sphere
     double ReachM = 0.0;         // the farthest distance held (m)
     uint32 BakeKey = 0;          // the bake it was made from
+    /** R2 (the drain bug): the terrain it was made for (the ocean's density when its build
+     *  started). Since W7d the field's coasts are the drawn terrain's, which a setting outside the
+     *  bake's key (the noise pack's layers, the warp, the climate's chain) moves by kilometres:
+     *  a field is current only for its bake and this terrain. */
+    TWeakPtr<const FVoxelDensityGPUData> Terrain;
     bool bFromGpu = false;
     double BuildSeconds = 0.0;
     /** 6 (N + 2 Pad)^2 texels' bits. */
@@ -58,9 +66,6 @@ public:
     /** The coast as segments of unit directions (six doubles each; stage O9c, the ocean mesh's
      *  split bias: VoxelOceanShoreCore::Coastline). Any thread; a pass over every texel. */
     std::vector<double> Coastline() const;
-
-    /** Whether a point is sea or within MarginCm of it (not land, not an inland basin). */
-    bool IsSea(const FVector& PlanetPoint, double MarginCm) const;
 
     /** A bake cell's arc at a face centre (cm). */
     double CellCm() const;
@@ -97,11 +102,13 @@ public:
     FVoxelOceanShoreBuilder();
     ~FVoxelOceanShoreBuilder();
 
-    /** Starts over for a bake (the field's reach in m). Without a bake, or one without the
+    /** Starts over for a bake (the field's reach in m) and the terrain drawn from it (InTerrain:
+     *  the ocean's density, whose heights are sampled; R2). Without a bake, or one without the
      *  sea-connected bit's inputs, it is done at once with no field. Known: a field made for the
-     *  same bake and radius (another reach), whose terrain heights are reused instead of sampled. */
+     *  same bake, terrain and radius (another reach), whose terrain heights are reused instead of
+     *  sampled. */
     void Start(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& InBake, double InRadiusCm, double InReachM,
-        const FVoxelOceanShoreField* Known = nullptr);
+        const TSharedPtr<const FVoxelDensityGPUData>& InTerrain, const FVoxelOceanShoreField* Known = nullptr);
 
     /** Enqueues the GPU's sampling of Count cells from First (the terrain's depth at the bake's
      *  cells: FVoxelOceanPages::SampleCoastDepths, mode 1); false if it can't yet. */
@@ -116,10 +123,10 @@ public:
     /** The field once done (null: none could be made, or none asked for). */
     TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> GetResult() const { return Result; }
 
-    /** What it is building for (the bake, the radius, the reach). */
-    bool IsFor(const FVoxelLandBake* InBake, double InRadiusCm, double InReachM) const
+    /** What it is building for (the bake, the terrain, the radius, the reach). */
+    bool IsFor(const FVoxelLandBake* InBake, const TSharedPtr<const FVoxelDensityGPUData>& InTerrain, double InRadiusCm, double InReachM) const
     {
-        return Bake.Get() == InBake && RadiusCm == InRadiusCm && ReachM == InReachM;
+        return Bake.Get() == InBake && Terrain.Pin() == InTerrain && RadiusCm == InRadiusCm && ReachM == InReachM;
     }
 
     /** Forgets the build (a GPU build still running finishes unread). */
@@ -134,16 +141,24 @@ private:
     void Finish(TSharedPtr<FVoxelOceanShoreField, ESPMode::ThreadSafe> Field);
 
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Bake;
+    /** R2: the terrain it builds for (weak: a planet rebuilt meanwhile lets it go). */
+    TWeakPtr<const FVoxelDensityGPUData> Terrain;
     double RadiusCm = 0.0;
     double ReachM = 0.0;
     double StartSeconds = 0.0;
+    /** R2 (H5): seconds waited for the terrain, counted only across ticks (a gap between two
+     *  ticks, a parked actor, counts at most VOSF::SampleWaitStep), and the last tick's time. */
+    double SampleWaited = 0.0;
+    double LastTickSeconds = 0.0;
     int32 WaitFrames = 0;
     bool bDone = true;
     bool bGpu = false;
     /** Stage W7d: sampling the terrain's heights first, the chunks issued. */
     bool bSampling = false;
     int64 Issued = 0;
-    int32 SampleWaitFrames = 0;
+    /** R2: the jump flood on the CPU (no GPU, or voxel.Ocean.ShoreFieldOnCpu), after the
+     *  terrain's heights where there is a GPU to sample them. */
+    bool bCpuBuild = false;
     TSharedPtr<FJob, ESPMode::ThreadSafe> Job;
     TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> Result;
 };

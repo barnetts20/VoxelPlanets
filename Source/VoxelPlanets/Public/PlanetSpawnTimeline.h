@@ -35,9 +35,9 @@ struct VOXELPLANETS_API FPlanetSpawnTimeline
         BakeGate,          // TickLandBake (the baker's ticks, the rivers' and the noise's checks)
         ClimateBase,       // VoxelLandClimate::BuildBase
         AtmosphereConfig,  // ConfigureAtmosphere (its surface map included)
-        Field,             // RebuildLandClimateTarget (BuildMap + MakeField)
-        Shelf,             // UpdateIceShelf (MakeIceShelfBake)
-        Compositor,        // BuildCompositor (the density)
+        Field,             // RebuildLandClimateTarget (the job's launch and its result's apply: BuildMap + MakeField run on a worker, P1i)
+        Shelf,             // UpdateIceShelf (the launch and the poll: MakeIceShelfBake runs on a worker, P1d)
+        Compositor,        // PrebuildCompositor and BuildCompositor (the launch and the take: the density is made on a worker, P1i)
         Terrain,           // the terrain's InitializeFromOwner (its rebuild, the material)
         Ocean,             // ConfigureOcean (the ocean's initialization)
         Initialize,        // the whole Initialize

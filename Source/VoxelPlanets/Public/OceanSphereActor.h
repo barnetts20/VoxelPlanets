@@ -248,7 +248,9 @@ private:
 
     /** The shore field (stage O8; FVoxelOceanShoreField): made from the planet's land bake at
      *  load (ShoreBuilder), its texture for the material and the passes, and that texture's
-     *  render-thread handle. None without a land bake (open water everywhere). */
+     *  render-thread handle. None without a land bake (open water everywhere). Keyed by the bake,
+     *  the radius and the terrain it sampled (R2): a field for another terrain (a reseed) is
+     *  dropped at once, never applied to the new one. */
     TSharedPtr<FVoxelOceanShoreBuilder> ShoreBuilder;
     TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> ShoreField;
     UPROPERTY(Transient)
@@ -266,6 +268,8 @@ private:
     /** Starts the shore field's build when the land bake, the radius or the reach changed, and
      *  takes it when done. */
     void UpdateShoreField();
+    /** R2: no shore field (nor the coastal field drawn into its texture). */
+    void ReleaseShoreField();
     /** voxel.Debug.OceanShore: the shore field around the camera. */
     void DrawShoreDebug() const;
 
@@ -276,8 +280,9 @@ public:
 
     /** Stage P1a (the planet's spawn timeline): the shore field, and the coastal field, are in. */
     bool HasShoreField() const { return ShoreField.IsValid(); }
-    /** Stage P1d: the shore field is in and made from the bake with this key (on a reseed the old
-     *  seed's field is held until the new one lands). */
+    /** Stage P1d: the shore field is in and made from the bake with this key and from the
+     *  ocean's current terrain (R2: a field for another bake is let go at once; one for another
+     *  terrain on the same bake is shown until the new one lands, UpdateShoreField). */
     bool HasShoreFieldFor(uint32 BakeKey) const;
     bool HasCoastField() const { return CoastField.IsValid(); }
 

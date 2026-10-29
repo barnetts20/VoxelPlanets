@@ -1578,6 +1578,9 @@ bool FVoxelOceanPages::SampleCoastDepths(const TSharedPtr<FVoxelOceanCoastDepthJ
     // The terrain's density must be there (the stand-in has no terrain: every point deep water),
     // and the shader compiled.
     if (!DensityInputs.Density.IsValid()) return false;
+    // R2: only the terrain the job was started for (not yet here after a rebuild: the job waits a
+    // tick; gone: it never is, and its builder starts over).
+    if (Job->Density.Pin() != DensityInputs.Density) return false;
     {
         FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
         if (!ShaderMap || !ShaderMap->GetShader(&FVoxelOceanCoastDepthCS::GetStaticType(), 0).IsValid()) return false;
@@ -2778,8 +2781,8 @@ void FVoxelOceanPages::UpdateRings(const FVector& CameraPlanet, const FVector4f&
         });
 }
 
-TSharedPtr<FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> FVoxelOceanLandCacheRHI::Make(const FVoxelLandCacheTextures& Textures, double LandSeaRadiusCm,
-    double OceanRadiusCm)
+TSharedPtr<FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> FVoxelOceanLandCacheRHI::Make(const FVoxelLandCacheTextures& Textures, uint32 InCacheSerial,
+    double LandSeaRadiusCm, double OceanRadiusCm)
 {
     if (!Textures.IsValid()) return nullptr;
     FTextureResource* Resources[4] = { Textures.Height->GameThread_GetRenderTargetResource(), Textures.Slope->GameThread_GetRenderTargetResource(),
@@ -2789,6 +2792,7 @@ TSharedPtr<FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> FVoxelOceanLandCacheRHI
     const TSharedPtr<FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> Out = MakeShared<FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe>();
     Out->LandSeaRadiusCm = LandSeaRadiusCm;
     Out->SeaOffsetCm = OceanRadiusCm - LandSeaRadiusCm;
+    Out->CacheSerial = InCacheSerial;
     Out->Sources[0] = Textures.Height;
     Out->Sources[1] = Textures.Slope;
     Out->Sources[2] = Textures.Fields;
@@ -2804,8 +2808,9 @@ TSharedPtr<FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> FVoxelOceanLandCacheRHI
     return Out;
 }
 
-bool FVoxelOceanLandCacheRHI::IsFor(const FVoxelLandCacheTextures& Textures, double InLandSeaRadiusCm, double OceanRadiusCm) const
+bool FVoxelOceanLandCacheRHI::IsFor(const FVoxelLandCacheTextures& Textures, uint32 InCacheSerial, double InLandSeaRadiusCm, double OceanRadiusCm) const
 {
+    if (CacheSerial != InCacheSerial) return false;
     // Weak: a texture made again at a freed one's address is another texture.
     return Sources[0].Get() == Textures.Height && Sources[1].Get() == Textures.Slope && Sources[2].Get() == Textures.Fields
         && Sources[3].Get() == Textures.State && Textures.IsValid() && LandSeaRadiusCm == InLandSeaRadiusCm && SeaOffsetCm == OceanRadiusCm - InLandSeaRadiusCm;

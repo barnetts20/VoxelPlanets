@@ -270,6 +270,9 @@ void FVoxelOceanCoastBuilder::Tick(const FSampler& Sampler)
             return;
         }
         Job = MakeShared<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>();
+        // (R2: the depths of the terrain its shore field was made for, never another's.)
+        if (Shore.IsValid())
+            Job->Density = Shore->Terrain;
         Job->R = Plan->R;
         Job->N = Plan->N;
         Job->FootprintCm = Plan->CellM * 100.0;

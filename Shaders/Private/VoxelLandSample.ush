@@ -13,7 +13,7 @@
 // angle from a double-float table: about 1e-7 cells, at any radius.
 //
 // Shared subset (VoxelShaderCompat.h). The C++ side includes it inside a struct whose members
-// have the names of the inputs below (VoxelDensity.cpp). Include after VoxelDensityCore.ush,
+// have the names of the inputs below (VoxelTerrestrialDensity.cpp). Include after VoxelDensityCore.ush,
 // VoxelDF64.ush and VoxelCubeSphere.ush, and after declaring:
 //
 //   StructuredBuffer<float> LandHeight;      6 * (N + 2 Pad)^2 heights (m), face-major, rows of U

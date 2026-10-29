@@ -232,8 +232,9 @@ struct VOXELPLANETS_API FVoxelTerrestrialSettings
     double DetailWavelength = 20000.0;
 
     /** Unused since N1: the detail set's eroded channel carries its own damping (each variant
-     *  its own: detail_a k 1, detail_b 0.5, detail_c 2). Kept so saved planets load. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "0.0", UIMax = "4.0"))
+     *  its own: detail_a k 1, detail_b 0.5, detail_c 2). Kept so saved planets load (R2, B10:
+     *  no longer editable). */
+    UPROPERTY()
     double DetailSlopeDamping = 1.0;
 
     /** The detail set (N1): a file name in the plugin's NoiseSets folder without .vxnt (e.g.

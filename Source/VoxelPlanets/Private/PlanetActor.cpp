@@ -453,7 +453,7 @@ float APlanetActor::GetBakeProgress() const
     return LandBake.IsValid() && LandBake->Key == VoxelLand::BakeKey(TerrestrialSettings, GetActorScale3D().GetMax()) ? 1.0f : 0.0f;
 }
 
-void APlanetActor::ComputeShape(double& OutPlanetRadius, double& OutNoiseAmplitude, double& OutOceanRadius) const
+void APlanetActor::ComputeShape(double& OutPlanetRadius, double& OutNoiseAmplitude, double& OutOceanRadius, bool bWarn) const
 {
     const double Radius = GetActorScale3D().GetMax();
     if (Generator == EVoxelSurfaceGenerator::Terrestrial && LandBake.IsValid())
@@ -464,8 +464,12 @@ void APlanetActor::ComputeShape(double& OutPlanetRadius, double& OutNoiseAmplitu
         const double Ceiling = Radius * NoiseAmplitudeRatio;
         if (OutNoiseAmplitude > Ceiling)
         {
-            UE_LOG(LogVoxelPlanets, Warning, TEXT("[Planet] %s: the terrestrial heights span %.0f m, more than NoiseAmplitudeRatio allows (%.0f m); they are clamped."),
-                *GetName(), OutNoiseAmplitude * 0.01, Ceiling * 0.01);
+            // (R2, B9: warned once a build, from Initialize: the prebuild asks every tick.)
+            if (bWarn)
+            {
+                UE_LOG(LogVoxelPlanets, Warning, TEXT("[Planet] %s: the terrestrial heights span %.0f m, more than NoiseAmplitudeRatio allows (%.0f m); they are clamped."),
+                    *GetName(), OutNoiseAmplitude * 0.01, Ceiling * 0.01);
+            }
             OutNoiseAmplitude = Ceiling;
         }
         OutOceanRadius = FMath::Max(1.0, Radius);
@@ -497,11 +501,15 @@ void APlanetActor::Initialize()
         ShelfFutureHash = 0;
         LandBaker.Reset();
         LandNoise.Reset();
+        // (R2, B3: and a terrestrial compositor prebuilt for the build before the switch: it held
+        // the bake, the noise pack and the climate field until the planet went back.)
+        CompositorFuture = TFuture<TSharedPtr<FDensitySampleCompositor>>();
+        CompositorFutureKey = 0;
     }
     double PlanetRadius = 0.0;
     double NoiseAmplitude = 0.0;
     double OceanRadius = 0.0;
-    ComputeShape(PlanetRadius, NoiseAmplitude, OceanRadius);
+    ComputeShape(PlanetRadius, NoiseAmplitude, OceanRadius, true);
     const double RootExtent = VoxelDensity::RootExtentFor(PlanetRadius, NoiseAmplitude);
 
     SpawnChildActors();
@@ -541,6 +549,12 @@ void APlanetActor::Initialize()
     ConfigureGravity(PlanetRadius, OceanRadius);
     // Stage A1: after the ocean, which takes the atmosphere's light as its sun.
     ConfigureAtmosphere(PlanetRadius, OceanRadius);
+    // R2 (B4): the terrain and the ocean now sample the shelf's bake. The planet's bake's GPU
+    // fields were released when the shelf landed, but the old terrain kept drawing from them
+    // until here, and a remesh or a land-cache write re-uploaded them: let go once more, now that
+    // nothing samples them (64 MB at N 1024; R1's BAKE-1).
+    if (ShelfBake.IsValid() && LandBake.IsValid())
+        VoxelLand::ReleaseBakeGPU(*LandBake);
 
     RecordAppliedState();
     bInitialized = true;
@@ -917,6 +931,8 @@ bool APlanetActor::UpdateClimateCapture()
         if (!bSnapshot)
         {
             ClimateCaptureState = EVoxelPlanetClimateCapture::Captured;
+            // (R2, B6: a snapshot's status line pending for a field still being made isn't this one's.)
+            ClimateSnapshotStatusDelay = -1.0;
             RebuildLandClimateTarget();
             LandClimateStatus = !bEnableAtmosphere ? TEXT("Provisional model (no atmosphere).")
                 : AtmosphereType == EPlanetAtmosphereType::AirOnly && LandClimate.Source == EVoxelLandClimateSource::Snapshot
@@ -1006,6 +1022,7 @@ bool APlanetActor::UpdateClimateCapture()
     {
         ClimateCaptureState = EVoxelPlanetClimateCapture::Captured;
         ClimateSim.Reset();
+        ClimateSnapshotStatusDelay = -1.0;
         ShowAtOnce();
         RebuildLandClimateTarget();
         LandClimateStatus = FString::Printf(TEXT("Provisional model: no snapshot, %s; kept for this seed."), *Reason);
@@ -1127,6 +1144,11 @@ bool APlanetActor::UpdateIceShelf()
         TerrestrialSettings.IceShelfRise, TerrestrialSettings.IceShelfRoll, TerrestrialSettings.IceShelfDraft })
         Hash = HashCombine(Hash, ::GetTypeHash(V));
     Hash |= 1u;
+    // (R2, B2: a shelf that came out empty is remembered too, by its hash: a warm planet's
+    // build went on to the compositor's prebuild, and the next tick baked the same empty shelf
+    // again before Initialize.)
+    if (!ShelfBake.IsValid() && ShelfBakeHash == Hash && !ShelfFuture.IsValid())
+        return true;
     if (ShelfBake.IsValid() && ShelfBakeHash == Hash)
     {
         // The same shelf: only the rivers may be new (other river settings: LandBake's, remade by
@@ -1140,8 +1162,15 @@ bool APlanetActor::UpdateIceShelf()
             FScopeLock ShelfLock(&ShelfBake->RiverLock);
             ShelfBake->Rivers = Rivers;
         }
-        // (A river rebuild uploaded the planet's bake's fields again: let go, as below.)
-        VoxelLand::ReleaseBakeGPU(*LandBake);
+        // (A river rebuild uploaded the planet's bake's fields again: let go, as below. R2, B4:
+        // only when the rivers did change: since P1i this runs every tick the build waits for its
+        // compositor, and a terrain still drawing from the planet's bake re-uploaded the fields
+        // every frame.)
+        if (Rivers != ShelfRiversReleased.Pin())
+        {
+            ShelfRiversReleased = Rivers;
+            VoxelLand::ReleaseBakeGPU(*LandBake);
+        }
         return true;
     }
     // Stage P1d: on the thread pool (MakeIceShelfBake runs on any thread: it reads its inputs,
@@ -1162,13 +1191,19 @@ bool APlanetActor::UpdateIceShelf()
     ShelfBake = ShelfFuture.Get();
     ShelfFuture = TFuture<TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>>();
     ShelfFutureHash = 0;
-    ShelfBakeHash = ShelfBake.IsValid() ? Hash : 0u;
+    ShelfBakeHash = Hash;
     // The terrain samples the shelf's bake from now on (its own GPU copy, uploaded on first use):
     // the planet's bake's GPU fields (the solve's, 64 MB at N 1024) would stay resident unread
     // for the planet's life (R1, BAKE-1). Not while its rivers are being built (TickRivers reads
     // them): TickLandBake finished them before this.
     if (ShelfBake.IsValid())
+    {
+        {
+            FScopeLock RiverLock(&LandBake->RiverLock);
+            ShelfRiversReleased = LandBake->Rivers;
+        }
         VoxelLand::ReleaseBakeGPU(*LandBake);
+    }
     return true;
 }
 
@@ -1382,11 +1417,12 @@ void APlanetActor::TickSpawnTimeline()
             SpawnTimeline.Mark(ESpawnMark::TerrainSettled);
     }
     const bool bShoreExpected = OceanActor && bEnableOcean && Generator == EVoxelSurfaceGenerator::Terrestrial;
-    // (Stage P1d: this build's field, by its bake's key: a reseed holds the old seed's until then.)
+    // (Stage P1d: this build's field, by its bake's key. R2: the ocean lets another bake's field go
+    // at once, and the coastal field follows its shore field, so it is marked after it.)
     const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> ShoreBake = TerrainBake();
     if (bShoreExpected && ShoreBake.IsValid() && OceanActor->HasShoreFieldFor(ShoreBake->Key))
         SpawnTimeline.Mark(ESpawnMark::Shore);
-    if (bShoreExpected && OceanActor->HasCoastField())
+    if (bShoreExpected && SpawnTimeline.Has(ESpawnMark::Shore) && OceanActor->HasCoastField())
         SpawnTimeline.Mark(ESpawnMark::Coast);
     if (SpawnTimeline.Has(ESpawnMark::TerrainSettled) && (!bShoreExpected || SpawnTimeline.Has(ESpawnMark::Shore)))
         SpawnTimeline.End();

@@ -108,7 +108,7 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelOceanShoreSmoothCS, "/Plugin/VoxelPlanets/Private/
 
 static TAutoConsoleVariable<int32> CVarVoxelOceanShoreFieldOnCpu(
     TEXT("voxel.Ocean.ShoreFieldOnCpu"), 0,
-    TEXT("1: build the shore field on the CPU even where there is a GPU (seconds, in the background), as a dedicated server does: every machine then runs the same code (a GPU's build can differ from it by float rounding, by vendor), for the queries' agreement near the coast in multiplayer."),
+    TEXT("1: build the shore field's jump flood on the CPU even where there is a GPU (seconds, in the background), as a dedicated server does: every machine then runs the same code (a GPU's build can differ from it by float rounding, by vendor), for the queries' agreement near the coast in multiplayer. The terrain's heights are still sampled on the GPU first where there is one (voxel.Ocean.ShoreFromTerrain; R2: they were the bake's with this on, so the field's coasts weren't the drawn terrain's). A server without a GPU uses the bake's heights."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelOceanShoreFromTerrain(
@@ -120,11 +120,13 @@ namespace VoxelOceanShoreFieldDetail
 {
     /** Frames to wait for the shaders (compiling) before building on the CPU instead. */
     constexpr int32 ShaderWaitFrames = 300;
-    /** Stage W7d: the terrain's heights: cells per sampling chunk, chunks in flight, and frames
-     *  to wait for the terrain (no chunk taken) before the bake's heights instead. */
+    /** Stage W7d: the terrain's heights: cells per sampling chunk, chunks in flight, and seconds
+     *  to wait for the terrain (no chunk taken) before the bake's heights instead (R2: seconds,
+     *  not frames: 1,800 frames were 7.5 s at 240 fps, short of a slow shader compile). */
     constexpr int32 SampleChunk = 1 << 18;
     constexpr int32 SampleInFlight = 4;
-    constexpr int32 SampleWaitFrames = 1800;
+    constexpr double SampleWaitSeconds = 30.0;
+    constexpr double SampleWaitStep = 0.25;
     /** Cells per task of the CPU build. */
     constexpr int32 CpuChunk = 4096;
 
@@ -173,12 +175,6 @@ std::vector<double> FVoxelOceanShoreField::Coastline() const
     return VoxelOceanShoreCore::Coastline(Texels.GetData(), N, ReachM);
 }
 
-bool FVoxelOceanShoreField::IsSea(const FVector& PlanetPoint, double InMarginCm) const
-{
-    if (!IsValid()) return true;
-    const VoxelShader::FVoxelOceanShoreSample S = VoxelOceanShoreCore::Sample(Texels.GetData(), N, ReachM, PlanetPoint.X, PlanetPoint.Y, PlanetPoint.Z);
-    return (double)S.Distance * 100.0 > -InMarginCm;
-}
 
 double FVoxelOceanShoreField::CellCm() const
 {
@@ -294,24 +290,28 @@ FVoxelOceanShoreBuilder::~FVoxelOceanShoreBuilder() = default;
 void FVoxelOceanShoreBuilder::Reset()
 {
     Bake.Reset();
+    Terrain.Reset();
     Job.Reset();
     Result.Reset();
     bDone = true;
     bGpu = false;
     bSampling = false;
     Issued = 0;
-    SampleWaitFrames = 0;
+    bCpuBuild = false;
 }
 
 void FVoxelOceanShoreBuilder::Start(const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& InBake, double InRadiusCm, double InReachM,
-    const FVoxelOceanShoreField* Known)
+    const TSharedPtr<const FVoxelDensityGPUData>& InTerrain, const FVoxelOceanShoreField* Known)
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelOceanShoreBuilder::Start);
     Reset();
     Bake = InBake;
+    Terrain = InTerrain;
     RadiusCm = InRadiusCm;
     ReachM = InReachM;
     StartSeconds = FPlatformTime::Seconds();
+    SampleWaited = 0.0;
+    LastTickSeconds = StartSeconds;
     WaitFrames = 0;
     if (!Bake.IsValid() || RadiusCm <= 0.0 || ReachM <= 0.0 || !VOSF::HasInputs(*Bake))
     {
@@ -326,16 +326,21 @@ void FVoxelOceanShoreBuilder::Start(const TSharedPtr<const FVoxelLandBake, ESPMo
     Job->RadiusM = RadiusCm * 0.01;
     Job->ReachM = ReachM;
     Job->BakeSeaCells = Bake->SeaCells;
-    if (FApp::CanEverRender() && GMaxRHIFeatureLevel >= ERHIFeatureLevel::SM5 && CVarVoxelOceanShoreFieldOnCpu.GetValueOnGameThread() == 0)
+    // R2: the terrain's heights wherever there is a GPU to sample them, whichever builds the field
+    // (voxel.Ocean.ShoreFieldOnCpu chooses only the jump flood's machine).
+    const bool bCanSample = FApp::CanEverRender() && GMaxRHIFeatureLevel >= ERHIFeatureLevel::SM5;
+    bCpuBuild = !bCanSample || CVarVoxelOceanShoreFieldOnCpu.GetValueOnGameThread() != 0;
     {
         // Stage W7d: the terrain's own heights at the bake's cells first (the GPU's), unless off.
-        if (CVarVoxelOceanShoreFromTerrain.GetValueOnGameThread() != 0)
+        if (bCanSample && CVarVoxelOceanShoreFromTerrain.GetValueOnGameThread() != 0)
         {
             // A field made for the same bake, resolution and radius already holds them (only the
             // reach differs: the jump flood's): they are taken as they are, not sampled again
             // (R1, OCW-1: the sampling is seconds of the GPU's time).
+            // (R2: and for the same terrain: the heights are the drawn terrain's, which settings
+            // outside the bake's key move.)
             if (Known && Known->BakeKey == Bake->Key && Known->N == Bake->N && Known->RadiusCm == RadiusCm
-                && Known->Height.Num() == Bake->NumCells())
+                && Known->Height.Num() == Bake->NumCells() && InTerrain.IsValid() && Known->Terrain.Pin() == InTerrain)
             {
                 Job->Height = Known->Height;
                 FromTerrain();
@@ -346,6 +351,8 @@ void FVoxelOceanShoreBuilder::Start(const TSharedPtr<const FVoxelLandBake, ESPMo
             Issued = 0;
             Job->Depth = MakeShared<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>();
             Job->Depth->Mode = 1;
+            // (R2: sampled from this terrain only, never from the pages' previous one.)
+            Job->Depth->Density = InTerrain;
             Job->Depth->N = Job->N;
             Job->Depth->R = 1;
             Job->Depth->FootprintCm = 0.5 * UE_DOUBLE_PI * RadiusCm / (double)FMath::Max(Job->N, 1);
@@ -353,10 +360,11 @@ void FVoxelOceanShoreBuilder::Start(const TSharedPtr<const FVoxelLandBake, ESPMo
             Job->Depth->DepthCm.SetNumZeroed(Bake->NumCells());
             return;
         }
-        StartGpu();
+        if (bCpuBuild)
+            StartCpu();
+        else
+            StartGpu();
     }
-    else
-        StartCpu();
 }
 
 void FVoxelOceanShoreBuilder::FromTerrain()
@@ -444,12 +452,19 @@ void FVoxelOceanShoreBuilder::Tick(const FSampler& Sampler)
     {
         // Stage W7d: the terrain's depth at every bake cell, in chunks (the coastal field's).
         const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& D = Job->Depth;
-        if (D->Failed.load(std::memory_order_acquire) != 0 || (Issued == 0 && ++SampleWaitFrames > VOSF::SampleWaitFrames))
+        const double NowSeconds = FPlatformTime::Seconds();
+        if (Issued == 0)
+            SampleWaited += FMath::Min(NowSeconds - LastTickSeconds, VOSF::SampleWaitStep);
+        LastTickSeconds = NowSeconds;
+        if (D->Failed.load(std::memory_order_acquire) != 0 || (Issued == 0 && SampleWaited > VOSF::SampleWaitSeconds))
         {
             // No terrain to sample (or the shader gone): the bake's heights, as before.
             UE_LOG(LogVoxelPlanets, Warning, TEXT("[VoxelOcean] The shore field couldn't sample the terrain's heights; it uses the land bake's."));
             Job->Depth.Reset();
-            StartGpu();
+            if (bCpuBuild)
+                StartCpu();
+            else
+                StartGpu();
             return;
         }
         while (Sampler && Issued < D->Cells && D->InFlight.load(std::memory_order_acquire) < VOSF::SampleInFlight)
@@ -481,6 +496,12 @@ void FVoxelOceanShoreBuilder::Tick(const FSampler& Sampler)
     if (!Job->bIssued)
     {
         if (!Job->SeaMaskReady.IsReady()) return;
+        // R2: the terrain's heights and sea bits made, the jump flood on the CPU when asked for.
+        if (bCpuBuild)
+        {
+            StartCpu();
+            return;
+        }
         if (!VOSF::AreShadersReady())
         {
             if (++WaitFrames >= VOSF::ShaderWaitFrames)
@@ -610,6 +631,7 @@ void FVoxelOceanShoreBuilder::Finish(TSharedPtr<FVoxelOceanShoreField, ESPMode::
     Field->RadiusCm = RadiusCm;
     Field->ReachM = ReachM;
     Field->BakeKey = Bake->Key;
+    Field->Terrain = Terrain;
     Field->BuildSeconds = FPlatformTime::Seconds() - StartSeconds;
     // Stage W7d: the heights it was made from, when the terrain's.
     const bool bTerrain = Job.IsValid() && Job->Height.Num() == Bake->NumCells();

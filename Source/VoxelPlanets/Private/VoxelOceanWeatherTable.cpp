@@ -68,6 +68,10 @@ int64 VoxelOceanWeatherTable::KeyIndexAt(const IVoxelOceanEnvironmentSource& Sou
 FVoxelOceanWeatherKey VoxelOceanWeatherTable::BuildKey(const IVoxelOceanEnvironmentSource& Source, int32 ChartCells,
     const FVoxelOceanWeatherTiming& Timing, int64 Index)
 {
+    // R2 (F4): one state of the source for the whole key: the chunks below sample in parallel,
+    // and a weather map landing meanwhile split the key between two maps.
+    const TSharedPtr<const IVoxelOceanEnvironmentSource, ESPMode::ThreadSafe> Pinned = Source.Pin();
+    const IVoxelOceanEnvironmentSource& Fixed = Pinned.IsValid() ? *Pinned : Source;
     using VoxelOceanCharts::FVec;
     FVoxelOceanWeatherKey Key;
     Key.Index = Index;
@@ -98,11 +102,11 @@ FVoxelOceanWeatherKey VoxelOceanWeatherTable::BuildKey(const IVoxelOceanEnvironm
     Samples.SetNum(Points.Num());
     constexpr int32 Chunk = 512;
     const int32 Chunks = (Points.Num() + Chunk - 1) / Chunk;
-    ParallelFor(Chunks, [&Source, &Points, &Samples, Time](int32 C)
+    ParallelFor(Chunks, [&Fixed, &Points, &Samples, Time](int32 C)
         {
             const int32 First = C * Chunk;
             const int32 Count = FMath::Min(Chunk, Points.Num() - First);
-            Source.SampleWeatherBatch(TConstArrayView<FVector>(Points.GetData() + First, Count), Time,
+            Fixed.SampleWeatherBatch(TConstArrayView<FVector>(Points.GetData() + First, Count), Time,
                 TArrayView<FVoxelOceanEnvironment>(Samples.GetData() + First, Count));
         });
 

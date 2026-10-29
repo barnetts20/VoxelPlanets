@@ -272,6 +272,9 @@ public:
 
     /** The density and edits the next writes sample. Writes already pushed keep theirs. */
     void SetDensityInputs(const FVoxelOceanDensityInputs& InInputs);
+    /** R2 (G3): counts the changes of what the depth is sampled from (the density, the shore,
+     *  the land cache and the depth settings; not the edits, which come as rectangles). */
+    uint32 GetDensityVersion() const { return DensityVersion; }
     const FVoxelOceanDensityInputs& GetDensityInputs() const { return DensityInputs; }
 
     /** True when every page in InPages has a buffer set ready to draw in this frame; otherwise

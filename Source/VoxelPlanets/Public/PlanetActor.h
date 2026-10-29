@@ -32,6 +32,7 @@ class FVoxelLandBaker;
 struct FVoxelLandBake;
 class UVoxelOceanProfile;
 struct FVoxelLandNoiseSet;
+struct FVoxelLandRiverSet;
 struct FVoxelLandClimateField;
 class UTexture2DDynamic;
 
@@ -554,8 +555,10 @@ private:
     /** What the job under way is for (its inputs' hash) and the climate base it is made on. */
     uint32 ClimateFieldFutureKey = 0;
     uint32 ClimateFieldFutureBaseKey = 0;
-    /** Superseded jobs, kept until they finish so their fields are released on the game thread
-     *  (a field's GPU copy goes through a render command). */
+    /** Superseded jobs, kept until they finish (best effort: R2, B5). The real rule for every job
+     *  here (field, shelf, compositor): results and captured inputs may be released on a pool
+     *  worker, so their destructors only enqueue render commands, never touch the game thread's
+     *  state. */
     TArray<TFuture<TSharedPtr<FClimateFieldResult, ESPMode::ThreadSafe>>> ClimateFieldDiscarded;
     /** The capture's status line, written when its field lands (it says whether the sim's
      *  climate was used, which only the map knows): the snapshot's delay (s), or below 0 for none. */
@@ -612,7 +615,9 @@ private:
      *  what it was made from. The climate and the atmosphere keep reading LandBake (the snapshot's
      *  own ground). */
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> ShelfBake;
-    uint32 ShelfBakeHash = 0;
+    uint32 ShelfBakeHash = 0;   // R2 (B2): the inputs' hash of the last result, a null shelf's too
+    /** R2 (B4): the rivers the planet's bake's GPU fields were last released after. */
+    TWeakPtr<const FVoxelLandRiverSet, ESPMode::ThreadSafe> ShelfRiversReleased;
     /** Whether the planet asks for an ice shelf (a height, the land climate). */
     bool IceShelfOn() const;
     /** Makes ShelfBake for the current bake, climate and settings (or drops it). Stage P1d: the
@@ -637,7 +642,7 @@ private:
 
     /** The density's shape for the current generator: the radius the heights are above, their
      *  range, and the sea radius. Terrestrial needs LandBake. */
-    void ComputeShape(double& OutPlanetRadius, double& OutNoiseAmplitude, double& OutOceanRadius) const;
+    void ComputeShape(double& OutPlanetRadius, double& OutNoiseAmplitude, double& OutOceanRadius, bool bWarn = false) const;
 
     /** NoiseAmplitude / PlanetRadius for the children (NoiseAmplitudeRatio itself for the noise
      *  surface, so its lattice is unchanged). */
@@ -689,8 +694,10 @@ private:
      *  stage S1b; the TerrainActor property no longer takes them), attached or not. */
     void DestroyLegacyTerrainActors();
 
-    /** Builds the shared compositor (VoxelDensity::MakeCompositor) with a fresh
-     *  FSparseEditStore covering the terrain lattice's root box down to MaxDepth. */
+    /** Builds the shared compositor (VoxelDensity::MakeCompositor): the one PrebuildCompositor
+     *  made on a worker when its key matches (P1i), else here; with the held edit store when the
+     *  planet and lattice are the same (R1a, HeldEditStore), else a fresh one covering the
+     *  terrain lattice's root box down to MaxDepth. */
     TSharedPtr<FDensitySampleCompositor> BuildCompositor(double PlanetRadius, double NoiseAmplitude, double RootExtent, int32 MaxDepth);
 
     /** Stage P1i (S2): a terrestrial build's compositor made on the thread pool ahead of

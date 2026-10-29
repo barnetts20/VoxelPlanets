@@ -53,8 +53,8 @@ public:
      *  written into. */
     static int32 TilesFor(int32 Levels);
 
-    /** Game thread. The textures for Levels levels (transient objects in Outer); false when the
-     *  RHI can't create them. */
+    /** Game thread. The textures for Levels levels (the atlases transient objects in Outer, the
+     *  state texture in the transient package); false when the RHI can't create them. */
     static bool MakeTextures(int32 Levels, UObject* Outer, FVoxelLandCacheTextures& Out);
 
     FVoxelLandCache();
@@ -76,6 +76,10 @@ public:
     FString WhyNotWritable() const;
     int32 GetLevels() const;
     double GetSeaRadius() const { return SeaRadius; }
+    /** R2 (G4): a serial new with every Initialize (unique across caches): its texels' generation.
+     *  The ocean keys what it read from them on it, so a reseed whose cache keeps its textures
+     *  (the same radius) is never read as the same content. */
+    uint32 GetInitSerial() const { return InitSerial; }
 
     /** Game thread, every frame (a second call in a frame does nothing): the primary camera in
      *  the planet's frame (cm, no scale). Moves the levels' windows, re-anchors levels the camera
@@ -128,6 +132,7 @@ private:
     };
     TArray<FPendingEdit> PendingEdits;
     double SeaRadius = 0.0;
+    uint32 InitSerial = 0;
     FVoxelLandCacheTextures Textures;
     uint64 TexelsWritten = 0;
     uint64 LastTickFrame = MAX_uint64;

@@ -13,7 +13,7 @@ int3 BlockDim;
 int BlockStep;
 uint OutOffset;
 float SampleFootprint;
-uint OutputMode;   // 0 density, 1 |p| - R only, 2 edit delta only
+uint OutputMode;   // 0 density, 1 |p| - R only, 2 the density with the edits applied
 float2 HalfFinest;
 
 uint ContinentOctaves;

@@ -57,7 +57,8 @@ struct FVoxelDensityGPUData
 
     // The terrestrial generator (VoxelLandSample.ush; LandMode 0 for the noise surface). The
     // height is the bake's (m) plus the hills (VoxelLandHills.ush), the peaks (VoxelLandPeaks.ush), the gullies
-    // (VoxelLandGully.ush) and the detail layer,
+    // (VoxelLandGully.ush), the detail layer, the rivers' carve (VoxelLandCarve.ush), and the
+    // climate's layers (dunes, ice sheets, polar surfaces),
     // offset to the height above PlanetRadius; the warp's three layers follow the detail
     // octaves in Octaves.
     uint32 LandMode = 0;

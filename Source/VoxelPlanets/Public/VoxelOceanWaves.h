@@ -88,6 +88,13 @@ public:
     }
     /** The environment at a point at an ocean time. */
     FVoxelOceanEnvironment Sample(const FVector& PlanetPoint, double OceanTime) const { return SampleWeather(PlanetPoint, WeatherTime(OceanTime)); }
+    /** R2 (F4): this source fixed to its current state, for many batches that must agree (one
+     *  weather key's build, in parallel chunks): the atmosphere's weather pins the map it has now.
+     *  Invalid: already fixed (a pure function of the point and the time). */
+    virtual TSharedPtr<const IVoxelOceanEnvironmentSource, ESPMode::ThreadSafe> Pin() const
+    {
+        return TSharedPtr<const IVoxelOceanEnvironmentSource, ESPMode::ThreadSafe>();
+    }
 };
 
 /** How the FFT model keys the weather (VoxelOceanWeatherTable.h; the ocean's Weather settings). */

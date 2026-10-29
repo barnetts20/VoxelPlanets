@@ -4,10 +4,16 @@
 #include "Misc/Paths.h"
 #include "ShaderCore.h"
 #include "UObject/UObjectGlobals.h"
+#include "Misc/CoreDelegates.h"
 
 #define LOCTEXT_NAMESPACE "FVoxelPlanetsModule"
 
 DEFINE_LOG_CATEGORY(LogVoxelPlanets);
+
+namespace VoxelPlanetsModuleDetail
+{
+    FDelegateHandle NoiseExitHook;
+}
 
 UObject* VoxelPlanets::LoadPluginAsset(UClass* Class, const TCHAR* Name)
 {
@@ -20,6 +26,10 @@ void FVoxelPlanetsModule::StartupModule()
 	// Where the authored noise sets are (found here, on the game thread, for the workers that
 	// read them).
 	VoxelLand::NoiseSetDirectory();
+	// The shared noise packs dropped before the RHI goes (each pack's GPU copy is released on the
+	// render thread). R2 (C1): registered here, on the game thread, not by the first pack made
+	// (a pool worker: core delegates aren't thread-safe).
+	VoxelPlanetsModuleDetail::NoiseExitHook = FCoreDelegates::OnEnginePreExit.AddStatic(&VoxelLand::ReleaseLandNoise);
 
 	// The module loads at PostConfigInit (VoxelPlanets.uplugin) so its global shaders register
 	// before the engine compiles them. Map /Plugin/VoxelPlanets to the plugin's Shaders folder
@@ -35,6 +45,7 @@ void FVoxelPlanetsModule::StartupModule()
 void FVoxelPlanetsModule::ShutdownModule()
 {
 	// The shared noise packs (VoxelLandBake.cpp), if the engine's pre-exit didn't drop them.
+	FCoreDelegates::OnEnginePreExit.Remove(VoxelPlanetsModuleDetail::NoiseExitHook);
 	VoxelLand::ReleaseLandNoise();
 }
 

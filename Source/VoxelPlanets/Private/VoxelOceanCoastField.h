@@ -31,6 +31,7 @@
 #include <atomic>
 
 struct FVoxelLandBake;
+struct FVoxelDensityGPUData;
 class FVoxelOceanShoreField;
 class UTexture2DArray;
 
@@ -47,6 +48,13 @@ struct FVoxelOceanCoastDepthJob
     int32 N = 0;
     double FootprintCm = 0.0;
     int64 Cells = 0;
+    /** R2 (the drain bug): the terrain this job samples. The pages issue a chunk only while
+     *  their density is this one (FVoxelOceanPages::SampleCoastDepths), so a job never mixes two
+     *  terrains' depths: after a planet's rebuild the ocean's new pages hold the old density
+     *  until the actor's inputs reach them later in the tick, and a shore field started in
+     *  between sampled its first million cells (a whole cube face) from the previous seed's
+     *  terrain. Expired or unset: nothing is issued. */
+    TWeakPtr<const FVoxelDensityGPUData> Density;
     /** cm (VoxelOceanPage.usf's CoastDepthCS), written by the render thread chunk by chunk. */
     TArray<float> DepthCm;
     std::atomic<int64> Received{ 0 };

@@ -606,19 +606,27 @@ namespace VoxelLandNoiseDetail
 
     // P1j: the packs kept alive whatever uses them. Pending: those made and not yet taken (by
     // TryGetLandNoise or GetLandNoise), so a planet that waited for one finds it when it asks;
-    // at most PendingCount (a pack prewarmed for a planet that has since moved on to another
-    // goes when four newer ones are made). Kept: after they were taken, the
+    // R2 (C2): at most PendingCount, each for about PendingSeconds (a pack prewarmed for a planet
+    // that has since moved on goes at the next store, take or prewarm after that; with four,
+    // several planets warming at once evicted each other's packs before their bakes were done,
+    // and each re-read its pack). Kept: after they were taken, the
     // voxel.Land.NoisePacksKept most recently taken (none by default: a pack then lives exactly
     // as long as a planet or a density holds it). R1a kept the four most recently made, so up to
     // three packs (each ~224 MB of words and a ~224 MB GPU copy) outlived the reseeds that
     // replaced them.
-    constexpr int32 PendingCount = 4;
+    constexpr int32 PendingCount = 8;
+    constexpr double PendingSeconds = 120.0;
     using FPackRef = TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>;
+    struct FPendingPack
+    {
+        FPackRef Pack;
+        double MadeSeconds = 0.0;
+    };
 
     FCriticalSection Lock;        // Entries, Pending, Kept, the folder's list, the flags (held briefly)
     FCriticalSection MakeLock;    // one pack made at a time (held while reading or generating)
     TMap<FString, FEntry> Entries;
-    TArray<FPackRef> Pending;
+    TArray<FPendingPack> Pending;
     TArray<FPackRef> Kept;
     FString Directory;            // NoiseSetDirectory, found on the game thread (StartupModule)
     bool bDirectoryKnown = false;
@@ -632,7 +640,6 @@ namespace VoxelLandNoiseDetail
     TArray<FString> AuthoredIce;      // T5d2
     TArray<FString> AuthoredPolar;    // T5d3
     bool bListed = false;
-    bool bExitHooked = false;
     bool bClosed = false;         // ReleaseLandNoise ran (the engine is exiting)
 
     /** Appends a chain (Texels: ChainTexels(N) texels, 4 x u16 each) to Out's words from a whole
@@ -1167,6 +1174,24 @@ namespace VoxelLandNoiseDetail
         return Out;
     }
 
+    /** R2 (C2, C9): lets go the pending packs past PendingCount or older than PendingSeconds,
+     *  and the kept ones past voxel.Land.NoisePacksKept (Lock held; what goes is moved to
+     *  Dropped, released after the lock). Run on every store, take and prewarm. */
+    void PruneLocked(TArray<FPackRef>& Dropped)
+    {
+        const double Now = FPlatformTime::Seconds();
+        for (int32 i = Pending.Num() - 1; i >= 0; i--)
+        {
+            if (i >= PendingCount || Now - Pending[i].MadeSeconds > PendingSeconds)
+            {
+                Dropped.Add(MoveTemp(Pending[i].Pack));
+                Pending.RemoveAt(i, 1, EAllowShrinking::No);
+            }
+        }
+        const int32 Keep = FMath::Clamp(CVarVoxelLandNoisePacksKept.GetValueOnAnyThread(), 0, 16);
+        while (Kept.Num() > Keep) Dropped.Add(Kept.Pop(EAllowShrinking::No));
+    }
+
     /** Stores Pack under Key (Lock taken here). */
     void Store(const FString& Key, const TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe>& Pack)
     {
@@ -1181,16 +1206,12 @@ namespace VoxelLandNoiseDetail
         Entry.bReady = true;
         if (Pack.IsValid())
         {
-            Pending.Remove(Pack);
-            Pending.Insert(Pack, 0);
-            while (Pending.Num() > PendingCount) Dropped.Add(Pending.Pop(EAllowShrinking::No));
+            Pending.RemoveAll([&Pack](const FPendingPack& P) { return P.Pack == Pack; });
+            Pending.Insert(FPendingPack{ Pack, FPlatformTime::Seconds() }, 0);
         }
-        // Dropped before the RHI goes (each pack's GPU copy is released on the render thread).
-        if (!bExitHooked)
-        {
-            bExitHooked = true;
-            FCoreDelegates::OnEnginePreExit.AddStatic(&VoxelLand::ReleaseLandNoise);
-        }
+        PruneLocked(Dropped);
+        // (R2, C1: the engine-exit hook that drops the packs before the RHI goes is registered by
+        // the module's startup, on the game thread: core delegates aren't for workers.)
     }
 
     /** Whether Key's pack is there (Lock held): its pack (null if none could be made). */
@@ -1214,11 +1235,11 @@ namespace VoxelLandNoiseDetail
     void TakeLocked(const FPackRef& Pack, TArray<FPackRef>& Dropped)
     {
         if (!Pack.IsValid() || bClosed) return;
-        Pending.Remove(Pack);
+        Pending.RemoveAll([&Pack](const FPendingPack& P) { return P.Pack == Pack; });
         const int32 Keep = FMath::Clamp(CVarVoxelLandNoisePacksKept.GetValueOnAnyThread(), 0, 16);
         Kept.Remove(Pack);
         if (Keep > 0) Kept.Insert(Pack, 0);
-        while (Kept.Num() > Keep) Dropped.Add(Kept.Pop(EAllowShrinking::No));
+        PruneLocked(Dropped);
     }
 
     void Take(const FPackRef& Pack)
@@ -1578,9 +1599,12 @@ void VoxelLand::PrewarmLandNoise(const FString& Key)
     using namespace VoxelLandNoiseDetail;
     if (Key.IsEmpty()) return;
     {
+        // (R2, C9: declared before the lock, so a last reference goes after it.)
+        TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Pack;
+        TArray<FPackRef> Dropped;
         FScopeLock ScopeLock(&Lock);
         if (bClosed) return;
-        TSharedPtr<const FVoxelLandNoiseSet, ESPMode::ThreadSafe> Pack;
+        PruneLocked(Dropped);
         if (FindReadyLocked(Key, Pack)) return;
         FEntry& Entry = Entries.FindOrAdd(Key);
         if (Entry.bPending) return;
@@ -1599,12 +1623,17 @@ void VoxelLand::PrewarmLandNoise(const FString& Key)
 void VoxelLand::ReleaseLandNoise()
 {
     using namespace VoxelLandNoiseDetail;
-    FScopeLock ScopeLock(&Lock);
-    // The engine is exiting: a pack still being made is handed to its caller but not kept.
-    bClosed = true;
-    Entries.Empty();
-    Pending.Empty();
-    Kept.Empty();
+    // (R2, C9: the packs go after the lock.)
+    TArray<FPendingPack> DroppedPending;
+    TArray<FPackRef> DroppedKept;
+    {
+        FScopeLock ScopeLock(&Lock);
+        // The engine is exiting: a pack still being made is handed to its caller but not kept.
+        bClosed = true;
+        Entries.Empty();
+        DroppedPending = MoveTemp(Pending);
+        DroppedKept = MoveTemp(Kept);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1822,7 +1851,7 @@ void VoxelLand::ShapeFor(const FVoxelTerrestrialSettings& Settings, const FVoxel
     TRACE_CPUPROFILER_EVENT_SCOPE(VoxelLand::ShapeFor);
     // The B-spline and the face blend are convex combinations of the cells, so the bake's
     // range holds; the detail layer reaches at most its set's bound times its amplitude (N1:
-    // VoxelNoiseTiles::DetailStatsOf, a percent over; 2.5 without the pack's detail set), the
+    // VoxelNoiseTiles::DetailStatsOf, a percent over; none without the pack's detail set), the
     // gullies GullyReach either way, the hills HillMaxUnit times their relief (up; down by
     // less), the peaks PeakReach up (and down from the land's lowest, sea level), and a metre of
     // margin either side.
@@ -1958,6 +1987,20 @@ namespace VoxelLandCache
     /** Deletes the oldest bake files beyond MaxFiles. */
     void Trim(const FString& Directory)
     {
+        // R2 (C5): a save interrupted (the process killed mid-write, or a failed move) leaves its
+        // temporary file: those older than ten minutes go (one in flight is seconds old).
+        {
+            TArray<FString> Temps;
+            IFileManager::Get().FindFiles(Temps, *FPaths::Combine(Directory, TEXT("Bake_*.tmp")), true, false);
+            const FDateTime Old = FDateTime::UtcNow() - FTimespan::FromMinutes(10.0);
+            for (const FString& Name : Temps)
+            {
+                const FString Path = FPaths::Combine(Directory, Name);
+                const FDateTime Stamp = IFileManager::Get().GetTimeStamp(*Path);
+                if (Stamp != FDateTime::MinValue() && Stamp < Old)
+                    IFileManager::Get().Delete(*Path, false, true, true);
+            }
+        }
         TArray<FString> Files;
         IFileManager::Get().FindFiles(Files, *FPaths::Combine(Directory, TEXT("Bake_*.vlb")), true, false);
         if (Files.Num() <= MaxFiles) return;
@@ -2529,6 +2572,7 @@ FVoxelLandBaker::FVoxelLandBaker(const FVoxelTerrestrialSettings& InSettings, do
     : Settings(InSettings)
     , SeaRadius(InSeaRadius)
     , Key(VoxelLand::BakeKey(InSettings, InSeaRadius))
+    , bErode(VoxelLand::IsErosionEnabled())
     , N(VoxelLand::BakeResolutionFor(InSettings))
 {
     // The noise pack (the peaks', detail, hills' and strata's sets), read or generated meanwhile (the density
@@ -2793,6 +2837,7 @@ void FVoxelLandBaker::StartGpu()
         // The tan table the sampler uses, for the solve's cell directions.
         const TSharedPtr<FVoxelLandBake, ESPMode::ThreadSafe> Grid = VoxelLandBakeDetail::MakeBake(Job->Inputs);
         VoxelLandSolve::FSettings SolveSettings = VoxelLandBakeDetail::MakeSolveSettings(Settings, Job->Inputs, Grid->TanTable);
+        SolveSettings.bErode = bErode;
         Job->bErode = SolveSettings.bErode;
         Job->Solve = MakeUnique<VoxelLandSolve::FJob>(MoveTemp(SolveSettings));
     }
@@ -3060,7 +3105,19 @@ namespace VoxelLandBakeDetail
             }
             else
             {
-                RecordRiverJob(GraphBuilder, Job, R.Needed);
+                // R2 (C3): the bake's fields uploaded again if they were released since the first
+                // record (ReleaseBakeGPU; a no-op when they are there): the re-record registers them.
+                const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> Again = Job.Bake.Pin();
+                if (!Again.IsValid() || !Job.BakeGPU.IsValid())
+                {
+                    Job.Rec.SafeRelease();
+                    Job.Status.store(-1, std::memory_order_release);
+                }
+                else
+                {
+                    UploadFields(GraphBuilder, *Again, *Job.BakeGPU, true);
+                    RecordRiverJob(GraphBuilder, Job, R.Needed);
+                }
             }
         }
         }
@@ -3086,7 +3143,7 @@ TSharedPtr<const FVoxelLandRiverSet, ESPMode::ThreadSafe> VoxelLand::GetRivers(c
 
 void VoxelLand::ReleaseBakeGPU(const FVoxelLandBake& Bake)
 {
-    // Not while a river build reads them (it uploads what it needs itself).
+    // (A river build being recorded uploads what it needs itself, on every record: R2, C3.)
     if (!Bake.GPU.IsValid()) return;
     ENQUEUE_RENDER_COMMAND(VoxelLandReleaseBakeGPU)([GPU = Bake.GPU](FRHICommandListImmediate&)
         {

@@ -58,7 +58,11 @@ float2 VoxelOceanRainLayerOf(float2 Base, float2 Offset, float Cell, float Perio
             const float Phase = VoxelOceanRainUnit(VoxelOceanRainHash(Cu, Salt));
             const float Cycle = Time / Period + Phase;
             const float Age = frac(Cycle);
-            const uint Drop = VoxelOceanRainHash(Cu + uint2(uint(int(floor(Cycle)) & 0xffff) * 0x9e37u, 0x2c1bu), Salt + 7u);
+            // (R2, I1: the cycle's index taken over the clock's hour wrap, so the drops go on across
+            // it instead of re-rolling every ring in flight once an hour.)
+            const uint Cycles = uint(3600.0f / Period + 0.5f);
+            const uint Index = uint(int(floor(Cycle))) % Cycles;
+            const uint Drop = VoxelOceanRainHash(Cu + uint2((Index & 0xffffu) * 0x9e37u, 0x2c1bu), Salt + 7u);
             if (VoxelOceanRainUnit(Drop) >= Rain) continue;
             const float2 Centre = C + 0.15f + 0.7f * float2(VoxelOceanRainUnit(Drop * 747796405u), VoxelOceanRainUnit(Drop * 2891336453u));
             const float2 D = P - Centre;

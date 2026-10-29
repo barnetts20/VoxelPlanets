@@ -11,7 +11,7 @@
 #include "/Plugin/VoxelPlanets/Private/VoxelOceanCharts.ush"
 #include "/Plugin/VoxelPlanets/Private/VoxelOceanShore.ush"
 
-StructuredBuffer<float> ShoreHeight;     // the bake's heights (m)
+StructuredBuffer<float> ShoreHeight;     // the heights (m): the terrain's at the bake's cells (W7d), else the bake's
 StructuredBuffer<uint> ShoreSea;         // the sea-connected bit (Attr bit 11), 32 cells a word
 StructuredBuffer<uint> ShoreSeedsIn;     // the pass before's seeds (JumpCS, PackCS)
 RWStructuredBuffer<uint> ShoreSeedsOut;  // SeedCS, JumpCS

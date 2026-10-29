@@ -18,7 +18,23 @@ double FVoxelOceanAtmosphereWeather::WeatherTime(double OceanTime) const
 
 TSharedPtr<const FAtmosphereWeatherMap, ESPMode::ThreadSafe> FVoxelOceanAtmosphereWeather::LatestMap() const
 {
+    if (PinnedMap.IsValid()) return PinnedMap;
     return Feed.IsValid() ? Feed->Latest() : TSharedPtr<const FAtmosphereWeatherMap, ESPMode::ThreadSafe>();
+}
+
+TSharedPtr<const IVoxelOceanEnvironmentSource, ESPMode::ThreadSafe> FVoxelOceanAtmosphereWeather::Pin() const
+{
+    const TSharedPtr<FVoxelOceanAtmosphereWeather, ESPMode::ThreadSafe> Copy =
+        MakeShared<FVoxelOceanAtmosphereWeather, ESPMode::ThreadSafe>(Feed, Fallback, MeanWind, SwellShare);
+    Copy->PinnedMap = LatestMap();
+    // (No map yet: the fallback answers, itself pinned if it can be.)
+    if (!Copy->PinnedMap.IsValid() && Fallback.IsValid())
+    {
+        const TSharedPtr<const IVoxelOceanEnvironmentSource, ESPMode::ThreadSafe> PinnedFallback = Fallback->Pin();
+        if (PinnedFallback.IsValid()) return PinnedFallback;
+        return Fallback;
+    }
+    return Copy;
 }
 
 bool FVoxelOceanAtmosphereWeather::HasMap() const

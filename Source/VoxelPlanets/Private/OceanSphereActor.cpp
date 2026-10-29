@@ -823,7 +823,16 @@ FVoxelOceanEnvironment AOceanSphereActor::GetEnvironment() const
 
 bool AOceanSphereActor::HasShoreFieldFor(uint32 BakeKey) const
 {
-    return ShoreField.IsValid() && ShoreField->BakeKey == BakeKey;
+    return ShoreField.IsValid() && ShoreField->BakeKey == BakeKey && ShoreField->Terrain.Pin() == GPUDensity;
+}
+
+void AOceanSphereActor::ReleaseShoreField()
+{
+    ShoreField.Reset();
+    CoastField.Reset();
+    ShoreTexture = nullptr;
+    ShoreResource = nullptr;
+    ShoreRHI.Reset();
 }
 
 void AOceanSphereActor::UpdateShoreField()
@@ -837,26 +846,36 @@ void AOceanSphereActor::UpdateShoreField()
         Bake = FVoxelTerrestrialDensity::Of(*Compositor)->GetLandBake();
     // As last applied: a slider drag doesn't start a build every frame.
     const double ReachM = FMath::Max(AppliedSettings.ShoreFieldReach, 1.0) * 1000.0;
-    const bool bHave = ShoreField.IsValid() && Bake.IsValid() && ShoreField->BakeKey == Bake->Key && ShoreField->N == Bake->N
-        && ShoreField->RadiusCm == OceanRadius && ShoreField->ReachM == ReachM;
+    // R2 (the drain bug): the field is the drawn terrain's (stage W7d), so it is current only for
+    // this bake and this terrain (the ocean's density, made again with every planet rebuild).
+    const bool bSameBake = ShoreField.IsValid() && Bake.IsValid() && ShoreField->BakeKey == Bake->Key && ShoreField->N == Bake->N
+        && ShoreField->RadiusCm == OceanRadius;
+    const bool bSameTerrain = bSameBake && ShoreField->Terrain.Pin() == GPUDensity;
+    const bool bHave = bSameTerrain && ShoreField->ReachM == ReachM;
     if (!Bake.IsValid())
     {
         if (ShoreField.IsValid() || !ShoreBuilder->IsDone()) ShoreBuilder->Reset();
-        ShoreField.Reset();
-        ShoreTexture = nullptr;
-        ShoreResource = nullptr;
-        ShoreRHI.Reset();
+        ReleaseShoreField();
         return;
     }
-    // (The field held, when it is this bake's at this radius, lends its terrain heights.)
-    if (!bHave && !ShoreBuilder->IsFor(Bake.Get(), OceanRadius, ReachM))
-        ShoreBuilder->Start(Bake, OceanRadius, ReachM, ShoreField.Get());
+    // R2: a field made for another bake (the previous seed's, after a reseed) is let go at once
+    // rather than shown until the new one lands: its coasts aren't this planet's, so the drain
+    // and the basins' cull would sink or hide open sea wherever the old planet had land. Until
+    // the new field lands the sea is open water everywhere, as on a first build. A field for
+    // another terrain on the same bake (a rebuild for the climate's layers, the warp) is near
+    // this one's and stays until the new one lands, as one for this terrain at another reach
+    // does; only a field for this very terrain lends its heights (FVoxelOceanShoreBuilder::Start).
+    if (ShoreField.IsValid() && !bSameBake)
+        ReleaseShoreField();
+    // (The field held, when it is this bake's and terrain's at this radius, lends its terrain heights.)
+    if (!bHave && !ShoreBuilder->IsFor(Bake.Get(), GPUDensity, OceanRadius, ReachM))
+        ShoreBuilder->Start(Bake, OceanRadius, ReachM, GPUDensity, ShoreField.Get());
     // (Stage W7d: the terrain's heights at the bake's cells sampled through the surface first.)
     ShoreBuilder->Tick([this](const TSharedPtr<FVoxelOceanCoastDepthJob, ESPMode::ThreadSafe>& Job, int64 First, int32 Count)
         {
             return Surface.IsValid() && Surface->SampleCoastDepths(Job, First, Count);
         });
-    if (!bHave && ShoreBuilder->IsDone() && ShoreBuilder->IsFor(Bake.Get(), OceanRadius, ReachM))
+    if (!bHave && ShoreBuilder->IsDone() && ShoreBuilder->IsFor(Bake.Get(), GPUDensity, OceanRadius, ReachM))
     {
         const TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> Made = ShoreBuilder->GetResult();
         if (Made.IsValid() && Made != ShoreField)
@@ -868,11 +887,8 @@ void AOceanSphereActor::UpdateShoreField()
         }
         else if (!Made.IsValid() && ShoreField.IsValid())
         {
-            // The rebuild failed: no field rather than one for another bake, radius or reach.
-            ShoreField.Reset();
-            ShoreTexture = nullptr;
-            ShoreResource = nullptr;
-            ShoreRHI.Reset();
+            // The rebuild failed: no field rather than one for another bake, terrain, radius or reach.
+            ReleaseShoreField();
         }
     }
     // The texture's resource made again (it is ours alone, but a device reset or an editor
@@ -1148,6 +1164,16 @@ void AOceanSphereActor::InitializeInternal(TSharedPtr<FDensitySampleCompositor> 
     if (Compositor.IsValid() && FVoxelPlanetDensity::Of(*Compositor).IsValid())
         GPUDensity = FVoxelPlanetDensity::Of(*Compositor)->GetGPUData();
     AppliedSettings = OceanSettings;
+    // R2: a shore field for another bake goes now (UpdateShoreField's rule), so not even this
+    // call's underwater snapshot hands the old planet's field on.
+    if (ShoreField.IsValid())
+    {
+        TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> NewBake;
+        if (Compositor.IsValid() && FVoxelTerrestrialDensity::Of(*Compositor).IsValid())
+            NewBake = FVoxelTerrestrialDensity::Of(*Compositor)->GetLandBake();
+        if (!NewBake.IsValid() || ShoreField->BakeKey != NewBake->Key || ShoreField->N != NewBake->N || ShoreField->RadiusCm != OceanRadius)
+            ReleaseShoreField();
+    }
 
     // The FFT cascades' textures: the arrays once, the chart table again for a new radius (the
     // underwater pass keeps its own references to the old one's RHI texture until replaced).
@@ -1375,6 +1401,14 @@ void AOceanSphereActor::StartPerfSweep(int32 FramesPerStep, int32 Rounds)
                 PerfSweep.SavedVars.Add(Name, Var->GetString());
                 Var->Set(TEXT("0"), ECVF_SetByConsole);
             }
+        }
+        // (R2, F6: and the steps' own switches, put back as they were, not at 1.)
+        for (int32 StepIndex = 0; StepIndex < VoxelOceanPerfSweep::NumSteps; StepIndex++)
+        {
+            const TCHAR* StepVar = VoxelOceanPerfSweep::Steps[StepIndex].CVar;
+            if (!StepVar || PerfSweep.SavedVars.Contains(StepVar)) continue;
+            if (IConsoleVariable* Var = CM.FindConsoleVariable(StepVar))
+                PerfSweep.SavedVars.Add(StepVar, Var->GetString());
         }
     }
     // Stage W8e: the weather's clock held where it is (the procedural weather's): no weather key
@@ -1780,7 +1814,7 @@ void AOceanSphereActor::UpdateLandCache(const APlanetTerrainActor* Terrain)
         LandCacheIdleFrames = FMath::Min(LandCacheIdleFrames, 1000);
         return;
     }
-    if (!LandCacheRHI.IsValid() || !LandCacheRHI->IsFor(Cache->GetTextures(), Cache->GetSeaRadius(), OceanRadius))
-        LandCacheRHI = FVoxelOceanLandCacheRHI::Make(Cache->GetTextures(), Cache->GetSeaRadius(), OceanRadius);
+    if (!LandCacheRHI.IsValid() || !LandCacheRHI->IsFor(Cache->GetTextures(), Cache->GetInitSerial(), Cache->GetSeaRadius(), OceanRadius))
+        LandCacheRHI = FVoxelOceanLandCacheRHI::Make(Cache->GetTextures(), Cache->GetInitSerial(), Cache->GetSeaRadius(), OceanRadius);
     LandCacheEditSequence = Cache->GetSettledEditSequence();
 }

@@ -173,6 +173,6 @@ namespace VoxelDensityGPUCheck
 
     FAutoConsoleCommandWithWorldAndArgs Command(
         TEXT("voxel.Debug.DensityGPUCheck"),
-        TEXT("Samples the density on the GPU and the CPU around the surface below the camera and logs the differences. Args: number of levels (default 8); 'radial' compares |p| - R only (no noise); 'edits' compares the edit deltas only."),
+        TEXT("Samples the density on the GPU and the CPU around the surface below the camera and logs the differences. Args: number of levels (default 8); 'radial' compares |p| - R only (no noise); 'edits' compares the density with the edits applied."),
         FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Run));
 }

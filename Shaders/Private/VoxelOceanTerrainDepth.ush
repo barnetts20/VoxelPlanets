@@ -72,7 +72,9 @@ float LandCacheSeaOffset;
 #include "/Plugin/VoxelPlanets/Private/VoxelLandCache.ush"
 #include "/Plugin/VoxelPlanets/Private/VoxelLandCacheSample.ush"
 
-// The depth of a vertex in an inland basin (cm): land, well past any cull height.
+// The depth of a vertex in an inland basin (cm): land. Past the rings' cull height wherever their
+// cells are under ~1 km; the far sphere, whose cells are kilometres, tests for it directly
+// (VoxelOceanRings.usf, R2).
 #define VOXEL_OCEAN_BASIN_DEPTH (-1.0e6f)
 // The bed's slope is measured where the depth lies within these (cm; the surf's trains reach at
 // most 0.8 of the coastal field's seed depth, 32 m at the defaults: stage O9i), and at footprints up to

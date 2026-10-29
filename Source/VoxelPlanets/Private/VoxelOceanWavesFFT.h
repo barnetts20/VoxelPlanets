@@ -3,8 +3,11 @@
 // IVoxelOceanWaveModel, for the surface query on any thread, and the parameters the shaders
 // take.
 //
-// WHAT IT HOLDS (immutable once built; a change of settings, or of the reach's wind past a step,
-// builds a new model):
+// WHAT IT HOLDS (immutable once built; a change of settings builds a new model; a step of the
+// reach's wind (P1g) makes one from the held model that shares its charts, query prototypes and
+// computed frames, recomputing only the reach. Its live settings (the foam's: FoamWhitecap,
+// SurfFoam) are the last full build's, and aren't authoritative: the surface writes them from its
+// inputs):
 // - the slot layout (VoxelOceanSpectrum::MakeSlots: the long bands at three sea states, the short
 //   bands at a reference wind, ShortReferenceWind) and its GPU table, which the surface hands to
 //   the cascades (FVoxelOceanCascades);

@@ -202,7 +202,13 @@ void RingCS(uint3 DispatchThreadId : SV_DispatchThreadID)
     const uint FV = V - RingVerticesAll;
     const float3 Dir = FarDirections[FV].xyz;
     const float Land = FarLand[FV];
-    if (VoxelOceanRingUnderLand(Land, RingCull.w))
+    // R2 (G2): an inland basin (FarDepthCS's VOXEL_OCEAN_BASIN_DEPTH, exactly -1e6 cm) is culled
+    // whatever the far cell's slope reach: past ~80 km of sea radius that reach outgrew the
+    // sentinel, and from altitude every basin below sea level drew as open sea. The sentinel is
+    // matched exactly: land over 10 km high reads below -1e6 too, and stays under the reach test.
+    // A basin is ringed by land above the sea, which covers the dropped triangles' edges; one
+    // within a far cell of open sea can leave a cell-wide gap there (seen only from far off).
+    if (VoxelOceanRingUnderLand(Land, RingCull.w) || (RingCull.x >= 0.0f && Land == -1.0e6f))
     {
         VoxelOceanRingWriteNothing(V);
         return;

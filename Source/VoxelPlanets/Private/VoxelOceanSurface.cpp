@@ -150,6 +150,12 @@ void FVoxelOceanSurface::Initialize(AActor* InOwner, USceneComponent* InAttachRo
     UploadedTable = 0;
     UploadedTexture = nullptr;
     ShoreFrameTexture = nullptr;
+    // R2 (the drain bug): new pages never start from the inputs the last ones had: after a
+    // planet's rebuild those are the previous terrain's (its density, edits and shore field),
+    // and the shore field's first sampling chunks read them. The actor's next SetInputs (before
+    // the surface's tick) brings the current ones.
+    bHasInputs = false;
+    Inputs = FVoxelOceanSurfaceInputs();
     // A server, or a commandlet, draws nothing.
     bAvailable = FApp::CanEverRender() && InOwner && InAttachRoot && Settings.Radius > 0.0;
     if (!bAvailable) return;
@@ -161,8 +167,6 @@ void FVoxelOceanSurface::Initialize(AActor* InOwner, USceneComponent* InAttachRo
     Clip.bOn = Clip.bOn && Settings.bWavesInCompute;
     Pages->SetClipmap(Clip);
     bClipBound = false;
-    if (bHasInputs)
-        Pages->SetDensityInputs(Inputs.Density);
     if (WaveModel.IsValid())
         Pages->SetWaveReach(FVector2d(WaveModel->MaxHeight(), WaveModel->MaxHorizontal()).Size());
     if (Settings.CascadeTextures.IsValid())
@@ -316,14 +320,14 @@ void FVoxelOceanSurface::UpdateCoast()
     if (CoastBuild.IsValid() && CoastBuild.IsReady())
     {
         TSharedPtr<const VoxelOceanTiles::FCoastSet, ESPMode::ThreadSafe> Built = CoastBuild.Get();
-        const void* BuiltFor = CoastBuildField;
+        const TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> BuiltFor = CoastBuildField.Pin();
         CoastBuild = TFuture<TSharedPtr<const VoxelOceanTiles::FCoastSet, ESPMode::ThreadSafe>>();
-        CoastBuildField = nullptr;
+        CoastBuildField.Reset();
         // A build for another radius (the surface initialized again since) is dropped.
-        if (BuiltFor == Field && Field && Built.IsValid() && Built->GetRadius() == Settings.Radius)
+        if (BuiltFor.Get() == Field && Field && Built.IsValid() && Built->GetRadius() == Settings.Radius)
         {
             Coast = Built;
-            CoastField = Field;
+            CoastField = BuiltFor;
             CoastBounds.Reset();
             CoastBoundsOld.Reset();
             UE_LOG(LogVoxelPlanets, Log, TEXT("[VoxelOcean] Coast for the mesh's split bias: %d segments."), Coast->Num());
@@ -333,26 +337,30 @@ void FVoxelOceanSurface::UpdateCoast()
     if (Coast.IsValid() && Coast->GetRadius() != Settings.Radius)
     {
         Coast.Reset();
-        CoastField = nullptr;
+        CoastField.Reset();
         CoastBounds.Reset();
         CoastBoundsOld.Reset();
     }
-    if (Field == CoastField) return;
-    // No field: no coast (the next selection writes every tile again without codes). A new field:
-    // the old coast stays until the new one's build is done (the tiles and the selection agree on
-    // whichever they carry), then the next selection writes every tile again with it.
+    // No field: no coast (the next selection writes every tile again without codes). Tested
+    // first (R2): an expired weak key pins to null, which would match a field gone to null. A new
+    // field: the old coast stays until the new one's build is done (the tiles and the selection
+    // agree on whichever they carry), then the next selection writes every tile again with it.
     if (!Field)
     {
-        Coast.Reset();
-        CoastField = nullptr;
-        CoastBounds.Reset();
-        CoastBoundsOld.Reset();
+        if (Coast.IsValid())
+        {
+            Coast.Reset();
+            CoastField.Reset();
+            CoastBounds.Reset();
+            CoastBoundsOld.Reset();
+        }
         return;
     }
+    if (Field == CoastField.Pin().Get()) return;
     if (CoastBuild.IsValid()) return;
     TSharedPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> Shore = Inputs.Shore;
     const double Radius = Settings.Radius;
-    CoastBuildField = Field;
+    CoastBuildField = Shore;
     CoastBuild = Async(EAsyncExecution::ThreadPool, [Shore, Radius]() -> TSharedPtr<const VoxelOceanTiles::FCoastSet, ESPMode::ThreadSafe>
         {
             return MakeShared<VoxelOceanTiles::FCoastSet, ESPMode::ThreadSafe>(Shore->Coastline(), Radius);
@@ -817,20 +825,23 @@ void FVoxelOceanSurface::UpdateProbe(const FVector& Camera)
     const TSharedPtr<FVoxelOceanProbeState, ESPMode::ThreadSafe> State = Pages->GetProbeState();
     if (State.IsValid() && State->bRetry.exchange(false, std::memory_order_acq_rel))
         bProbed = false;
-    bool bSame = bProbed && ProbeDensity == Inputs.Density.Density.Get() && ProbeEdits == Inputs.Density.Edits.Get()
-        && ProbeShore == Inputs.Density.Shore.Get() && ProbeSequence == Inputs.WrittenEditSequence && ProbeHalfFinest == Inputs.Density.HalfFinest
-        && ProbeDepthFootprint == Inputs.Density.DepthFootprintCm && ProbeLandCache == Inputs.Density.LandCache.Get();
+    bool bSame = bProbed && ProbeDensity.Pin() == Inputs.Density.Density && ProbeEdits.Pin() == Inputs.Density.Edits
+        && ProbeShore.Pin() == Inputs.Density.Shore && ProbeSequence == Inputs.WrittenEditSequence && ProbeHalfFinest == Inputs.Density.HalfFinest
+        && ProbeDepthFootprint == Inputs.Density.DepthFootprintCm && ProbeLandCache.Pin() == Inputs.Density.LandCache
+        && ProbeMargin == Inputs.Density.ShoreMarginCm && ProbeDensityVersion == Pages->GetDensityVersion();
     for (int32 L = 0; bSame && L < VoxelOceanDepthProbe::Levels; L++)
         bSame = ProbeAnchors[L] == Levels.Anchor[L];
     if (bSame) return;
     Pages->ProbeDepth(Levels, Settings.Radius);
     for (int32 L = 0; L < VoxelOceanDepthProbe::Levels; L++)
         ProbeAnchors[L] = Levels.Anchor[L];
-    ProbeDensity = Inputs.Density.Density.Get();
-    ProbeEdits = Inputs.Density.Edits.Get();
-    ProbeShore = Inputs.Density.Shore.Get();
+    ProbeDensity = Inputs.Density.Density;
+    ProbeEdits = Inputs.Density.Edits;
+    ProbeShore = Inputs.Density.Shore;
     ProbeSequence = Inputs.WrittenEditSequence;
-    ProbeLandCache = Inputs.Density.LandCache.Get();
+    ProbeLandCache = Inputs.Density.LandCache;
+    ProbeMargin = Inputs.Density.ShoreMarginCm;
+    ProbeDensityVersion = Pages->GetDensityVersion();
     ProbeHalfFinest = Inputs.Density.HalfFinest;
     ProbeDepthFootprint = Inputs.Density.DepthFootprintCm;
     bProbed = true;

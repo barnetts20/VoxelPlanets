@@ -174,8 +174,11 @@ FVoxelOceanLace VoxelOceanFoamTexAt(float2 Base, float2 Offset, float Density, f
         const float W1 = 1.0f - abs(2.0f * Ph1 - 1.0f);
         const float W2 = 1.0f - W1;
         const float Drift = VOXEL_OCEAN_FOAM_TEX_CHURN_SPEED * VOXEL_OCEAN_FOAM_TEX_CHURN_PERIOD * InvTile;
-        const uint K1 = uint(int(C1) & 0xffff);
-        const uint K2 = uint(int(C2) & 0xffff);
+        // (R2, I1: the cycles counted over the clock's hour wrap, 2250 of them, so the churn's
+        // offsets go on across it.)
+        const uint ChurnCycles = uint(3600.0f / VOXEL_OCEAN_FOAM_TEX_CHURN_PERIOD + 0.5f);
+        const uint K1 = (uint(int(C1)) % ChurnCycles) & 0xffffu;
+        const uint K2 = (uint(int(C2)) % ChurnCycles) & 0xffffu;
         const float2 J1 = float2(VoxelOceanLaceUnit(VoxelOceanLaceHash(K1, Seed, 0x9e3779b9u)), VoxelOceanLaceUnit(VoxelOceanLaceHash(K1, Seed, 0x7f4a7c15u)));
         const float2 J2 = float2(VoxelOceanLaceUnit(VoxelOceanLaceHash(K2 ^ 0x5555u, Seed, 0x9e3779b9u)), VoxelOceanLaceUnit(VoxelOceanLaceHash(K2 ^ 0x5555u, Seed, 0x7f4a7c15u)));
         const float Z1 = VoxelOceanFoamTexSample(Set, SetSampler, UVW + J1 + float2(Drift * Ph1, 0.0f), Lod, Texels, bCubic).z;

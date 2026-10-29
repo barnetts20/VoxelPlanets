@@ -260,13 +260,18 @@ private:
     /** What the depth probe last sampled: its grids' anchors (VoxelOceanDepthProbe::Levels) and
      *  the inputs. */
     FVector ProbeAnchors[4];
-    const void* ProbeDensity = nullptr;
-    const void* ProbeEdits = nullptr;
-    const void* ProbeShore = nullptr;
+    /** (R2, F3/G3: weak pointers, not addresses, and the basin margin too.) */
+    TWeakPtr<const FVoxelDensityGPUData> ProbeDensity;
+    TWeakPtr<const FVoxelEditGPUData> ProbeEdits;
+    TWeakPtr<const FVoxelOceanShoreRHI, ESPMode::ThreadSafe> ProbeShore;
     uint32 ProbeSequence = 0;
-    const void* ProbeLandCache = nullptr;
+    TWeakPtr<const FVoxelOceanLandCacheRHI, ESPMode::ThreadSafe> ProbeLandCache;
     double ProbeHalfFinest = 0.0;
     double ProbeDepthFootprint = 0.0;
+    double ProbeMargin = 0.0;
+    /** The pages' density version (an input gone to null reads as unchanged through an expired
+     *  weak pointer: the version doesn't). */
+    uint32 ProbeDensityVersion = 0;
     bool bProbed = false;
     bool bClipBound = false;
     bool bTexturesBound = false;
@@ -304,9 +309,11 @@ private:
      *  running; and the coast the tiles on screen carry the codes of (a new coast writes them
      *  all again with the next selection). */
     TSharedPtr<const VoxelOceanTiles::FCoastSet, ESPMode::ThreadSafe> Coast;
-    const void* CoastField = nullptr;
+    /** (R2, F3: weak pointers, not addresses: a field freed and another made at its address
+     *  read as "the same".) */
+    TWeakPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> CoastField;
     TFuture<TSharedPtr<const VoxelOceanTiles::FCoastSet, ESPMode::ThreadSafe>> CoastBuild;
-    const void* CoastBuildField = nullptr;
+    TWeakPtr<const FVoxelOceanShoreField, ESPMode::ThreadSafe> CoastBuildField;
     TSharedPtr<const VoxelOceanTiles::FCoastSet, ESPMode::ThreadSafe> SelectionCoast;
     /** Per node, the least coast distance the material sees over its cap (CoastCapBound), for
      *  Coast: nodes are selected again every frame. */

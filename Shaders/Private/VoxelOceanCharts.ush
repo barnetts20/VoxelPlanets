@@ -315,7 +315,9 @@ VOXEL_FUNC FVoxelOceanChartBlend VoxelOceanChartBlendOf(int Count, FVoxelOceanCh
     for (int k = 0; k < VOXEL_OCEAN_CHART_CANDIDATES; k++)
     {
         if (k >= Count) continue;
-        const float W = smoothstep(Band, 0.0f, Distances.D[k] - Nearest);
+        // (R2, I2: edges in order: SPIR-V and Metal leave a reversed smoothstep undefined. The
+        // same value, bit for bit: (B - d) / B is (d - B) / -B.)
+        const float W = smoothstep(0.0f, Band, Band - (Distances.D[k] - Nearest));
         if (W <= 0.0f) continue;
         // Keep the largest VOXEL_OCEAN_CHART_MAX (more is all but impossible on this grid).
         int Slot = B.Count;

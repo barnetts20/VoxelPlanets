@@ -36,6 +36,8 @@ public:
     virtual double WeatherTime(double OceanTime) const override;
     virtual FVoxelOceanEnvironment SampleWeather(const FVector& PlanetPoint, double WeatherTime) const override;
     virtual void SampleWeatherBatch(TConstArrayView<FVector> PlanetPoints, double WeatherTime, TArrayView<FVoxelOceanEnvironment> Out) const override;
+    /** R2 (F4): a copy that answers from the map landed now, whatever lands after. */
+    virtual TSharedPtr<const IVoxelOceanEnvironmentSource, ESPMode::ThreadSafe> Pin() const override;
 
     /** Whether a map has landed (the fallback answers until then). */
     bool HasMap() const;
@@ -47,6 +49,8 @@ private:
     TSharedPtr<const FAtmosphereWeatherMap, ESPMode::ThreadSafe> LatestMap() const;
 
     TSharedPtr<FAtmosphereWeatherFeed, ESPMode::ThreadSafe> Feed;
+    /** R2 (F4): a pinned copy's map (LatestMap answers it instead of the feed). */
+    TSharedPtr<const FAtmosphereWeatherMap, ESPMode::ThreadSafe> PinnedMap;
     TSharedPtr<const IVoxelOceanEnvironmentSource, ESPMode::ThreadSafe> Fallback;
     double MeanWind = 7.0;
     double SwellShare = 0.6;

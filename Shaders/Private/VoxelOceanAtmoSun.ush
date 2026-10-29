@@ -7,10 +7,11 @@
 // view's rect at 1 / voxel.Ocean.AtmosphereSunScale, each texel the point where its centre's ray
 // meets the sea sphere (its horizon point where it misses), the atmosphere's surface-sun pass at
 // those points (FAtmosphereViewExtension::AddSurfaceSunPass_RenderThread, the march's own
-// Atmo_SurfaceSun), two slices:
+// Atmo_SurfaceSun), three slices:
 // - 0: the sun through the deck's shadow and the air, per channel (rgb); the planet's shadow (a: 1
 //   lit);
-// - 1: the air's transmittance alone (rgb); the march's direct share (a: DirectFraction).
+// - 1: the air's transmittance alone (rgb); the march's direct share (a: DirectFraction);
+// - 2: the weather the rain reads (VoxelOceanRain.ush).
 // The sea sphere is smooth across the view, horizon included, so the grid filters bilinearly without
 // a depth guide; the waves' height is nothing to the shadow map's texels or the air.
 

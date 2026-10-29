@@ -401,6 +401,9 @@ private:
     FVoxelTerrestrialSettings Settings;
     double SeaRadius = 0.0;
     uint32 Key = 0;
+    /** R2 (C4): voxel.Land.Erosion as the key read it: the solve takes this, not the cvar
+     *  later (a flip between would save an eroded bake under the uneroded key). */
+    bool bErode = true;
     int32 N = 0;
     EState State = EState::Start;
     double StartSeconds = 0.0;
@@ -416,7 +419,11 @@ private:
 
 namespace VoxelLand
 {
-    /** Bump when the generator's output changes for the same settings (invalidates caches). */
+    /** Bump when the generator's output changes for the same settings (invalidates caches). R2
+     *  (C4): the cached fields come from VoxelLandBake.usf, VoxelLandPlates.ush,
+     *  VoxelLandSolve.usf/.ush, and VoxelPlugin's VoxelCubeSphere.ush and VoxelDensityCore.ush (the
+     *  gradient noise): a change to any of them, in either plugin, needs a bump here, or cleared
+     *  Saved/VoxelLand. */
     constexpr uint32 GeneratorVersion = 12;   // 7: T3f, belts and the continental slope follow the continents' outline; 8: T3g, channel heads; 9: T3h, the character follows them; 10: T4b, the static surface rises monotonically into the ranges; 11: T4c, the sedimentary province; 12: S1, the routing's drainage exact (fixed point) and its fill from the solve's receivers
 
     /** voxel.Land.Erosion: whether bakes run the erosion solve (part of the key). */
@@ -567,7 +574,9 @@ namespace VoxelLand
     VOXELPLANETS_API FString GlacialNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
 
     /** The ice sheets' set (T5d2): Settings.IceSheetNoiseSet if set ("none": none); else one of the
-     *  folder's `icesheet*` sets by the seed. Empty without ice sheets or swells, or a set. */
+     *  folder's `icesheet*` sets by the seed. Empty without ice sheets or swells, or a set. R2
+     *  (C7): it reaches the density only in a pack, and a pack needs a peaks, hills or detail set
+     *  (LandNoiseNameFor): without all three the swells are left out. */
     VOXELPLANETS_API FString IceSheetNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
 
     /** The ice sheets' smooth maximum's width (m; VoxelLandIce.ush). */
@@ -575,7 +584,8 @@ namespace VoxelLand
 
     /** The polar surfaces' set (T5d3): Settings.PolarNoiseSet if set ("none": none); else one of the
      *  folder's `polar*` sets by the seed. Empty without any of its features (height scales 0) or a
-     *  set (the density leaves it out without the land climate). */
+     *  set (the density leaves it out without the land climate). As the ice sheets' set (C7): only
+     *  with a peaks, hills or detail set. */
     VOXELPLANETS_API FString PolarNoiseNameFor(const FVoxelTerrestrialSettings& Settings);
 
     /** A polar feature's spacing (m; Channel 0 crevasses, 1 sastrugi, 2 polygons): the setting, at

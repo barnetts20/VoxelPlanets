@@ -55,8 +55,8 @@ namespace VoxelShader
         uint LandPeakSeed = 0;
         float LandPeakSpacingM = 0.0f;
         float LandPeakReliefM = 0.0f;
-        float LandPeakReliefStart = 250.0f;
-        float LandPeakReliefEnd = 900.0f;
+        float LandPeakReliefStart = 500.0f;   // (R2, D5: the GPU side's defaults; set whenever read)
+        float LandPeakReliefEnd = 1500.0f;
         float LandPeakMeanR = 0.0f;
         float LandPeakMeanG = 0.0f;
         float LandPeakScaleR = 1.0f;
@@ -495,6 +495,20 @@ FVoxelTerrestrialDensity::FVoxelTerrestrialDensity(const FVoxelTerrestrialSettin
     const bool bClimate = InClimate.IsValid() && InClimate->IsValid();
     if (bClimate && LandHillTexelsPerCell > 0.0f && LandNoise->DuneN > 0)
         LandDuneTexelsPerCell = VoxelLand::DuneTexelsPerCell(InLand, *LandBake, *LandNoise);
+    // R2 (D3): the peaks', hills' and strata's detail placements held to the lattice's range too,
+    // as every other placement (past 2^30 turned texels the float-to-int split is undefined, and
+    // the CPU and the GPU disagree): on very large planets at the finest detail wavelengths.
+    {
+        const double LatticeFaceTexels = UE_SQRT_2 * (0.5 * (double)LandBake->N + 4.0);
+        for (float* PerCell : { &LandPeakDetailTexelsPerCell, &LandHillDetailTexelsPerCell, &LandStrataDetailTexelsPerCell })
+        {
+            if (*PerCell > 0.0f && (double)*PerCell * LatticeFaceTexels >= 1073741824.0)
+            {
+                UE_LOG(LogVoxelPlanets, Warning, TEXT("[VoxelLand] A detail wavelength (the peaks', hills' or strata's) is too fine for this planet's lattice; that detail is left out."));
+                *PerCell = 0.0f;
+            }
+        }
+    }
     // The lattice's range (as the detail layer's): the turned texel coordinates under 2^30.
     const double FaceTexels = UE_SQRT_2 * (0.5 * (double)LandBake->N + 4.0);
     if (LandDuneTexelsPerCell > 0.0f && (double)LandDuneTexelsPerCell * FaceTexels >= 1073741824.0)
@@ -590,11 +604,14 @@ FVoxelTerrestrialDensity::FVoxelTerrestrialDensity(const FVoxelTerrestrialSettin
         || LandPolarDuneTexelsPerCell > 0.0f;
     // The climate, kept for whichever layer reads it (T5e: and the ice shelf's share: the rivers fade
     // on it).
-    bLandIceShelf = InLand.IceShelfHeight > 0.0;
+    // (R2, D1: the shelf only with a climate, as every climate layer: IceShelfHeight defaults to 40,
+    // so a planet with the climate off dereferenced a null field here, on a pool worker since P1i.)
+    bLandIceShelf = bClimate && InLand.IceShelfHeight > 0.0;
     if (LandDuneTexelsPerCell > 0.0f || LandGlacialTexelsPerCell > 0.0f || LandIceMaxThickness > 0.0f || bPolar || bLandIceShelf)
     {
         LandClimate = MoveTemp(InClimate);
-        LandClimateLapse = LandClimate->LapseRate;
+        if (LandClimate.IsValid())
+            LandClimateLapse = LandClimate->LapseRate;
     }
     if (LandGlacialTexelsPerCell > 0.0f)
     {

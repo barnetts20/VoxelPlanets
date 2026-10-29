@@ -26,7 +26,7 @@ DECLARE_GPU_STAT(VoxelLandCacheWrite);   // P1a: its own row in stat gpu
 
 static TAutoConsoleVariable<int32> CVarVoxelLandCacheTexelsPerFrame(
     TEXT("voxel.Land.CacheTexelsPerFrame"), 131072,
-    TEXT("The land surface cache's write budget a frame (texels; a level is 262144). A re-centring level's new frame gets up to half first; window moves next, coarse to fine; refills after, coarse to fine; the re-centring again with what's left."),
+    TEXT("The land surface cache's write budget a frame (texels; a level is 262144; at least 2048, four level rows: an edit's rectangle is written in whole rows, a wide one from a quarter of the budget, R2). A re-centring level's new frame gets up to half first; window moves next, coarse to fine; refills after, coarse to fine; the edits' rectangles (brush-sized ones from up to half the budget, large ones from a quarter); the re-centring again with what's left."),
     ECVF_Default);
 
 static TAutoConsoleVariable<float> CVarVoxelLandCacheReanchorDegrees(
@@ -187,6 +187,9 @@ bool FVoxelLandCache::Initialize(const FVoxelTerrestrialDensity& Density, const 
 {
     TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelLandCache::Initialize);
     Reset();
+    // (R2, G4: game thread: a plain counter.)
+    static uint32 NextInitSerial = 0;
+    InitSerial = ++NextInitSerial;
     const TSharedRef<const FVoxelDensityGPUData, ESPMode::ThreadSafe> Data = Density.GetGPUData();
     if (!Data->Land.IsValid() || !InTextures.IsValid()) return false;
     SeaRadius = Data->Land->SeaRadius;
@@ -361,12 +364,22 @@ void FVoxelLandCache::Tick(const FVector& CameraPlanet)
     }
 
     VoxelLandCachePlan::FSettings Settings;
-    Settings.Budget = CVarVoxelLandCacheTexelsPerFrame.GetValueOnGameThread();
+    // (R2, E3: at least four level rows: a dirty rectangle is written in whole rows, and a whole
+    // window's from a quarter of the budget, so a smaller budget never drained it, and the
+    // settled edit sequence the ocean waits for froze.)
+    Settings.Budget = FMath::Max(CVarVoxelLandCacheTexelsPerFrame.GetValueOnGameThread(), 4 * VOXEL_LAND_CACHE_N);
     Settings.ReanchorDegrees = (double)CVarVoxelLandCacheReanchorDegrees.GetValueOnGameThread();
     const double Direction[3] = { CameraPlanet.X, CameraPlanet.Y, CameraPlanet.Z };
     std::vector<VoxelLandCachePlan::FJob> Jobs;
     Plan->Tick(Direction, Settings, Jobs);
-    if (!Dispatch(Jobs.data(), (int32)Jobs.size())) return;
+    if (!Dispatch(Jobs.data(), (int32)Jobs.size()))
+    {
+        // (R2, E5: the plan has counted these writes as done: written again from scratch, so no
+        // level is marked valid over texels nothing wrote. Unreachable today: IsWritable checks
+        // the same resources just before.)
+        Plan->InvalidateAll();
+        return;
+    }
     LastLiveFrame = GFrameCounter;
     // Every notice the edits set carries is now in the plan's dirty texels (above). Those whose
     // texels the writes so far have all reached are in what they leave; the settled sequence is
