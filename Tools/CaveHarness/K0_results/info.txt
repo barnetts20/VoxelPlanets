@@ -1,0 +1,23 @@
+caves: cell 192 m (16 per bake cell), 3 levels 40 m apart from the water table (share 0.20), radius 3.0 m (spread 0.35, trunks x2.5, max 24 m)
+       karst above province 0.404 (25% of the land); active 0.70 (+0.30 trunks); chambers 0.05 (22 m), shafts 0.12, mouths 0.00, dolines 0.00
+       depth 500 m at cells to 4 m, 150 m above; cover 24 m (slope 0.40); detail 0.70 m at 8.0 m (3 octaves, gain 0.45), bedding 0.25 m at 1.6 m; blend 1.5 m
+       sea caves 0.35 a 4-cell node at |h| < 60 m, relief > 150 m: radius 6.0 m (x1.5 tall), roof 5 m, into the cliff to 45 m of overburden
+land cells 536094, karst 133736 (24.9%); bake cell 3068 m, finest lattice cell 1.02 m
+  valley h   506 m relief  1659 m flow 27.2 province 0.51 table   101 m; land    507 m, bake there    506 m
+  valley h   630 m relief  1464 m flow 27.5 province 0.59 table   443 m; land    560 m, bake there    630 m
+  valley h   690 m relief  1461 m flow 27.7 province 0.49 table   510 m; land    440 m, bake there    690 m
+  valley h  1067 m relief  1426 m flow 28.4 province 0.59 table   972 m; land    727 m, bake there   1067 m
+  valley h   383 m relief  1369 m flow 27.7 province 0.65 table   332 m; land    399 m, bake there    383 m
+  valley h  1040 m relief  1360 m flow 27.6 province 0.57 table   675 m; land    834 m, bake there   1040 m
+  coast  h    39 m relief  2090 m flow 23.6 province 0.00 table     8 m; land   -103 m, bake there     39 m
+  coast  h    38 m relief  1751 m flow 23.5 province 0.20 table     8 m; land    780 m, bake there     38 m
+  coast  h    55 m relief  1691 m flow 23.4 province 0.38 table    11 m; land   -233 m, bake there     55 m
+  coast  h    45 m relief  1680 m flow 23.5 province 0.25 table     9 m; land    396 m, bake there     45 m
+  coast  h    18 m relief  1651 m flow 23.3 province 0.03 table     4 m; land    149 m, bake there     18 m
+  coast  h    15 m relief  1634 m flow 24.6 province 0.09 table     3 m; land    226 m, bake there     15 m
+  upland h   343 m relief   512 m flow 25.0 province 0.85 table    91 m; land    268 m, bake there    343 m
+  upland h   303 m relief   661 m flow 25.2 province 0.84 table    61 m; land    292 m, bake there    303 m
+  upland h   342 m relief   680 m flow 24.1 province 0.77 table    68 m; land    459 m, bake there    342 m
+  upland h   320 m relief   663 m flow 24.3 province 0.76 table    64 m; land    241 m, bake there    320 m
+  upland h   395 m relief   665 m flow 23.8 province 0.76 table    79 m; land    389 m, bake there    395 m
+  upland h   334 m relief   648 m flow 23.9 province 0.76 table    67 m; land    524 m, bake there    334 m

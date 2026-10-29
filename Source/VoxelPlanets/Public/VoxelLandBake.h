@@ -128,6 +128,11 @@ struct VOXELPLANETS_API FVoxelLandBake
     mutable TSharedPtr<const struct FVoxelLandRiverSet, ESPMode::ThreadSafe> Rivers;
     mutable TSharedPtr<FVoxelLandRiverJob, ESPMode::ThreadSafe> RiverJob;
 
+    /** K1: the cave bake for the last cave key made (VoxelLand::GetCaveBake, VoxelLandCaves.h): the
+     *  planet's densities share it, and a rebuilt density finds it while its key holds. */
+    mutable FCriticalSection CaveLock;
+    mutable TSharedPtr<const struct FVoxelLandCaveBake, ESPMode::ThreadSafe> Caves;
+
     /** The kept lakes, by Cell. */
     TArray<FVoxelLandLake> Lakes;
 

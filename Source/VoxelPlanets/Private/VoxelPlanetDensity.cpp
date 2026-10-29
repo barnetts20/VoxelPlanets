@@ -8,11 +8,6 @@
 #include "Async/ParallelFor.h"
 #include "Misc/ScopeLock.h"
 
-namespace VoxelShader
-{
-#include "VoxelDensityCore.ush"
-}
-
 FVoxelPlanetDensity::FVoxelPlanetDensity(double InPlanetRadius, double InNoiseAmplitude, double InMinFootprint)
     : PlanetRadius(FMath::Max(InPlanetRadius, 1.0))
     , NoiseAmplitude(FMath::Max(InNoiseAmplitude, 0.0))
@@ -32,11 +27,14 @@ FVoxelWaterSample FVoxelPlanetDensity::WaterAt(const FVector& Direction) const
 
 float FVoxelPlanetDensity::SampleOne(const FVector& Position, double Footprint) const
 {
-    using namespace VoxelShader;
-
     const double Radius = Position.Size();
-    const double Surface = Radius - (PlanetRadius + HeightAt(Position, Footprint));
-    return VoxelComposeTerrain((float)Surface, VoxelCaveDensity());
+    return (float)(Radius - (PlanetRadius + HeightAt(Position, Footprint)));
+}
+
+void FVoxelPlanetDensity::SampleRange(const FSampleInput& Input, int32 Begin, int32 End, double Footprint, float* DensityOut) const
+{
+    for (int32 i = Begin; i < End; i++)
+        DensityOut[i] = SampleOne(Input.GetPosition(i), Footprint);
 }
 
 void FVoxelPlanetDensity::Sample(const FSampleInput& Input, float* DensityOut) const
@@ -50,15 +48,12 @@ void FVoxelPlanetDensity::Sample(const FSampleInput& Input, float* DensityOut) c
     {
         const int32 NumBatches = (Count + BatchSize - 1) / BatchSize;
         ParallelFor(NumBatches, [&](int32 Batch) {
-            const int32 End = FMath::Min(Count, (Batch + 1) * BatchSize);
-            for (int32 i = Batch * BatchSize; i < End; i++)
-                DensityOut[i] = SampleOne(Input.GetPosition(i), Footprint);
+            SampleRange(Input, Batch * BatchSize, FMath::Min(Count, (Batch + 1) * BatchSize), Footprint, DensityOut);
             });
     }
     else
     {
-        for (int32 i = 0; i < Count; i++)
-            DensityOut[i] = SampleOne(Input.GetPosition(i), Footprint);
+        SampleRange(Input, 0, Count, Footprint, DensityOut);
     }
 }
 

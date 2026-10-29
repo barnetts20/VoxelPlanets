@@ -1,0 +1,8 @@
+caves: cell 192 m (16 per bake cell), 3 levels 40 m apart from the water table (share 0.20), radius 3.0 m (spread 0.35, trunks x2.5, max 24 m)
+       karst above province 0.404 (25% of the land); active 0.70 (+0.30 trunks); chambers 0.05 (22 m), shafts 0.12, mouths 0.00, dolines 0.00
+       depth 500 m at cells to 4 m, 150 m above; cover 24 m (slope 0.40); detail 0.70 m at 8.0 m (3 octaves, gain 0.45), bedding 0.25 m at 1.6 m; blend 1.5 m
+       sea caves 0.35 a 4-cell node at |h| < 60 m, relief > 150 m: radius 6.0 m (x1.5 tall), roof 5 m, into the cliff to 45 m of overburden
+brick path at level 0 (16 m bricks), 223 bricks in the karst band: gather 3.66 us a brick (7.8 primitives, 0 overflowed), evaluate 0.198 us a sample; per-sample path 3.250 us  [2.7101e-17]
+  a brick of 17^3 = 4913 samples: 0.199 us a sample with the gather shared
+brick path at level 2 (65 m bricks), 223 bricks in the karst band: gather 4.25 us a brick (0.6 primitives, 0 overflowed), evaluate 0.050 us a sample; per-sample path 2.674 us  [2.03232e-16]
+  a brick of 17^3 = 4913 samples: 0.051 us a sample with the gather shared

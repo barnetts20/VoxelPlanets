@@ -15,6 +15,13 @@
 // above PlanetRadius (FVoxelTerrestrialDensity::LandHeightAt); the continent, mountain and detail
 // octave layers are empty (DetailOctaves 0) and the octave table holds the warp's.
 //
+// K1: with VOXEL_DENSITY_CAVES 1 (the mesher and the density check define it, after including
+// VoxelCaveParameters.ush, VoxelLandCaves.ush and VoxelLandCaveCarve.ush) the land mode carves the
+// caves (VoxelCaveDistanceDF) with VoxelCaveCarve, in cm: the mesher from its bricks' gathered
+// lists (VoxelSampleDensityBrickDF, VOXEL_CAVE_STORED), the density check one gather a point
+// (VoxelSampleDensityDF). Other includers (the ocean pages' terrain depth) leave it undefined: no
+// caves.
+//
 //   StructuredBuffer<FVoxelOctave> Octaves;      continent, mountain, detail, then the land warp's octaves
 //                                                (the warp's alone in land mode)
 //   uint ContinentOctaves, MountainOctaves, DetailOctaves;
@@ -282,8 +289,10 @@ VOXEL_FUNC FVoxelLandDifferenced VoxelLandDifferencedDF(VOXEL_LAND_ARGS_DECL flo
 }
 
 // Density (negative = solid, cm) at lattice point Index (half finest cells from the root
-// centre), with octaves finer than Footprint (cm) left out. Edits are not included.
-VOXEL_FUNC float VoxelSampleDensityDF(VOXEL_LAND_ARGS_DECL int IndexX, int IndexY, int IndexZ, float Footprint)
+// centre), with octaves finer than Footprint (cm) left out, and the caves where
+// VOXEL_DENSITY_CAVES (CaveBrick: the mesher's brick, VOXEL_CAVE_NO_BRICK otherwise). Edits are
+// not included.
+VOXEL_FUNC float VoxelSampleDensityAtDF(VOXEL_LAND_ARGS_DECL int IndexX, int IndexY, int IndexZ, float Footprint, uint CaveBrick)
 {
     const float2 PX = VoxelDFMul(VoxelDFFromInt(IndexX), HalfFinest);
     const float2 PY = VoxelDFMul(VoxelDFFromInt(IndexY), HalfFinest);
@@ -291,6 +300,10 @@ VOXEL_FUNC float VoxelSampleDensityDF(VOXEL_LAND_ARGS_DECL int IndexX, int Index
     const float2 Radius = VoxelDFSqrt(VoxelDFAdd(VoxelDFAdd(VoxelDFMul(PX, PX), VoxelDFMul(PY, PY)), VoxelDFMul(PZ, PZ)));
 
     float2 Height = float2(0.0f, 0.0f);
+#if defined(VOXEL_DENSITY_CAVES) && VOXEL_DENSITY_CAVES
+    float BakeM = 0.0f;
+    bool bLand = false;
+#endif
     if (Radius.x > 1.0e-6f && NoiseAmplitude.x > 0.0f)
     {
         const float2 Scale = VoxelDFDiv(PlanetRadius, Radius);
@@ -306,7 +319,12 @@ VOXEL_FUNC float VoxelSampleDensityDF(VOXEL_LAND_ARGS_DECL int IndexX, int Index
             const float2 LPX = VoxelDFMul(PX, LandScale);
             const float2 LPY = VoxelDFMul(PY, LandScale);
             const float2 LPZ = VoxelDFMul(PZ, LandScale);
-            float2 Total = VoxelLandHeightDF(VOXEL_LAND_ARGS LPX, LPY, LPZ, Footprint, false).Height;
+            const FVoxelLandHeight Land = VoxelLandHeightDF(VOXEL_LAND_ARGS LPX, LPY, LPZ, Footprint, false);
+            float2 Total = Land.Height;
+#if defined(VOXEL_DENSITY_CAVES) && VOXEL_DENSITY_CAVES
+            BakeM = Land.Bake;
+            bLand = true;
+#endif
             // Within [0, NoiseAmplitude], as FVoxelTerrestrialDensity::LandHeightAt clamps.
             if (Total.x < 0.0f || (Total.x == 0.0f && Total.y < 0.0f)) Total = float2(0.0f, 0.0f);
             if (Total.x > NoiseAmplitude.x || (Total.x == NoiseAmplitude.x && Total.y > NoiseAmplitude.y)) Total = NoiseAmplitude;
@@ -329,7 +347,32 @@ VOXEL_FUNC float VoxelSampleDensityDF(VOXEL_LAND_ARGS_DECL int IndexX, int Index
     }
 
     const float2 Surface = VoxelDFSub(Radius, VoxelDFAdd(PlanetRadius, Height));
-    return VoxelComposeTerrain(Surface.x + Surface.y, VoxelCaveDensity());
+    float Density = Surface.x + Surface.y;
+#if defined(VOXEL_DENSITY_CAVES) && VOXEL_DENSITY_CAVES
+    // The caves (K1): the land's height and the bake's in m about sea level (the sea-level sphere
+    // is PlanetRadius plus LandHeightOffset).
+    if (bLand && CaveOn != 0u)
+    {
+        const float2 SeaRadius = VoxelDFAdd(PlanetRadius, LandHeightOffset);
+        const float2 LandH = VoxelDFSub(Height, LandHeightOffset);
+        const float Cave = VoxelCaveDistanceDF(VOXEL_LAND_ARGS PX, PY, PZ, Radius, SeaRadius, (LandH.x + LandH.y) * 0.01f, BakeM, Footprint * 0.01f, CaveBrick);
+        Density = VoxelCaveCarve(Density, Cave, 100.0f);
+    }
+#endif
+    return Density;
+}
+
+// The density with the caves one gather a point (the density check; VoxelSampleDensityAtDF).
+VOXEL_FUNC float VoxelSampleDensityDF(VOXEL_LAND_ARGS_DECL int IndexX, int IndexY, int IndexZ, float Footprint)
+{
+    return VoxelSampleDensityAtDF(VOXEL_LAND_ARGS IndexX, IndexY, IndexZ, Footprint, 0xFFFFFFFFu);
+}
+
+// The density for the mesher's brick Brick: the caves from the lists its gather pass left
+// (VOXEL_CAVE_STORED; VoxelSampleDensityAtDF).
+VOXEL_FUNC float VoxelSampleDensityBrickDF(VOXEL_LAND_ARGS_DECL int IndexX, int IndexY, int IndexZ, float Footprint, uint Brick)
+{
+    return VoxelSampleDensityAtDF(VOXEL_LAND_ARGS IndexX, IndexY, IndexZ, Footprint, Brick);
 }
 
 // |p| - R at lattice point Index, no noise: checks the double-float position path alone.

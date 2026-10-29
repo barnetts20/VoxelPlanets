@@ -1,0 +1,49 @@
+== defaults
+  at the camera, footprint 1.0 m: density 3.24, cave -3.24 (kind 3, stage 2), land 558.5 bake 575.9
+  at the camera, footprint 2.0 m: density 3.28, cave -3.28 (kind 3, stage 2), land 558.5 bake 575.9
+  at the camera, footprint 4.1 m: density -399.68, cave 1000000000.00 (kind 0, stage 2), land 558.5 bake 575.9
+  at the camera, footprint 8.1 m: density -399.34, cave 1000000000.00 (kind 0, stage 2), land 558.2 bake 575.9
+camera 2 m above a karst valley (16 cells a brick, factor 2.5, slope bound 3.5, levels 7..0 in +-3 km):
+  level  cell m   wanted land/caves   surface land/caves   samples land/caves
+     7   130.21         0       0           0       0            64        64
+     6    65.10       302     302          83      83         17602     17602
+     5    32.55       658     658         163     163         38562     38562
+     4    16.28       704     704         194     194         41053     41053
+     3     8.14       648     648         183     183         37545     37545
+     2     4.07       680     680         181     181         39468     39468
+     1     2.03       665     665         172     172         39211     39211
+     0     1.02       833     833         243     243         47913     47913
+  total wanted 4490 -> 4490 (+0.0%), surface 1219 -> 1219 (+0.0%), test samples 261418 -> 261418
+camera inside a passage, 399 m below the land (16 cells a brick, factor 2.5, slope bound 3.5, levels 7..0 in +-3 km):
+  level  cell m   wanted land/caves   surface land/caves   samples land/caves
+     7   130.21         0       0           0       0            48        48
+     6    65.10       232     232          76      76         13058     13058
+     5    32.55       651     651         179     179         38099     38099
+     4    16.28       726     726         207     207         42417     42417
+     3     8.14       590     590         231     231         29735     29735
+     2     4.07       260     260          34      34         17016     17080
+     1     2.03         0     381           0     126            40     29885
+     0     1.02         0     719           0     193             0     48039
+  total wanted 2459 -> 3559 (+44.7%), surface 727 -> 1046 (+43.9%), test samples 140413 -> 218361
+== meshed depth 500 m at every level (CaveDeepCellM=1e9)
+camera 2 m above a karst valley (16 cells a brick, factor 2.5, slope bound 3.5, levels 7..0 in +-3 km):
+  total wanted 4490 -> 4526 (+0.8%), surface 1219 -> 1290 (+5.8%), test samples 261418 -> 263104
+== larger caves (radius 5 m, chambers 35 m)
+  at the camera, footprint 1.0 m: density 4.78, cave -4.78 (kind 3, stage 2), land 558.5 bake 575.9
+  at the camera, footprint 2.0 m: density 4.83, cave -4.83 (kind 3, stage 2), land 558.5 bake 575.9
+  at the camera, footprint 4.1 m: density -399.68, cave 1000000000.00 (kind 0, stage 2), land 558.5 bake 575.9
+  at the camera, footprint 8.1 m: density -399.34, cave 1000000000.00 (kind 0, stage 2), land 558.2 bake 575.9
+camera 2 m above a karst valley (16 cells a brick, factor 2.5, slope bound 3.5, levels 7..0 in +-3 km):
+  total wanted 4490 -> 4490 (+0.0%), surface 1219 -> 1219 (+0.0%), test samples 261418 -> 261418
+camera inside a passage, 399 m below the land (16 cells a brick, factor 2.5, slope bound 3.5, levels 7..0 in +-3 km):
+  total wanted 2459 -> 3816 (+55.2%), surface 727 -> 1189 (+63.5%), test samples 140413 -> 232408
+== larger caves, depth gate off
+camera 2 m above a karst valley (16 cells a brick, factor 2.5, slope bound 3.5, levels 7..0 in +-3 km):
+  total wanted 4490 -> 4528 (+0.8%), surface 1219 -> 1432 (+17.5%), test samples 261418 -> 255524
+== naive test (split bricks tested with their own level's caves)
+  at the camera, footprint 1.0 m: density 3.24, cave -3.24 (kind 3, stage 2), land 558.5 bake 575.9
+  at the camera, footprint 2.0 m: density 3.28, cave -3.28 (kind 3, stage 2), land 558.5 bake 575.9
+  at the camera, footprint 4.1 m: density -399.68, cave 1000000000.00 (kind 0, stage 2), land 558.5 bake 575.9
+  at the camera, footprint 8.1 m: density -399.34, cave 1000000000.00 (kind 0, stage 2), land 558.2 bake 575.9
+camera inside a passage, 399 m below the land (16 cells a brick, factor 2.5, slope bound 3.5, levels 7..0 in +-3 km):
+  total wanted 2459 -> 2459 (+0.0%), surface 727 -> 727 (+0.0%), test samples 140413 -> 140413

@@ -1,0 +1,9 @@
+caves: cell 192 m (16 per bake cell), 3 levels 40 m apart from the water table (share 0.20), radius 3.0 m (spread 0.35, trunks x2.5, max 24 m)
+       karst above province 0.404 (25% of the land); active 0.70 (+0.30 trunks); chambers 0.05 (22 m), shafts 0.12, mouths 0.00, dolines 0.00
+       depth 500 m at cells to 4 m, 150 m above; cover 24 m (slope 0.40); detail 0.70 m at 8.0 m (3 octaves, gain 0.45), bedding 0.25 m at 1.6 m; blend 1.5 m
+       sea caves 0.35 a 4-cell node at |h| < 60 m, relief > 150 m: radius 6.0 m (x1.5 tall), roof 5 m, into the cliff to 45 m of overburden
+slope near walls (|cave| < 6 m):
+  |grad cave distance|, detail off                            1543 points: median 1.000, 99% 1.022, 99.9% 1.369, max 1.406
+  |grad cave distance|                                        1538 points: median 1.006, 99% 1.215, 99.9% 1.375, max 1.431
+  |grad carved density| (the land's vertical distance too)    1538 points: median 1.006, 99% 1.215, 99.9% 1.375, max 1.431
+  noise gradient bound 3.075 a lattice unit: the detail adds at most 0.730 (octaves) + 0.480 (bedding, across the beds)

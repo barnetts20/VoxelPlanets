@@ -1,0 +1,10 @@
+caves: cell 192 m (16 per bake cell), 3 levels 40 m apart from the water table (share 0.20), radius 3.0 m (spread 0.35, trunks x2.5, max 24 m)
+       karst above province 0.404 (25% of the land); active 0.70 (+0.30 trunks); chambers 0.05 (22 m), shafts 0.12, mouths 0.00, dolines 0.00
+       depth 500 m at cells to 4 m, 150 m above; cover 24 m (slope 0.40); detail 0.70 m at 8.0 m (3 octaves, gain 0.45), bedding 0.25 m at 1.6 m; blend 1.5 m
+       sea caves 0.35 a 4-cell node at |h| < 60 m, relief > 150 m: radius 6.0 m (x1.5 tall), roof 5 m, into the cliff to 45 m of overburden
+CPU cost per sample, one thread (the land chain at the finest footprint; the cave term alone):
+  above the land (5 m)                  3000 points: land   3.73 us, caves  0.031 us (  0.8%); skipped 3000, patch 0, nodes 0; a sample: 0.00 levels, 0.00 near, 0.00 edges, 0.00 detail  [1.2e-17]
+  1.5 km below the land                 3000 points: land   3.65 us, caves  0.033 us (  0.9%); skipped 3000, patch 0, nodes 0; a sample: 0.00 levels, 0.00 near, 0.00 edges, 0.00 detail  [1.2e-17]
+  100 m below, outside karst            3000 points: land   4.23 us, caves  0.184 us (  4.3%); skipped 2964, patch 36, nodes 0; a sample: 0.00 levels, 0.00 near, 0.00 edges, 0.00 detail  [1.1996e-17]
+  karst, in the levels' band            3000 points: land   3.66 us, caves  3.724 us (101.7%); skipped 0, patch 0, nodes 3000; a sample: 3.00 levels, 1.33 near, 2.44 edges, 0.04 detail  [1.24401e-18]
+  karst, near walls (|cave| < 4 m)      1000 points: land   3.60 us, caves  4.308 us (119.7%); skipped 0, patch 0, nodes 1000; a sample: 3.00 levels, 1.51 near, 2.85 edges, 1.00 detail  [1.55489e-24]

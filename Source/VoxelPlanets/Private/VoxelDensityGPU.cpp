@@ -12,6 +12,7 @@
 #include "RHIGPUReadback.h"
 #include "Async/Async.h"
 #include "Misc/App.h"
+#include "HAL/IConsoleManager.h"
 #include <atomic>
 
 /** Samples the density on a box of lattice points (VoxelDensityGPU.usf). Global shaders must
@@ -56,6 +57,7 @@ public:
         SHADER_PARAMETER(float, RidgeGain)
         SHADER_PARAMETER(float, SlopeDamping)
         SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelLandShaderParameters, Land)
+        SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelCaveShaderParameters, Caves)
     END_SHADER_PARAMETER_STRUCT()
 
     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -127,6 +129,7 @@ void VoxelDensityGPU::SampleBlocksAsync(TSharedRef<const FVoxelDensityGPUData> D
             FRDGBufferUAVRef OutUAV = GraphBuilder.CreateUAV(OutBuffer, ERDGUnorderedAccessViewFlags::SkipBarrier);
             TShaderMapRef<FVoxelDensityCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
             const FVoxelLandShaderParameters Land = VoxelLandGPU::GetParameters(GraphBuilder, *Data);
+            const FVoxelCaveShaderParameters Caves = VoxelLandGPU::GetCaveParameters(GraphBuilder, *Data);
 
             uint32 Offset = 0;
             for (const FVoxelDensityGPUBlock& Block : Blocks)
@@ -164,6 +167,7 @@ void VoxelDensityGPU::SampleBlocksAsync(TSharedRef<const FVoxelDensityGPUData> D
                 Parameters->RidgeGain = Data->RidgeGain;
                 Parameters->SlopeDamping = Data->SlopeDamping;
                 Parameters->Land = Land;
+                Parameters->Caves = Caves;
                 FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelDensity %dx%dx%d", Block.Dim.X, Block.Dim.Y, Block.Dim.Z),
                     Shader, Parameters, FComputeShaderUtils::GetGroupCount(Block.Dim, FVoxelDensityCS::GroupSize));
                 Offset += (uint32)Block.NumPoints();
@@ -200,7 +204,8 @@ void VoxelDensityGPU::SampleBlocksAsync(TSharedRef<const FVoxelDensityGPUData> D
 // ---------------------------------------------------------------------------
 
 /** The planet density's parameters (VoxelTerrestrialMesher.usf): the noise surface's octaves and
- *  constants, the land chain's, and the land debug views'. */
+ *  constants, the land chain's, the caves' with the batch's gathered lists (K1: CaveGatherCS
+ *  writes them, the sample pass reads them), and the land debug views'. */
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelTerrestrialMesherParameters, )
     SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVoxelOctave>, Octaves)
     SHADER_PARAMETER(uint32, ContinentOctaves)
@@ -219,24 +224,71 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelTerrestrialMesherParameters, )
     SHADER_PARAMETER(float, RidgeGain)
     SHADER_PARAMETER(float, SlopeDamping)
     SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelLandShaderParameters, Land)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelCaveShaderParameters, Caves)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVoxelCaveListHead>, CaveHeads)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVoxelCavePrim>, CavePrims)
     SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelLandDebugParameters, LandDebug)
+END_SHADER_PARAMETER_STRUCT()
+
+/** The caves' gather pass's parameters (K1, VoxelTerrestrialMesher.usf CaveGatherCS): the sea-level
+ *  sphere (PlanetRadius and the land's LandHeightOffset), the land's lattice, the caves', and the
+ *  batch's lists it writes (VoxelLandGPU::CaveSlots heads a brick, CaveMaxPrims primitives a
+ *  head). */
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelTerrestrialCaveGatherParameters, )
+    SHADER_PARAMETER(FVector2f, PlanetRadius)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelLandShaderParameters, Land)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FVoxelCaveShaderParameters, Caves)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVoxelCaveListHead>, CaveHeadsOut)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVoxelCavePrim>, CavePrimsOut)
+    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVoxelCaveNode>, CaveNodesOut)
 END_SHADER_PARAMETER_STRUCT()
 
 VOXEL_MESHER_SOURCE_SHADER(FVoxelTerrestrialSampleCS, FVoxelTerrestrialMesherParameters)
 VOXEL_MESHER_SOURCE_SHADER(FVoxelTerrestrialColourCS, FVoxelTerrestrialMesherParameters)
+VOXEL_MESHER_SOURCE_SHADER(FVoxelTerrestrialCaveGatherCS, FVoxelTerrestrialCaveGatherParameters)
 IMPLEMENT_GLOBAL_SHADER(FVoxelTerrestrialSampleCS, "/Plugin/VoxelPlanets/Private/VoxelTerrestrialMesher.usf", "SampleCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelTerrestrialColourCS, "/Plugin/VoxelPlanets/Private/VoxelTerrestrialMesher.usf", "LandDebugCS", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelTerrestrialCaveGatherCS, "/Plugin/VoxelPlanets/Private/VoxelTerrestrialMesher.usf", "CaveGatherCS", SF_Compute);
+
+static TAutoConsoleVariable<int32> CVarVoxelCavesGPU(
+    TEXT("voxel.Caves.GPU"),
+    1,
+    TEXT("The caves in the GPU mesher (K1). 0: none (no gather pass, nothing carved); 1: on; 2: the gather pass runs but the ")
+    TEXT("samples carve nothing (to tell the two apart). The CPU density (collision, queries) keeps its caves. Read per batch; ")
+    TEXT("set at startup with -dpcvars=voxel.Caves.GPU=0."),
+    ECVF_RenderThreadSafe);
+
+namespace VoxelDensityGPUDetail
+{
+    /** A batch's gathered cave lists (render thread, within one graph): the gather pass makes
+     *  them (FVoxelMesherSampler::AddBrickPass), the sample passes read them; stand-ins until
+     *  then or without caves. */
+    struct FCaveLists
+    {
+        FRDGBufferSRVRef Heads = nullptr;
+        FRDGBufferSRVRef Prims = nullptr;
+    };
+
+    /** Whether the density carves caves on the GPU (its constants on and its cave bake there). */
+    bool HasCaves(const FVoxelDensityGPUData& D)
+    {
+        return D.LandMode != 0 && D.Caves.CaveOn != 0u && D.LandCaves.IsValid() && D.LandCaves->Words.Num() > 0;
+    }
+}
 
 bool FVoxelDensityGPUSource::AreShadersReady() const
 {
     // GetShader by type returns an empty reference when the shader isn't compiled for this
     // platform (TShaderMapRef would assert).
     FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
-    return ShaderMap && ShaderMap->GetShader(&FVoxelTerrestrialSampleCS::GetStaticType(), 0).IsValid();
+    if (!ShaderMap || !ShaderMap->GetShader(&FVoxelTerrestrialSampleCS::GetStaticType(), 0).IsValid()) return false;
+    // K1: the caves' gather (the sample pass reads its lists).
+    return !VoxelDensityGPUDetail::HasCaves(*Data) || ShaderMap->GetShader(&FVoxelTerrestrialCaveGatherCS::GetStaticType(), 0).IsValid();
 }
 
 FVoxelMesherSampler FVoxelDensityGPUSource::MakeSampler(FRDGBuilder& GraphBuilder, const FVoxelBrickMesherGPUDebugView& DebugView) const
 {
+    using namespace VoxelDensityGPUDetail;
     const FVoxelDensityGPUData& D = *Data;
     // The octaves, uploaded with the first batch and kept.
     FRDGBufferRef OctaveBuffer = nullptr;
@@ -267,23 +319,67 @@ FVoxelMesherSampler FVoxelDensityGPUSource::MakeSampler(FRDGBuilder& GraphBuilde
     Source.RidgeGain = D.RidgeGain;
     Source.SlopeDamping = D.SlopeDamping;
     Source.Land = VoxelLandGPU::GetParameters(GraphBuilder, D);
+    Source.Caves = VoxelLandGPU::GetCaveParameters(GraphBuilder, D);
     // The land debug view's colour pass, when its shader is ready (it isn't part of
     // AreShadersReady, so the terrain never waits for it).
     FGlobalShaderMap* ShaderMap = GetGlobalShaderMap(GMaxRHIFeatureLevel);
     const bool bColour = DebugView.Mode > 0 && ShaderMap && ShaderMap->GetShader(&FVoxelTerrestrialColourCS::GetStaticType(), 0).IsValid();
     Source.LandDebug = VoxelLandGPU::GetDebugParameters(GraphBuilder, D, bColour ? DebugView.Mode : 0, DebugView.SeaRadius);
 
+    // K1: the caves' lists, stand-ins until the batch's gather pass makes them (and for good
+    // without caves: the sample pass then never reads them).
+    const TSharedRef<FCaveLists> Lists = MakeShared<FCaveLists>();
+    Lists->Heads = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<FVoxelCaveListHeadGPU>(GraphBuilder, TEXT("Voxel.CaveHeadsNone"), TConstArrayView<FVoxelCaveListHeadGPU>()));
+    Lists->Prims = GraphBuilder.CreateSRV(VoxelGPUCommon::UploadStructuredBuffer<FVoxelCavePrimGPU>(GraphBuilder, TEXT("Voxel.CavePrimsNone"), TConstArrayView<FVoxelCavePrimGPU>()));
+    const int32 CavesMode = CVarVoxelCavesGPU.GetValueOnRenderThread();
+    const bool bCaves = CavesMode != 0 && HasCaves(D) && Source.Caves.CaveOn != 0u && ShaderMap
+        && ShaderMap->GetShader(&FVoxelTerrestrialCaveGatherCS::GetStaticType(), 0).IsValid();
+    if (!bCaves) Source.Caves.CaveOn = 0u;
+
     FVoxelMesherSampler Sampler;
-    Sampler.AddSamplePass = [Source](FRDGBuilder& InGraphBuilder, ERDGPassFlags PassFlags, const FVoxelMesherCommonParameters& Common, uint32 Mode,
+    if (bCaves)
+    {
+        // Each brick's lists (VoxelLandGPU::CaveSlots face slots of CaveMaxPrims primitives), for
+        // its samples in the passes after.
+        FVoxelTerrestrialCaveGatherParameters Gather;
+        Gather.PlanetRadius = D.PlanetRadius;
+        Gather.Land = Source.Land;
+        Gather.Caves = Source.Caves;
+        // voxel.Caves.GPU 2: the gather runs, the samples carve nothing.
+        if (CavesMode == 2) Source.Caves.CaveOn = 0u;
+        Sampler.AddBrickPass = [Gather, Lists](FRDGBuilder& InGraphBuilder, ERDGPassFlags PassFlags, const FVoxelMesherCommonParameters& Common)
+            {
+                const uint32 NumSlots = FMath::Max(Common.NumBricks, 1u) * VoxelLandGPU::CaveSlots;
+                FRDGBufferRef Heads = InGraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FVoxelCaveListHeadGPU), NumSlots), TEXT("Voxel.CaveHeads"));
+                FRDGBufferRef Prims = InGraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FVoxelCavePrimGPU), NumSlots * VoxelLandGPU::CaveMaxPrims), TEXT("Voxel.CavePrims"));
+                // The gather's node grids (scratch: written before read by the same thread).
+                FRDGBufferRef Nodes = InGraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(VoxelLandGPU::CaveNodeBytes, NumSlots * VoxelLandGPU::CaveNodesPerSlot), TEXT("Voxel.CaveNodes"));
+                FVoxelTerrestrialCaveGatherParameters Pass = Gather;
+                Pass.CaveHeadsOut = InGraphBuilder.CreateUAV(Heads);
+                Pass.CavePrimsOut = InGraphBuilder.CreateUAV(Prims);
+                Pass.CaveNodesOut = InGraphBuilder.CreateUAV(Nodes);
+                VoxelBrickMesherGPU::AddSourcePass<FVoxelTerrestrialCaveGatherCS>(InGraphBuilder, PassFlags, Common, Pass, 0u, Common.NumBricks * VoxelLandGPU::CaveSlots,
+                    TEXT("Cave lists"));
+                Lists->Heads = InGraphBuilder.CreateSRV(Heads);
+                Lists->Prims = InGraphBuilder.CreateSRV(Prims);
+            };
+    }
+    Sampler.AddSamplePass = [Source, Lists](FRDGBuilder& InGraphBuilder, ERDGPassFlags PassFlags, const FVoxelMesherCommonParameters& Common, uint32 Mode,
         uint32 NumThreads, const TCHAR* Name)
         {
-            VoxelBrickMesherGPU::AddSourcePass<FVoxelTerrestrialSampleCS>(InGraphBuilder, PassFlags, Common, Source, Mode, NumThreads, Name);
+            FVoxelTerrestrialMesherParameters Pass = Source;
+            Pass.CaveHeads = Lists->Heads;
+            Pass.CavePrims = Lists->Prims;
+            VoxelBrickMesherGPU::AddSourcePass<FVoxelTerrestrialSampleCS>(InGraphBuilder, PassFlags, Common, Pass, Mode, NumThreads, Name);
         };
     if (bColour)
     {
-        Sampler.AddColourPass = [Source](FRDGBuilder& InGraphBuilder, ERDGPassFlags PassFlags, const FVoxelMesherCommonParameters& Common, uint32 NumThreads)
+        Sampler.AddColourPass = [Source, Lists](FRDGBuilder& InGraphBuilder, ERDGPassFlags PassFlags, const FVoxelMesherCommonParameters& Common, uint32 NumThreads)
             {
-                VoxelBrickMesherGPU::AddSourcePass<FVoxelTerrestrialColourCS>(InGraphBuilder, PassFlags, Common, Source, 0u, NumThreads, TEXT("Land debug colours"));
+                FVoxelTerrestrialMesherParameters Pass = Source;
+                Pass.CaveHeads = Lists->Heads;
+                Pass.CavePrims = Lists->Prims;
+                VoxelBrickMesherGPU::AddSourcePass<FVoxelTerrestrialColourCS>(InGraphBuilder, PassFlags, Common, Pass, 0u, NumThreads, TEXT("Land debug colours"));
             };
     }
     return Sampler;

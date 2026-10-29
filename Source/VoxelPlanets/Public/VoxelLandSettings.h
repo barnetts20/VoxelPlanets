@@ -19,6 +19,126 @@ enum class EVoxelSurfaceGenerator : uint8
     Terrestrial
 };
 
+/** The caves (Design/EditsAndCaves.md, K1): a network of karst passages, chambers, shafts and
+ *  dolines under the karst (the land whose province is in the top KarstCoverage), and sea caves
+ *  in cliff coasts, carved into the terrestrial surface from the seed and the bake (nothing is
+ *  stored). Changing them rebuilds the density, not the bake. */
+USTRUCT(BlueprintType)
+struct VOXELPLANETS_API FVoxelCaveSettings
+{
+    GENERATED_BODY()
+
+    /** Carve the caves. Off: the land as it was (no cave bake is made). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves")
+    bool bEnabled = true;
+
+    /** The cave lattice's cell (m): one node a cell on each level, the passages joining
+     *  neighbours. Rounded to a whole fraction of the bake cell (at least six a cell). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "32.0", UIMin = "96", UIMax = "512"))
+    double CellSize = 192.0;
+
+    /** The cave levels, stacked from the water table up (the lowest has round tubes with sediment
+     *  floors, the ones above keyholes: a tube over a canyon). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "1", ClampMax = "4"))
+    int32 Levels = 3;
+
+    /** The height between levels (m). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "5.0", UIMax = "150.0"))
+    double LevelSpacing = 40.0;
+
+    /** The water table, the lowest level: the local base level (the valley floors, the sea) plus
+     *  this share of the height above it. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double WaterTableShare = 0.2;
+
+    /** The share of the land that is karst, by the bake's province (as StrataCoverage): the
+     *  passages, chambers, shafts and dolines are there. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double KarstCoverage = 0.25;
+
+    /** The passages' median radius (m; log-normal about it). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.5", UIMax = "10.0"))
+    double PassageRadius = 3.0;
+
+    /** The largest passage radius (m). Every cave closes at footprints above the largest radius
+     *  of any kind, so larger caves are meshed at coarser levels too. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "1.0", UIMax = "60.0"))
+    double PassageRadiusMax = 24.0;
+
+    /** How much wider the trunks under the main drainage are (their radius times 1 + this). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", UIMax = "5.0"))
+    double TrunkGain = 1.5;
+
+    /** The share of nodes with a chamber (twice it on trunks). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double ChamberShare = 0.05;
+
+    /** The chambers' median horizontal radius (m; half as tall, from half to one and a half of it). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "2.0", UIMax = "80.0"))
+    double ChamberRadius = 22.0;
+
+    /** The share of nodes with a shaft up to the level above. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double ShaftShare = 0.12;
+
+    /** The share of nodes whose passages and chambers may break the surface (the entrances in
+     *  valley walls and slopes; the others close below CoverDepth). 0.004 gives about 13 per
+     *  1,000 km^2 of karst. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", ClampMax = "0.2"))
+    double MouthShare = 0.004;
+
+    /** The share of the top level's nodes with a doline: a shaft to the surface widening into a
+     *  bowl. 0.0008 gives about 12 per 1,000 km^2 of karst. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", ClampMax = "0.05"))
+    double DolineShare = 0.0008;
+
+    /** The share of the sea caves' lattice nodes (768 m apart at the default cell) with a sea
+     *  cave, where the coast has relief. 0: none. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    double SeaCaveShare = 0.35;
+
+    /** The sea caves' median radius (m; half as tall again). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "1.0", UIMax = "20.0"))
+    double SeaCaveRadius = 6.0;
+
+    /** How deep below the bake (m) caves are meshed at footprints up to DeepFootprint (near the
+     *  camera, and inside a cave); ShallowMeshedDepth above it. The density is the same whatever
+     *  the camera does: the brick tree tests a brick it splits with the finest footprint, so the
+     *  caves near the camera are meshed at any depth within this. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", UIMax = "2000.0"))
+    double MeshedDepth = 500.0;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", UIMax = "1000.0"))
+    double ShallowMeshedDepth = 150.0;
+
+    /** The footprint (m, the cell size of a level) up to which MeshedDepth holds. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", UIMax = "32.0"))
+    double DeepFootprint = 4.0;
+
+    /** How far below the surface (m) caves are shut, except at entrances (mouths, dolines, sea
+     *  caves). They close toward it at CoverSlope. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", UIMax = "100.0"))
+    double CoverDepth = 24.0;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.05", ClampMax = "1.0"))
+    double CoverSlope = 0.4;
+
+    /** The walls' roughness (m): three octaves of noise from 8 m down. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", UIMax = "3.0"))
+    double WallRoughness = 0.7;
+
+    /** The bedding ledges' depth (m). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", UIMax = "1.0"))
+    double Bedding = 0.25;
+
+    /** The blend (m) where the caves meet the land and each other (the smooth maximum's). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Caves", meta = (ClampMin = "0.0", UIMax = "10.0"))
+    double Blend = 1.5;
+
+    /** Hash of every field, for change detection (FVoxelTerrestrialSettings::GetSettingsHash). */
+    uint32 GetHash() const;
+};
+
 /** The terrestrial generator. Changing a Bake setting bakes the planet again (cached on disk
  *  by a hash of them); the Sample settings change only the per-sample layers. */
 USTRUCT(BlueprintType)
@@ -661,6 +781,10 @@ struct VOXELPLANETS_API FVoxelTerrestrialSettings
      *  four octaves). Kept within a quarter of PeakSpacing in code. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Sample", meta = (ClampMin = "16.0", UIMin = "50", UIMax = "2000"))
     double PeakDetailWavelength = 400.0;
+
+    /** The caves (Design/EditsAndCaves.md, K1). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Terrestrial|Caves")
+    FVoxelCaveSettings Caves;
 
     /** Hash of the settings that change the bake (with the radius and the generator version,
      *  the cache key). */

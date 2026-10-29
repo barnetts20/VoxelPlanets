@@ -1,5 +1,6 @@
 // VoxelDensityGPU.usf - Samples the planet density on a box of lattice points
-// (FVoxelDensityCS, VoxelDensityGPU.cpp). The evaluation is VoxelDensitySample.ush.
+// (FVoxelDensityCS, VoxelDensityGPU.cpp). The evaluation is VoxelDensitySample.ush, with the caves
+// (K1) one gather a point (VoxelLandCaveCarve.ush without VOXEL_CAVE_STORED).
 
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/VoxelPlanets/Private/VoxelDensityCore.ush"
@@ -44,6 +45,10 @@ uint EditOpCount;
 #include "/Plugin/VoxelPlanets/Private/VoxelLandParameters.ush"
 #include "/Plugin/VoxelPlanets/Private/VoxelLandSample.ush"
 #include "/Plugin/VoxelPlanets/Private/VoxelLandGully.ush"
+#define VOXEL_DENSITY_CAVES 1
+#include "/Plugin/VoxelPlanets/Private/VoxelCaveParameters.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelLandCaves.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelLandCaveCarve.ush"
 #include "/Plugin/VoxelPlanets/Private/VoxelDensitySample.ush"
 #include "/Plugin/VoxelPlugin/Private/VoxelEditSample.ush"
 

@@ -1,0 +1,73 @@
+// VoxelCaveParameters.ush - The caves' shader inputs (FVoxelCaveShaderParameters in VoxelLandGPU.h;
+// the CPU's FVoxelCaveConstants, VoxelLandCaves.h, holds the same names), for the passes that
+// carve them (VoxelTerrestrialMesher.usf, VoxelDensityGPU.usf). Include before VoxelLandCaves.ush.
+
+#ifndef VOXEL_CAVE_PARAMETERS_USH
+#define VOXEL_CAVE_PARAMETERS_USH
+
+StructuredBuffer<uint> CaveBake;       // two words per padded bake cell (VoxelLandCaves.ush VOXEL_CAVE_WORD)
+uint CaveOn;                           // 0: no caves (CaveBake is a stand-in)
+uint CaveSeed;
+uint CaveCellsPerBake;
+uint CaveLevels;
+uint CaveRoughCells;
+uint CaveRoughOctaves;
+uint CaveSeaCells;
+float CaveCellM;
+float CaveLevelM;
+float CaveTableShare;
+float CaveFloorClearM;
+float CavePhiWaveCells;
+float CavePhiNoiseM;
+float CavePhiJitterM;
+float CavePhiNoiseSlope;
+float CaveTrunkFlowLo;
+float CaveTrunkFlowHi;
+float CaveRadiusM;
+float CaveRadiusSpread;
+float CaveTrunkGain;
+float CaveRadiusMaxM;
+float CaveKarstLo;
+float CaveKarstHi;
+float CaveKarstSlack;
+float CaveActiveShare;
+float CaveTrunkActive;
+float CaveChamberShare;
+float CaveChamberRadiusM;
+float CaveChamberSquash;
+float CaveShaftShare;
+float CaveShaftRadiusM;
+float CaveMouthShare;
+float CaveDolineShare;
+float CaveDolineRadiusM;
+float CaveDolineHeadM;
+float CaveDolineFunnel;
+float CaveDolineBowlM;
+float CaveDeepCellM;
+float CaveDepthM;
+float CaveShallowDepthM;
+float CaveRoughM;
+float CaveRoughGain;
+float CaveBeddingM;
+float CaveBeddingWaveM;
+float CaveBlendM;
+float CaveBandSlackM;
+float CaveSeaShare;
+float CaveSeaCoastM;
+float CaveSeaZM;
+float CaveSeaRadiusM;
+float CaveSeaReliefM;
+float CaveSeaTall;
+float CaveSeaFloorM;
+float CaveSeaRoofM;
+float CaveSeaCoverM;
+float CaveFloorFill;
+float CaveCanyonDepth;
+float CaveCanyonWidth;
+float CaveMeander;
+float CaveMeanderZM;
+float CaveCoverM;
+float CaveCoverSlope;
+float CaveMaxRadiusM;
+
+#endif // VOXEL_CAVE_PARAMETERS_USH

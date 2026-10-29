@@ -3,7 +3,9 @@
 #include "VoxelDensityGPU.h"
 #include "VoxelLandBake.h"
 #include "VoxelLandClimate.h"
+#include "VoxelLandCaves.h"
 #include "VoxelPlanets.h"
+#include "Async/ParallelFor.h"
 #include "VoxelShaderCompat.h"
 #include "FDensitySampleCompositor.h"
 
@@ -24,8 +26,9 @@ namespace VoxelShader
 
     /** The land bake's sampler on the CPU: VoxelLandSample.ush and VoxelLandGully.ush (with
      *  VoxelLandHills.ush, VoxelLandNoise.ush and VoxelLandPeaks.ush) with the shader's buffers
-     *  and constants as members (the GPU runs the same code). */
-    struct FVoxelLandSamplerCPU
+     *  and constants as members (the GPU runs the same code); and the caves (VoxelLandCaves.ush,
+     *  K1), their constants the base's members (FVoxelCaveConstants, the shaders' names). */
+    struct FVoxelLandSamplerCPU : public FVoxelCaveConstants
     {
         const float* LandHeight = nullptr;
         const float2* LandTanTable = nullptr;
@@ -210,9 +213,12 @@ namespace VoxelShader
         float LandPolarDuneM = 0.0f;
         float LandPolarDuneMean = 0.0f;
         float LandPolarDuneFade = 0.0f;
+        // K1: the cave bake (VoxelLandCaves.ush VOXEL_CAVE_WORD; read when CaveOn).
+        const uint* CaveBake = nullptr;
 
 #include "VoxelLandSample.ush"
 #include "VoxelLandGully.ush"
+#include "VoxelLandCaves.ush"
     };
 }
 
@@ -712,6 +718,7 @@ FVoxelTerrestrialDensity::FVoxelTerrestrialDensity(const FVoxelTerrestrialSettin
     LandHasWater = InLand.bCarveRivers && LandBake->Water.Num() == LandBake->NumCells() ? 1u : 0u;
 
     BuildLandSampler();
+    BuildCaves(InLand);
 }
 
 FVoxelTerrestrialDensity::~FVoxelTerrestrialDensity() = default;
@@ -731,6 +738,203 @@ double FVoxelTerrestrialDensity::LandHeightAt(const FVector& SurfacePoint, doubl
 {
     return LandSurfaceAt(SurfacePoint, Footprint, nullptr);
 }
+
+void FVoxelTerrestrialDensity::BuildCaves(const FVoxelTerrestrialSettings& InLand)
+{
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelTerrestrialDensity::BuildCaves);
+    CaveConstants = VoxelLand::CaveConstantsFor(InLand, *LandBake);
+    if (CaveConstants.CaveOn != 0u)
+    {
+        const uint32 Key = VoxelLand::CaveBakeKey(InLand, *LandBake);
+        LandCaves = VoxelLand::GetCaveBake(*LandBake, Key, [this]() { return MakeCaveBake(); });
+        if (!LandCaves.IsValid() || LandCaves->Words.Num() != 2 * LandBake->NumCells())
+        {
+            LandCaves.Reset();
+            CaveConstants.CaveOn = 0u;
+        }
+    }
+    if (CaveConstants.CaveOn != 0u)
+    {
+        UE_LOG(LogVoxelPlanets, Log, TEXT("[VoxelLand] Caves: %u cells of %.0f m a bake cell, %u levels %.0f m apart; karst above province %.3f (%.0f%% of the land)%s; meshed %.0f m deep to %.1f m cells; closed from %.1f m cells."),
+            CaveConstants.CaveCellsPerBake, CaveConstants.CaveCellM, CaveConstants.CaveLevels, CaveConstants.CaveLevelM,
+            0.5f * (CaveConstants.CaveKarstLo + CaveConstants.CaveKarstHi), 100.0 * FMath::Clamp(InLand.Caves.KarstCoverage, 0.0, 1.0),
+            CaveConstants.CaveKarstLo > 1.0f ? TEXT(" (no province: no karst)") : TEXT(""), CaveConstants.CaveDepthM, CaveConstants.CaveDeepCellM,
+            CaveConstants.CaveMaxRadiusM);
+    }
+    VoxelShader::FVoxelLandSamplerCPU& Sampler = *LandSampler;
+    static_cast<FVoxelCaveConstants&>(Sampler) = CaveConstants;
+    Sampler.CaveBake = LandCaves.IsValid() ? LandCaves->Words.GetData() : nullptr;
+}
+
+TSharedPtr<FVoxelLandCaveBake, ESPMode::ThreadSafe> FVoxelTerrestrialDensity::MakeCaveBake() const
+{
+    TRACE_CPUPROFILER_EVENT_SCOPE(FVoxelTerrestrialDensity::MakeCaveBake);
+    using namespace VoxelShader;
+    using namespace VoxelTerrestrialDensityDetail;
+    const double StartSeconds = FPlatformTime::Seconds();
+    const FVoxelLandBake& Bake = *LandBake;
+    const int32 BakeN = Bake.N;
+    const int32 Side = Bake.Side();
+    const int32 Pad = FVoxelLandBake::Pad;
+    const int32 NumCells = Bake.NumCells();
+    const bool bProvince = Bake.Province.Num() == NumCells;
+    const TSharedPtr<FVoxelLandCaveBake, ESPMode::ThreadSafe> Made = MakeShared<FVoxelLandCaveBake, ESPMode::ThreadSafe>();
+    Made->N = BakeN;
+    Made->Words.SetNumZeroed(2 * NumCells);
+    uint32* Words = Made->Words.GetData();
+    FVoxelLandSamplerCPU& Sampler = *LandSampler;
+
+    // The province bilinear between cell centres at a direction (the bake's own, 0..1).
+    auto ProvinceAt = [&Bake, BakeN, Side, Pad](const FVector& Dir) -> float
+        {
+            int32 Axis = 0;
+            for (int32 a = 1; a < 3; a++) if (FMath::Abs(Dir[a]) > FMath::Abs(Dir[Axis])) Axis = a;
+            const uint32 Face = (uint32)(Axis * 2 + (Dir[Axis] < 0.0 ? 1 : 0));
+            const double Den = FMath::Abs(Dir[Axis]);
+            const double S = FMath::Atan(Dir[(int32)VoxelCubeUAxis(Face)] / Den) * 4.0 / UE_DOUBLE_PI;
+            const double T = FMath::Atan(Dir[(int32)VoxelCubeVAxis(Face)] / Den) * 4.0 / UE_DOUBLE_PI;
+            const double J = (S + 1.0) * 0.5 * BakeN - 0.5;
+            const double K = (T + 1.0) * 0.5 * BakeN - 0.5;
+            const int32 J0 = FMath::FloorToInt32(J);
+            const int32 K0 = FMath::FloorToInt32(K);
+            const double FX = J - J0;
+            const double FY = K - K0;
+            auto At = [&Bake, BakeN, Side, Pad, Face](int32 CJ, int32 CK) -> double
+                {
+                    CJ = FMath::Clamp(CJ, -Pad, BakeN + Pad - 1);
+                    CK = FMath::Clamp(CK, -Pad, BakeN + Pad - 1);
+                    return (double)Bake.Province[(int32)Face * Side * Side + (CK + Pad) * Side + (CJ + Pad)] / 63.0;
+                };
+            return (float)((At(J0, K0) * (1.0 - FX) + At(J0 + 1, K0) * FX) * (1.0 - FY) + (At(J0, K0 + 1) * (1.0 - FX) + At(J0 + 1, K0 + 1) * FX) * FY);
+        };
+
+    // Each cell's centre through the warp (as LandSurfaceAt warps): the height, drainage, relief
+    // and province there.
+    ParallelFor(6 * Side, [&](int32 Row)
+        {
+            const int32 Face = Row / Side;
+            const int32 k = Row % Side - Pad;
+            const int32 NormalAxis = (int32)VoxelCubeNormalAxis((uint32)Face);
+            const int32 UAxis = (int32)VoxelCubeUAxis((uint32)Face);
+            const int32 VAxis = (int32)VoxelCubeVAxis((uint32)Face);
+            const double TanV = FMath::Tan(((k + 0.5) * 2.0 / BakeN - 1.0) * UE_DOUBLE_PI * 0.25);
+            for (int32 i = 0; i < Side; i++)
+            {
+                const int32 j = i - Pad;
+                FVector Dir;
+                Dir[NormalAxis] = (Face & 1) ? -1.0 : 1.0;
+                Dir[UAxis] = FMath::Tan(((j + 0.5) * 2.0 / BakeN - 1.0) * UE_DOUBLE_PI * 0.25);
+                Dir[VAxis] = TanV;
+                Dir.Normalize();
+                const FVector SurfacePoint = Dir * LandSampleRadius;
+                FVector Q = SurfacePoint;
+                if (LandWarpAmplitude > 0.0)
+                {
+                    for (int32 Axis = 0; Axis < 3; Axis++)
+                        Q[Axis] += VoxelDensityLayers::EvaluateLayer(LandWarp[Axis], SurfacePoint, 0.0, LandWarpRidgeGain, LandWarpSlopeDamping) * LandWarpAmplitude;
+                }
+                const FVoxelLandSamplerCPU::FVoxelLandBakeSample Sample = Sampler.VoxelLandBakeSampleDF(ToDoubleFloat(Q.X), ToDoubleFloat(Q.Y), ToDoubleFloat(Q.Z), true);
+                const float Province = bProvince ? ProvinceAt(Q.GetSafeNormal()) : 0.0f;
+                const int32 Cell = Face * Side * Side + (k + Pad) * Side + i;
+                Words[2 * Cell] = asuint(Sample.Height);
+                Words[2 * Cell + 1] = Sampler.VoxelCavePackWord(0.0f, Sample.Flow, Sample.Relief, Province);
+            }
+        });
+
+    // The local base: the lowest of those heights (sea level for the sea) within VoxelLandRelief's
+    // window (about two cells), within the face's padded cells.
+    ParallelFor(6 * Side, [&](int32 Row)
+        {
+            const int32 Face = Row / Side;
+            const int32 Row0 = Row % Side;
+            for (int32 i = 0; i < Side; i++)
+            {
+                float Lo = 3.0e38f;
+                for (int32 dj = -2; dj <= 2; dj++)
+                {
+                    for (int32 di = -2; di <= 2; di++)
+                    {
+                        if (di * di + dj * dj > 5) continue;
+                        const int32 r = Row0 + dj;
+                        const int32 c = i + di;
+                        if (r < 0 || r >= Side || c < 0 || c >= Side) continue;
+                        Lo = FMath::Min(Lo, FMath::Max(asfloat(Words[2 * (Face * Side * Side + r * Side + c)]), 0.0f));
+                    }
+                }
+                const int32 Cell = Face * Side * Side + Row0 * Side + i;
+                Words[2 * Cell + 1] = (Words[2 * Cell + 1] & ~0x3FFFu) | (Sampler.VoxelCavePackWord(Lo, VOXEL_CAVE_FLOW_FROM, 0.0f, 0.0f) & 0x3FFFu);
+            }
+        });
+
+    Made->BuildSeconds = FPlatformTime::Seconds() - StartSeconds;
+    UE_LOG(LogVoxelPlanets, Log, TEXT("[VoxelLand] Cave bake for bake %08x: %d cells in %.2f s (%.0f MB)."), Bake.Key, NumCells, Made->BuildSeconds,
+        (double)Made->Words.Num() * 4.0 / (1024.0 * 1024.0));
+    return Made;
+}
+
+bool FVoxelTerrestrialDensity::MayHoldSurfaceInSolid(const FBox& Region, double Footprint) const
+{
+    using namespace VoxelShader;
+    using VoxelTerrestrialDensityDetail::ToDoubleFloat;
+    FVoxelLandSamplerCPU& Sampler = *LandSampler;
+    const float FootprintM = (float)(FMath::Max(Footprint, MinFootprint) * 0.01);
+    if (Sampler.CaveOn == 0u || FootprintM >= Sampler.CaveMaxRadiusM || !Region.IsValid) return false;
+    return Sampler.VoxelCaveBoxMayHold(ToDoubleFloat(Region.Min.X), ToDoubleFloat(Region.Min.Y), ToDoubleFloat(Region.Min.Z),
+        ToDoubleFloat(Region.Max.X), ToDoubleFloat(Region.Max.Y), ToDoubleFloat(Region.Max.Z), ToDoubleFloat(LandSampleRadius), FootprintM);
+}
+
+void FVoxelTerrestrialDensity::SampleRange(const FSampleInput& Input, int32 Begin, int32 End, double Footprint, float* DensityOut) const
+{
+    using namespace VoxelShader;
+    using VoxelTerrestrialDensityDetail::ToDoubleFloat;
+    FVoxelLandSamplerCPU& Sampler = *LandSampler;
+    // Footprints below the finest cell are raised to it, as HeightAt does (and the GPU).
+    const double Band = FMath::Max(Footprint, MinFootprint);
+    const float FootprintM = (float)(Band * 0.01);
+    const bool bCaves = Sampler.CaveOn != 0u && FootprintM < Sampler.CaveMaxRadiusM;
+    // The last region gathered (a cave cell and 32 m of altitude) and its list.
+    constexpr float BandM = 32.0f;
+    FVoxelLandSamplerCPU::FVoxelCaveRegion Region{};
+    FVoxelLandSamplerCPU::FVoxelCaveList List{};
+    bool bList = false;
+    for (int32 i = Begin; i < End; i++)
+    {
+        const FVector Position = Input.GetPosition(i);
+        const double Len = Position.Size();
+        if (Len <= 1e-12 || NoiseAmplitude <= 0.0)
+        {
+            DensityOut[i] = (float)(Len - PlanetRadius);
+            continue;
+        }
+        float BakeM = 0.0f;
+        const double Height = LandSurfaceAt(Position * (LandSampleRadius / Len), Band, nullptr, &BakeM);
+        float Density = (float)(Len - (PlanetRadius + Height));
+        if (bCaves)
+        {
+            // The caves' cheap gates first (as VoxelLandCaveCarve.ush VoxelCaveDistanceDF).
+            const float LandM = (float)((Height - LandHeightOffset) * 0.01);
+            const float Z = (float)((Len - LandSampleRadius) * 0.01);
+            if (Z - LandM <= 2.0f * FootprintM + Sampler.CaveBlendM + 1.0f && BakeM - Z <= FMath::Max(Sampler.CaveDepthM, Sampler.CaveShallowDepthM) + Sampler.CaveBandSlackM)
+            {
+                const FVoxelLandSamplerCPU::FVoxelCaveSample S = Sampler.VoxelCaveSampleDF(ToDoubleFloat(Position.X), ToDoubleFloat(Position.Y), ToDoubleFloat(Position.Z),
+                    ToDoubleFloat(Len), ToDoubleFloat(LandSampleRadius), LandM, BakeM, FootprintM);
+                if (!Sampler.VoxelCaveSkip(S))
+                {
+                    if (!bList || S.Face != List.Face || S.IU != List.OU || S.IV != List.OV || S.Z < Region.ZMin || S.Z > Region.ZMax)
+                    {
+                        const float Z0 = FMath::FloorToFloat(S.Z / BandM) * BandM;
+                        Region = Sampler.VoxelCaveCellRegion(S, Z0, Z0 + BandM);
+                        List = Sampler.VoxelCaveGather(Region);
+                        bList = true;
+                    }
+                    Density = Sampler.VoxelCaveCarve(Density, Sampler.VoxelCaveEvaluate(List, S).Distance, 100.0f);
+                }
+            }
+        }
+        DensityOut[i] = Density;
+    }
+}
+
 
 void FVoxelTerrestrialDensity::BuildLandSampler()
 {
@@ -960,7 +1164,7 @@ void FVoxelTerrestrialDensity::BuildLandSampler()
     Sampler.LandGullySeed = LandGullySeed;
 }
 
-double FVoxelTerrestrialDensity::LandSurfaceAt(const FVector& SurfacePoint, double Footprint, FVoxelWaterSample* OutWater) const
+double FVoxelTerrestrialDensity::LandSurfaceAt(const FVector& SurfacePoint, double Footprint, FVoxelWaterSample* OutWater, float* OutBake) const
 {
     using namespace VoxelShader;
     using namespace VoxelTerrestrialDensityDetail;
@@ -996,6 +1200,7 @@ double FVoxelTerrestrialDensity::LandSurfaceAt(const FVector& SurfacePoint, doub
     const double Height = (double)Land.Bake * 100.0 + LandHeightOffset + D * (double)((float)LandDetailAmplitude * DetailWeight * Land.DetailScale)
         + (double)Land.Hills * 100.0 + (double)Land.Peaks * 100.0 + (double)Land.Gully * 100.0 + (double)Land.Carve * 100.0;
     const double Clamped = FMath::Clamp(Height, 0.0, NoiseAmplitude);
+    if (OutBake) *OutBake = Land.Bake;
     if (OutWater)
     {
         // R2 (Design/RiversLakes.md 3.6): a kept lake over the ground, else a river's water line
@@ -1223,6 +1428,9 @@ void FVoxelTerrestrialDensity::BuildGPUData(FVoxelDensityGPUData& Out) const
     Out.LandGlacialCooling = LandGlacialCooling;
     Out.LandGlacialDetailScaleHard = LandGlacialDetailScaleHard;
     Out.LandGlacialDetailScaleSoft = LandGlacialDetailScaleSoft;
+    // K1: the caves.
+    Out.Caves = CaveConstants;
+    Out.LandCaves = LandCaves;
 
     // The warp is sampled on the sea-level sphere (the finest octaves are its).
     double MaxFrequency = 0.0;

@@ -7,6 +7,7 @@
 #include "CoreMinimal.h"
 #include "VoxelEditGPU.h"   // FVoxelEditGPUData, VoxelDoubleFloat (the engine's)
 #include "VoxelDensitySource.h"
+#include "VoxelLandCaves.h"   // FVoxelCaveConstants
 #include "RenderGraphResources.h"
 
 class FSparseEditStore;
@@ -217,12 +218,17 @@ struct FVoxelDensityGPUData
     float LandPolarDuneM = 0.0f;
     float LandPolarDuneMean = 0.0f;
     float LandPolarDuneFade = 0.0f;
+    // K1: the caves (VoxelLandCaves.ush; FVoxelTerrestrialDensity's): the constants (CaveOn 0: none)
+    // and the cave bake they read (null: none).
+    FVoxelCaveConstants Caves;
+    TSharedPtr<const FVoxelLandCaveBake, ESPMode::ThreadSafe> LandCaves;
 };
 
 /** The planet density as the voxel engine's GPU mesher takes it (Design/PlanetPluginSplit.md,
- *  S1a): Data, and the planet's mesher passes (VoxelTerrestrialMesher.usf): the sample pass on
- *  the density (VoxelDensitySample.ush: the noise surface or the land chain) and the land debug
- *  views' colour pass (VoxelLandDebug.ush). FVoxelPlanetDensity::MakeGPUSource makes one. */
+ *  S1a): Data, and the planet's mesher passes (VoxelTerrestrialMesher.usf): the caves' gather
+ *  pass (K1: each brick's cave lists, before its samples), the sample pass on the density
+ *  (VoxelDensitySample.ush: the noise surface or the land chain, with the caves) and the land
+ *  debug views' colour pass (VoxelLandDebug.ush). FVoxelPlanetDensity::MakeGPUSource makes one. */
 class VOXELPLANETS_API FVoxelDensityGPUSource : public IVoxelDensitySourceGPU
 {
 public:
@@ -244,7 +250,7 @@ private:
 /** What SampleBlocksAsync returns per point. */
 enum class EVoxelDensityGPUOutput : uint8
 {
-    Density,   // the density without edits (FVoxelPlanetDensity::Sample)
+    Density,   // the density without edits (FVoxelPlanetDensity::Sample; the caves one gather a point)
     Radial,    // |p| - R only: the double-float position path alone
     Edits      // the density with the edits (FSparseEditStore::Apply on FVoxelPlanetDensity::Sample)
 };

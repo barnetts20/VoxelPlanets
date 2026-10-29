@@ -413,6 +413,8 @@ uint32 FVoxelTerrestrialSettings::GetSettingsHash() const
     // T5e: the ice shelf.
     for (const double V : { IceShelfHeight, IceShelfTemperature, IceShelfFrontNoise, IceShelfRise, IceShelfRoll, IceShelfDraft })
         H = HashCombine(H, ::GetTypeHash(V));
+    // K1: the caves (FVoxelCaveSettings, VoxelLandCaves.cpp).
+    H = HashCombine(H, Caves.GetHash());
     return H;
 }
 

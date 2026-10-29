@@ -1,7 +1,8 @@
 // VoxelLandGPU.h - The land bake on the GPU for sampling (VoxelLandSample.ush): its buffers,
 // uploaded once per bake on the render thread, and the shader parameters every pass that
-// evaluates the density binds (the density check, the brick mesher, the ocean pages). Private
-// to the module: it pulls in the render graph headers.
+// evaluates the density binds (the density check, the brick mesher, the ocean pages); and the
+// caves' (K1: the cave bake and constants, for the passes that carve them, and the mesher's
+// gathered lists' layouts). Private to the module: it pulls in the render graph headers.
 
 #pragma once
 
@@ -46,6 +47,43 @@ struct FVoxelLandNoiseGPU
 {
     TRefCountPtr<FRDGPooledBuffer> Words;
 };
+
+/** K1: the GPU copy of an FVoxelLandCaveBake (render thread only): its words. */
+struct FVoxelLandCaveBakeGPU
+{
+    TRefCountPtr<FRDGPooledBuffer> Words;
+};
+
+/** K1: a gathered cave primitive (FVoxelCavePrim in VoxelLandCaves.ush): its places and radii,
+ *  depth, kind and flags. The mesher's gather pass writes VOXEL_CAVE_MAX_PRIMS a list. */
+struct FVoxelCavePrimGPU
+{
+    float Values[13] = {};
+    uint32 Kind = 0;
+    uint32 Flags = 0;
+    uint32 Pad = 0;
+};
+static_assert(sizeof(FVoxelCavePrimGPU) == 64, "Must match FVoxelCavePrim in VoxelLandCaves.ush");
+
+/** K1: a brick's face slot's list head (FVoxelCaveListHead in VoxelLandCaves.ush): its region
+ *  and its list's count. The mesher's gather pass writes VOXEL_CAVE_SLOTS a brick. */
+struct FVoxelCaveListHeadGPU
+{
+    uint32 Words[12] = {};
+};
+static_assert(sizeof(FVoxelCaveListHeadGPU) == 48, "Must match FVoxelCaveListHead in VoxelLandCaves.ush");
+
+/** K1: the slots a brick's gather writes (VOXEL_CAVE_SLOTS) and the primitives a slot holds
+ *  (VOXEL_CAVE_MAX_PRIMS), as VoxelLandCaves.ush defines them. */
+namespace VoxelLandGPU
+{
+    constexpr uint32 CaveSlots = 3;
+    constexpr uint32 CaveMaxPrims = 64;
+    /** The gather pass's node grid per face slot (VOXEL_CAVE_NODES FVoxelCaveNode of 44 bytes),
+     *  kept in a scratch buffer rather than thread-local memory (VOXEL_CAVE_GATHER_BUFFERS). */
+    constexpr uint32 CaveNodesPerSlot = 144;
+    constexpr uint32 CaveNodeBytes = 44;
+}
 
 /** Declared in the shader by VoxelLandParameters.ush, read by VoxelLandSample.ush and the land
  *  branch of VoxelDensitySample.ush. Included flat in a pass's parameters
@@ -238,6 +276,76 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelLandShaderParameters, )
     SHADER_PARAMETER(float, LandPolarDuneFade)
 END_SHADER_PARAMETER_STRUCT()
 
+/** K1: the caves' inputs (VoxelCaveParameters.ush; FVoxelCaveConstants, VoxelLandCaves.h, holds
+ *  the same names): the cave bake and the constants. Included flat in the parameters of the
+ *  passes that carve caves (the density check, the brick mesher's sample and gather passes). */
+BEGIN_SHADER_PARAMETER_STRUCT(FVoxelCaveShaderParameters, )
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, CaveBake)
+    SHADER_PARAMETER(uint32, CaveOn)
+    SHADER_PARAMETER(uint32, CaveSeed)
+    SHADER_PARAMETER(uint32, CaveCellsPerBake)
+    SHADER_PARAMETER(uint32, CaveLevels)
+    SHADER_PARAMETER(uint32, CaveRoughCells)
+    SHADER_PARAMETER(uint32, CaveRoughOctaves)
+    SHADER_PARAMETER(uint32, CaveSeaCells)
+    SHADER_PARAMETER(float, CaveCellM)
+    SHADER_PARAMETER(float, CaveLevelM)
+    SHADER_PARAMETER(float, CaveTableShare)
+    SHADER_PARAMETER(float, CaveFloorClearM)
+    SHADER_PARAMETER(float, CavePhiWaveCells)
+    SHADER_PARAMETER(float, CavePhiNoiseM)
+    SHADER_PARAMETER(float, CavePhiJitterM)
+    SHADER_PARAMETER(float, CavePhiNoiseSlope)
+    SHADER_PARAMETER(float, CaveTrunkFlowLo)
+    SHADER_PARAMETER(float, CaveTrunkFlowHi)
+    SHADER_PARAMETER(float, CaveRadiusM)
+    SHADER_PARAMETER(float, CaveRadiusSpread)
+    SHADER_PARAMETER(float, CaveTrunkGain)
+    SHADER_PARAMETER(float, CaveRadiusMaxM)
+    SHADER_PARAMETER(float, CaveKarstLo)
+    SHADER_PARAMETER(float, CaveKarstHi)
+    SHADER_PARAMETER(float, CaveKarstSlack)
+    SHADER_PARAMETER(float, CaveActiveShare)
+    SHADER_PARAMETER(float, CaveTrunkActive)
+    SHADER_PARAMETER(float, CaveChamberShare)
+    SHADER_PARAMETER(float, CaveChamberRadiusM)
+    SHADER_PARAMETER(float, CaveChamberSquash)
+    SHADER_PARAMETER(float, CaveShaftShare)
+    SHADER_PARAMETER(float, CaveShaftRadiusM)
+    SHADER_PARAMETER(float, CaveMouthShare)
+    SHADER_PARAMETER(float, CaveDolineShare)
+    SHADER_PARAMETER(float, CaveDolineRadiusM)
+    SHADER_PARAMETER(float, CaveDolineHeadM)
+    SHADER_PARAMETER(float, CaveDolineFunnel)
+    SHADER_PARAMETER(float, CaveDolineBowlM)
+    SHADER_PARAMETER(float, CaveDeepCellM)
+    SHADER_PARAMETER(float, CaveDepthM)
+    SHADER_PARAMETER(float, CaveShallowDepthM)
+    SHADER_PARAMETER(float, CaveRoughM)
+    SHADER_PARAMETER(float, CaveRoughGain)
+    SHADER_PARAMETER(float, CaveBeddingM)
+    SHADER_PARAMETER(float, CaveBeddingWaveM)
+    SHADER_PARAMETER(float, CaveBlendM)
+    SHADER_PARAMETER(float, CaveBandSlackM)
+    SHADER_PARAMETER(float, CaveSeaShare)
+    SHADER_PARAMETER(float, CaveSeaCoastM)
+    SHADER_PARAMETER(float, CaveSeaZM)
+    SHADER_PARAMETER(float, CaveSeaRadiusM)
+    SHADER_PARAMETER(float, CaveSeaReliefM)
+    SHADER_PARAMETER(float, CaveSeaTall)
+    SHADER_PARAMETER(float, CaveSeaFloorM)
+    SHADER_PARAMETER(float, CaveSeaRoofM)
+    SHADER_PARAMETER(float, CaveSeaCoverM)
+    SHADER_PARAMETER(float, CaveFloorFill)
+    SHADER_PARAMETER(float, CaveCanyonDepth)
+    SHADER_PARAMETER(float, CaveCanyonWidth)
+    SHADER_PARAMETER(float, CaveMeander)
+    SHADER_PARAMETER(float, CaveMeanderZM)
+    SHADER_PARAMETER(float, CaveCoverM)
+    SHADER_PARAMETER(float, CaveCoverSlope)
+    SHADER_PARAMETER(float, CaveMaxRadiusM)
+END_SHADER_PARAMETER_STRUCT()
+
 /** The land debug views' inputs (VoxelLandDebug.ush, declared in VoxelBrickMesherGPU.usf):
  *  the view, the bake's attributes, the sea radius, and the plate model's inputs
  *  (VoxelLandPlates.ush). Included in the brick mesher's parameters, with the density's
@@ -271,4 +379,9 @@ namespace VoxelLandGPU
      *  uploaded the first time a view needs them and kept with the bake; otherwise, or on the
      *  noise surface, one-element stand-ins. */
     FVoxelLandDebugParameters GetDebugParameters(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density, int32 Mode, double SeaRadius);
+
+    /** Render thread. K1: the caves' parameters of Density: its constants and its cave bake
+     *  (uploaded the first time any pass asks and kept with it), or CaveOn 0 and a one-element
+     *  stand-in when it has no caves (the noise surface, caves off, no cave bake). */
+    FVoxelCaveShaderParameters GetCaveParameters(FRDGBuilder& GraphBuilder, const FVoxelDensityGPUData& Density);
 }

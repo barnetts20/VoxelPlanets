@@ -1,8 +1,9 @@
 // VoxelTerrestrialMesher.usf - The terrestrial density source's mesher passes
-// (FVoxelDensityGPUSource, VoxelDensityGPU.cpp; Design/PlanetPluginSplit.md, S1a): the sample pass
-// on the planet density (VoxelDensitySample.ush: the noise surface or the land chain) and the land
-// debug views' colour pass (VoxelLandDebug.ush). The engine's mesher (VoxelBrickMesherGPU.usf)
-// records every other pass.
+// (FVoxelDensityGPUSource, VoxelDensityGPU.cpp; Design/PlanetPluginSplit.md, S1a): the caves'
+// gather pass (K1: each brick's cave lists, recorded before the batch's sample passes), the sample
+// pass on the planet density (VoxelDensitySample.ush: the noise surface or the land chain, with
+// the caves from the brick's lists) and the land debug views' colour pass (VoxelLandDebug.ush).
+// The engine's mesher (VoxelBrickMesherGPU.usf) records every other pass.
 
 #include "/Engine/Public/Platform.ush"
 #include "/Plugin/VoxelPlanets/Private/VoxelDensityCore.ush"
@@ -32,12 +33,29 @@ float SlopeDamping;
 #include "/Plugin/VoxelPlanets/Private/VoxelLandParameters.ush"
 #include "/Plugin/VoxelPlanets/Private/VoxelLandSample.ush"
 #include "/Plugin/VoxelPlanets/Private/VoxelLandGully.ush"
+
+// The caves (K1, VoxelLandCaves.ush): the cave bake and constants, and each brick's gathered lists
+// (VOXEL_CAVE_SLOTS heads a brick, VOXEL_CAVE_MAX_PRIMS primitives a head), which CaveGatherCS
+// writes and the sample pass reads. The gather keeps its node grid in a scratch buffer and writes
+// its primitives straight to CavePrimsOut (VOXEL_CAVE_GATHER_BUFFERS: VoxelLandCaves.ush declares
+// CaveNodesOut and CavePrimsOut), not in thread-local arrays.
+#define VOXEL_DENSITY_CAVES 1
+#define VOXEL_CAVE_STORED 1
+#define VOXEL_CAVE_GATHER_BUFFERS 1
+#include "/Plugin/VoxelPlanets/Private/VoxelCaveParameters.ush"
+#include "/Plugin/VoxelPlanets/Private/VoxelLandCaves.ush"
+StructuredBuffer<FVoxelCaveListHead> CaveHeads;
+StructuredBuffer<FVoxelCavePrim> CavePrims;
+RWStructuredBuffer<FVoxelCaveListHead> CaveHeadsOut;
+#include "/Plugin/VoxelPlanets/Private/VoxelLandCaveCarve.ush"
+
 #include "/Plugin/VoxelPlanets/Private/VoxelDensitySample.ush"
 
-// The mesher's density (VoxelMesherCommon.ush): the planet's, without the edits.
-float VoxelMesherSourceDensity(int X, int Y, int Z, float Footprint)
+// The mesher's density (VoxelMesherCommon.ush): the planet's, without the edits, the caves from
+// brick Brick's lists.
+float VoxelMesherSourceDensity(uint Brick, int X, int Y, int Z, float Footprint)
 {
-    return VoxelSampleDensityDF(X, Y, Z, Footprint);
+    return VoxelSampleDensityBrickDF(X, Y, Z, Footprint, Brick);
 }
 
 #include "/Plugin/VoxelPlugin/Private/VoxelEditSample.ush"
@@ -77,4 +95,57 @@ void SampleCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 void LandDebugCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
 {
     VoxelLandDebugPass(ThreadIndex(GroupId, GroupThread));
+}
+
+// The caves' gather (K1): one thread per brick and face slot. The brick's box with the margin its
+// samples reach (VOXEL_CAVE_BRICK_MARGIN of its cells: neighbours, coarser targets, gradient
+// points), at its level's footprint (its stitched and target samples are at it or coarser: one
+// list serves them all); the slot's region (VoxelCaveBoxRegion) and its gathered list, for the
+// brick's samples (VoxelLandCaveCarve.ush VoxelCaveStoredDistance).
+[numthreads(64, 1, 1)]
+void CaveGatherCS(uint3 GroupId : SV_GroupID, uint GroupThread : SV_GroupIndex)
+{
+    const uint Id = ThreadIndex(GroupId, GroupThread);
+    if (Id >= NumBricks * VOXEL_CAVE_SLOTS) return;
+    const uint B = Id / VOXEL_CAVE_SLOTS;
+    const uint Slot = Id % VOXEL_CAVE_SLOTS;
+    const FVoxelMesherBrick Brick = Bricks[B];
+    const int Scale = int(1u << uint(Brick.Level));
+    const int Lo = -2 * VOXEL_CAVE_BRICK_MARGIN * Scale;
+    const int Hi = (2 * CellsPerBrick + 2 * VOXEL_CAVE_BRICK_MARGIN) * Scale;
+    const float2 MinX = VoxelDFMul(VoxelDFFromInt(Brick.MinIndex.x + Lo), HalfFinest);
+    const float2 MinY = VoxelDFMul(VoxelDFFromInt(Brick.MinIndex.y + Lo), HalfFinest);
+    const float2 MinZ = VoxelDFMul(VoxelDFFromInt(Brick.MinIndex.z + Lo), HalfFinest);
+    const float2 MaxX = VoxelDFMul(VoxelDFFromInt(Brick.MinIndex.x + Hi), HalfFinest);
+    const float2 MaxY = VoxelDFMul(VoxelDFFromInt(Brick.MinIndex.y + Hi), HalfFinest);
+    const float2 MaxZ = VoxelDFMul(VoxelDFFromInt(Brick.MinIndex.z + Hi), HalfFinest);
+    const float FootprintM = max(ldexp(FinestCell, Brick.Level), MinFootprint) * 0.01f;
+    const float2 SeaRadius = VoxelDFAdd(PlanetRadius, LandHeightOffset);
+
+    FVoxelCaveRegion R = VoxelCaveBoxRegion(MinX, MinY, MinZ, MaxX, MaxY, MaxZ, SeaRadius, FootprintM, Slot);
+    if (LandMode == 0u || CaveOn == 0u) R.Valid = 0u;
+    FVoxelCaveListHead Head;
+    Head.Face = R.Face;
+    Head.OU = R.OU;
+    Head.OV = R.OV;
+    Head.NU = R.NU;
+    Head.NV = R.NV;
+    Head.ZMin = R.ZMin;
+    Head.ZMax = R.ZMax;
+    Head.Footprint = R.Footprint;
+    Head.Count = 0u;
+    Head.Stage = 0u;
+    Head.Valid = R.Valid;
+    Head.Overflow = 0u;
+    // Gathered only while caves are open at the footprint (above it the list is valid and empty).
+    // The node grid in this thread's scratch (VOXEL_CAVE_NODES), the primitives straight into its
+    // slot's list (VOXEL_CAVE_MAX_PRIMS).
+    if (R.Valid != 0u && FootprintM < CaveMaxRadiusM)
+    {
+        CaveGatherNodeBase = Id * uint(VOXEL_CAVE_NODES);
+        CaveGatherPrimBase = Id * uint(VOXEL_CAVE_MAX_PRIMS);
+        const FVoxelCaveList L = VoxelCaveGather(R);
+        Head = VoxelCaveHeadOf(R, L);
+    }
+    CaveHeadsOut[Id] = Head;
 }

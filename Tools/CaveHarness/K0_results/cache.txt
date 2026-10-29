@@ -1,0 +1,12 @@
+caves: cell 192 m (16 per bake cell), 3 levels 40 m apart from the water table (share 0.20), radius 3.0 m (spread 0.35, trunks x2.5, max 24 m)
+       karst above province 0.404 (25% of the land); active 0.70 (+0.30 trunks); chambers 0.05 (22 m), shafts 0.12, mouths 0.00, dolines 0.00
+       depth 500 m at cells to 4 m, 150 m above; cover 24 m (slope 0.40); detail 0.70 m at 8.0 m (3 octaves, gain 0.45), bedding 0.25 m at 1.6 m; blend 1.5 m
+       sea caves 0.35 a 4-cell node at |h| < 60 m, relief > 150 m: radius 6.0 m (x1.5 tall), roof 5 m, into the cliff to 45 m of overburden
+  upland 0:  25.0 km^2 karst of 25.0;   0 mouths (0 open texels):
+          cache columns: 390625 land texels, 390625 one crossing, 0 flagged: 0 at mouths, 0 elsewhere
+  valley 0:  24.9 km^2 karst of 25.0;   0 mouths (0 open texels):
+          cache columns: 389621 land texels, 389617 one crossing, 4 flagged: 4 at mouths, 0 elsewhere
+  coast  0:   0.0 km^2 karst of 25.0;   0 mouths (0 open texels):
+          cache columns: 201434 land texels, 201431 one crossing, 3 flagged: 3 at mouths, 0 elsewhere
+mouths (karst sites): 0 over 49.9 km^2 of karst: 0.0 per 1,000 km^2 (Earth's karst: 6-63);
+cache columns: 981680 land texels, 7 flagged: 7 at mouths, 0 elsewhere

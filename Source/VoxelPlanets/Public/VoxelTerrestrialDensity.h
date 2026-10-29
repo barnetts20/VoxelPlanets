@@ -2,13 +2,15 @@
 // whose heightfield is the land bake's heights (sampled through a warp, VoxelLandSample.ush)
 // plus the hillside layers (hills, peaks, strata, dunes, the glacial and polar surfaces, the
 // ice sheets), the gullies (VoxelLandGully.ush), the detail layer (VoxelLandDetail.ush, N1) and
-// the rivers' and lakes' carve (VoxelLandCarve.ush), from the shared land code the GPU runs too.
+// the rivers' and lakes' carve (VoxelLandCarve.ush), from the shared land code the GPU runs too;
+// and the caves carved into it (VoxelLandCaves.ush, K1).
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "VoxelPlanetDensity.h"
 #include "VoxelDensityLayers.h"
+#include "VoxelLandCaves.h"
 
 struct FVoxelLandBake;
 struct FVoxelLandClimateField;
@@ -50,6 +52,12 @@ public:
     /** The base's, then the warp's octaves and the Land* block (LandMode 1). */
     virtual void BuildGPUData(FVoxelDensityGPUData& Out) const override;
 
+    /** K1: whether the caves may hold surface in Region (a cave there at Footprint:
+     *  VoxelLandCaves.ush VoxelCaveBoxMayHold), for an empty test whose sample proved it solid:
+     *  the caves' distance is exact only near them, so a sample far from one reads the land's
+     *  depth. */
+    virtual bool MayHoldSurfaceInSolid(const FBox& Region, double Footprint) const override;
+
     /** The generator's bake (never null). */
     const TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe>& GetLandBake() const { return LandBake; }
 
@@ -59,15 +67,35 @@ public:
     /** T5c: the climate the dunes were placed by (null: no dunes). */
     const TSharedPtr<const FVoxelLandClimateField, ESPMode::ThreadSafe>& GetLandClimate() const { return LandClimate; }
 
+    /** K1: the caves' constants (CaveOn 0: none) and the cave bake they read (null: none). */
+    const FVoxelCaveConstants& GetCaveConstants() const { return CaveConstants; }
+    const TSharedPtr<const FVoxelLandCaveBake, ESPMode::ThreadSafe>& GetLandCaves() const { return LandCaves; }
+
+protected:
+    /** The density with the caves (K1): the land as HeightAt gives it, then the caves carved
+     *  (VoxelLandCaves.ush, smax in cm). The caves gathered once per cave cell and 32 m of
+     *  altitude while consecutive samples stay in them (exact: VoxelCaveGather's region). */
+    virtual void SampleRange(const FSampleInput& Input, int32 Begin, int32 End, double Footprint, float* DensityOut) const override;
+
 private:
     /** HeightAt for the terrestrial generator, from the surface point on the sea-level sphere
      *  (the bake's SeaRadius; VoxelDensitySample.ush samples the same sphere). */
     double LandHeightAt(const FVector& SurfacePoint, double Footprint) const;
-    /** The same, and with OutWater the water there (WaterAt). */
-    double LandSurfaceAt(const FVector& SurfacePoint, double Footprint, FVoxelWaterSample* OutWater) const;
+    /** The same, and with OutWater the water there (WaterAt), with OutBake the bake's height
+     *  through the warp (m about sea level; the caves' sample). */
+    double LandSurfaceAt(const FVector& SurfacePoint, double Footprint, FVoxelWaterSample* OutWater, float* OutBake = nullptr) const;
     /** The land sampler (LandSampler) from the constants and buffers above, once the
      *  constructor has them all. */
     void BuildLandSampler();
+
+    /** K1: the caves' constants for InLand and the bake, and the cave bake (kept with the bake
+     *  while its key holds: VoxelLand::GetCaveBake, else MakeCaveBake), set on the sampler. After
+     *  BuildLandSampler. */
+    void BuildCaves(const FVoxelTerrestrialSettings& InLand);
+    /** The cave bake (VoxelLandCaves.ush VOXEL_CAVE_WORD): per padded bake cell, the bake through
+     *  the sampling warp at the cell's centre (its height, drainage and relief; the province
+     *  bilinear at the warped point), then the local base over VoxelLandRelief's window. */
+    TSharedPtr<FVoxelLandCaveBake, ESPMode::ThreadSafe> MakeCaveBake() const;
 
     TSharedPtr<const FVoxelLandBake, ESPMode::ThreadSafe> LandBake;
     VoxelDensityLayers::FLayer LandWarp[3];   // the sampling warp's components (no band limit)
@@ -230,6 +258,10 @@ private:
     float LandPolarDuneM = 0.0f;
     float LandPolarDuneMean = 0.0f;
     float LandPolarDuneFade = 0.0f;
+
+    // K1: the caves (VoxelLandCaves.ush): the constants (CaveOn 0: none) and the cave bake.
+    FVoxelCaveConstants CaveConstants;
+    TSharedPtr<const FVoxelLandCaveBake, ESPMode::ThreadSafe> LandCaves;
 
     TArray<uint32> LandFlowPacked;      // the bake's drainage, two f16 cells per word (empty: none)
     TArray<uint32> LandFormPacked;      // the bake's landform, two cells per word (empty: none)

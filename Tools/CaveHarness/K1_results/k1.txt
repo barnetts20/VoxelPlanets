@@ -1,0 +1,25 @@
+detail layer from the generated set: 4 scales from 20000 m (texel 312.50 m), A mean 0.5158 std 0.1066, bound 3.58; hard 11.45 soft 13.68 texels
+rivers from 200 km^2 (the GPU build, 1 build): 45660 segments, 10021 chains, 962 mouths, 270 lake inlets, 222 outlets; 98398 entries (max 41 a tile, overflow 0)
+planet n512: R 1000 km, N 512, cell 3068 m, lambda0 6136 m, 0 gully octaves, gully reach 0 m, heights -7629..8737 m, lattice finest 102 cm; hills 150 m, 8 octaves; peaks 1.00, spacing 6000 m (texel 93.8 m, set relief 2643 m), relief up to 5782 m
+caves: cell 192 m (16 per bake cell), 3 levels 40 m apart from the water table (share 0.20), radius 3.0 m (spread 0.35, trunks x2.5, max 24 m)
+       karst above province 0.404 (25% of the land); active 0.70 (+0.30 trunks); chambers 0.05 (22 m), shafts 0.12, mouths 0.00, dolines 0.00
+       depth 500 m at cells to 4 m, 150 m above; cover 24 m (slope 0.40); detail 0.70 m at 8.0 m (3 octaves, gain 0.45), bedding 0.25 m at 1.6 m; blend 1.5 m
+       sea caves 0.35 a 4-cell node at |h| < 60 m, relief > 150 m: radius 6.0 m (x1.5 tall), roof 5 m, into the cliff to 45 m of overburden
+k1 sample: 4000 points: face differs 0, cell differs 0 (a boundary within the cells' difference), |d cell| max 3.22e-06 cells, |dZ| max 1.22e-04 m, |dE| max 1.53e-05 m, |d province| max 7.41e-03; distance found by one only 3, |d distance| max 4.90e-04 m
+k1 bricks level 0 (1 m cells, 16 m bricks + 12 cells): 60 bricks (42 with caves), 60 face slots (0 too large), regions up to 2 cells; 4.3 primitives a list (max 25, 0 overflowed); gather 6.2 us a brick
+    18000 samples (386 in caves): near the surface (|d| < 4 cells) 1566, differing 0 (max 0 m); deeper 16434, differing 846
+k1 bricks level 1 (2 m cells, 32 m bricks + 12 cells): 60 bricks (44 with caves), 60 face slots (0 too large), regions up to 2 cells; 7.8 primitives a list (max 26, 0 overflowed); gather 7.2 us a brick
+    18000 samples (99 in caves): near the surface (|d| < 4 cells) 1593, differing 0 (max 0 m); deeper 16407, differing 1785
+k1 bricks level 2 (4 m cells, 64 m bricks + 12 cells): 60 bricks (45 with caves), 60 face slots (0 too large), regions up to 3 cells; 8.7 primitives a list (max 31, 0 overflowed); gather 8.6 us a brick
+    18000 samples (13 in caves): near the surface (|d| < 4 cells) 1183, differing 0 (max 0 m); deeper 16817, differing 2201
+k1 bricks level 3 (8 m cells, 128 m bricks + 12 cells): 60 bricks (14 with caves), 60 face slots (0 too large), regions up to 4 cells; 0.4 primitives a list (max 5, 0 overflowed); gather 10.5 us a brick
+    18000 samples (0 in caves): near the surface (|d| < 4 cells) 1532, differing 0 (max 0 m); deeper 16468, differing 475
+k1 bricks level 4 (16 m cells, 256 m bricks + 12 cells): 60 bricks (5 with caves), 60 face slots (0 too large), regions up to 7 cells; 0.1 primitives a list (max 1, 0 overflowed); gather 16.1 us a brick
+    18000 samples (0 in caves): near the surface (|d| < 4 cells) 2756, differing 0 (max 0 m); deeper 15244, differing 62
+k1 CPU cache: 49152 samples on 16^3 grids at caves, 49152 evaluated, 48 gathers: differing 0; 0.431 us a sample cached, 4.980 us one gather a sample
+k1 solid regions level 0 (19 m, radius 17 m): 80 boxes near caves, 0 proved solid by the centre sample: 0 hold cave surface (holes without the box test), box test keeps 0, misses 0; 0.0 us a box test
+k1 solid regions level 1 (39 m, radius 33 m): 80 boxes near caves, 4 proved solid by the centre sample: 0 hold cave surface (holes without the box test), box test keeps 3, misses 0; 7.8 us a box test
+k1 solid regions level 2 (77 m, radius 67 m): 80 boxes near caves, 33 proved solid by the centre sample: 0 hold cave surface (holes without the box test), box test keeps 3, misses 0; 10.2 us a box test
+k1 solid regions level 3 (155 m, radius 134 m): 80 boxes near caves, 6 proved solid by the centre sample: 0 hold cave surface (holes without the box test), box test keeps 0, misses 0; 9.6 us a box test
+k1 solid regions level 4 (309 m, radius 268 m): 80 boxes near caves, 0 proved solid by the centre sample: 0 hold cave surface (holes without the box test), box test keeps 0, misses 0; 0.0 us a box test
+k1 packing: base within 0.250 m, drainage within 0.250 (log2 m^2, 16..47.5), relief within 28.2% (above 10 m), province within 0.0079; 12 MB for 1622400 cells

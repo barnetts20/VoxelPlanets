@@ -1,0 +1,13 @@
+detail layer from the generated set: 4 scales from 20000 m (texel 312.50 m), A mean 0.5158 std 0.1066, bound 3.58; hard 11.45 soft 13.68 texels
+rivers from 200 km^2 (the GPU build, 1 build): 45660 segments, 10021 chains, 962 mouths, 270 lake inlets, 222 outlets; 98398 entries (max 41 a tile, overflow 0)
+planet n512: R 1000 km, N 512, cell 3068 m, lambda0 6136 m, 0 gully octaves, gully reach 0 m, heights -7629..8737 m, lattice finest 102 cm; hills 150 m, 8 octaves; peaks 1.00, spacing 6000 m (texel 93.8 m, set relief 2643 m), relief up to 5782 m
+caves: cell 192 m (16 per bake cell), 3 levels 40 m apart from the water table (share 0.20), radius 3.0 m (spread 0.35, trunks x2.5, max 24 m)
+       karst above province 0.404 (25% of the land); active 0.70 (+0.30 trunks); chambers 0.05 (22 m), shafts 0.12, mouths 0.00, dolines 0.00
+       depth 500 m at cells to 4 m, 150 m above; cover 24 m (slope 0.40); detail 0.70 m at 8.0 m (3 octaves, gain 0.45), bedding 0.25 m at 1.6 m; blend 1.5 m
+       sea caves 0.35 a 4-cell node at |h| < 60 m, relief > 150 m: radius 6.0 m (x1.5 tall), roof 5 m, into the cliff to 45 m of overburden
+CPU cost per sample, one thread (the land chain at the finest footprint; the cave term alone):
+  above the land (5 m)                  3000 points: land   3.65 us, caves  0.033 us (  0.9%); skipped 3000, patch 0, nodes 0; a sample: 0.00 levels, 0.00 near, 0.00 edges, 0.00 detail  [1.2e-17]
+  1.5 km below the land                 3000 points: land   3.54 us, caves  0.033 us (  0.9%); skipped 3000, patch 0, nodes 0; a sample: 0.00 levels, 0.00 near, 0.00 edges, 0.00 detail  [1.2e-17]
+  100 m below, outside karst            3000 points: land   4.41 us, caves  0.051 us (  1.2%); skipped 2964, patch 36, nodes 0; a sample: 0.00 levels, 0.00 near, 0.00 edges, 0.00 detail  [1.1996e-17]
+  karst, in the levels' band            3000 points: land   3.57 us, caves  4.648 us (130.3%); skipped 0, patch 0, nodes 3000; a sample: 3.00 levels, 1.53 near, 2.64 edges, 0.04 detail  [8.52005e-19]
+  karst, near walls (|cave| < 4 m)      1000 points: land   3.50 us, caves  5.100 us (145.7%); skipped 0, patch 0, nodes 1000; a sample: 3.00 levels, 1.69 near, 2.93 edges, 1.00 detail  [1.55228e-24]

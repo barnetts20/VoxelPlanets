@@ -1,0 +1,1677 @@
+// VoxelLandCaves.ush - The cave network (Design/EditsAndCaves.md, "Caves", "K0 as built" and "K1 as
+// built").
+//
+// A procedural signed distance (m, positive outside the caves) of round-cone passages, chambers,
+// shafts, dolines and sea caves, from the seed and the cave bake alone: nothing else is stored. The
+// density carves it into the land with smax(d_land, -Cave, k) (VoxelLandCaveCarve.ush: the GPU
+// density; FVoxelTerrestrialDensity: the CPU density), before the edits.
+//
+// The network (and the reference each part follows):
+//   - Cells. A cave cell is 1/CaveCellsPerBake of a bake cell along each face axis (the bake's
+//     equiangular lattice of texel centres, VoxelLandSample.ush VoxelLandAxisAt), so a sample's
+//     cell and its place in it come from the land's own exact face coordinates. Each cell holds
+//     one jittered node per level (cell hashing with jittered features, CaveResearch.md section 3;
+//     PCG3D, Jarzynski & Olano 2020).
+//   - Levels. CaveLevels horizons CaveLevelM apart from the water table up: the inception
+//     horizons of Paris et al. 2021 and the stacked levels of real karst (Palmer 1991). The water
+//     table at a node is the local base level (the lowest bake height within ~2 cells, derived
+//     like the relief) plus CaveTableShare of the height above it, so the levels descend with the
+//     drainage to the valley floors and the sea.
+//   - Edges. Each active node drains to its lowest neighbour (steepest descent over the 8
+//     neighbouring cells) on a potential: the water table plus a coherent noise. That makes a
+//     branchwork forest whose trunks follow the drainage toward base level (Palmer's branchwork).
+//     A node's choice depends only on its own and its neighbours' nodes, so every sample that
+//     sees an edge agrees on it without coordination (the design's hashed node pairs, as a tree).
+//   - Primitives: round cones (iq's exact sdRoundCone), split at a meandering midpoint; tubes with
+//     a sediment floor on the lowest level, keyholes (a tube over a vadose canyon) above it
+//     (Palmer's phreatic and vadose sections); ellipsoid chambers at some nodes, more on trunks
+//     (Deep Rock Galactic's rooms on a string of tunnels); shafts between levels; dolines (a shaft
+//     widening into a bowl at the surface); sea caves (tall passages at sea level, cut into cliff
+//     coasts).
+//   - Detail: band-limited gradient noise (Perlin 2002) added to the distance, octaves stopping
+//     below two cells of the level, and a vertically squashed octave that reads as bedding
+//     ledges. Noise is decoration only (Minecraft's noise caves are not used for the layout).
+//
+// Bounds and gates:
+//   - Reach. Nodes jitter within [0.3, 0.7] of their cell and edges join 8-neighbours, so all a
+//     sample can touch comes from the 3 x 3 cells around its own while passages (radius, meander
+//     and detail) stay under 0.18 cells and chambers under 1.2 cells. The tree needs the 5 x 5.
+//   - Slope (Lipschitz). Cones, slots and the ellipsoid bound have slope 1 plus the taper; the
+//     cover gate adds CaveCoverSlope x |grad depth| and the doline bowl CaveDolineFunnel x the
+//     same; the detail sum(A x Ln / lambda). The harness measures the total (slope mode).
+//   - LOD (the edits' rule): a radius r becomes r - max(0, 2c - r) at footprint c, so a passage
+//     narrower than two cells shrinks and closes at one cell; an edge whose radii are both under
+//     a cell is dropped (exactly: it has no surface left). K1: applied when a primitive is
+//     evaluated, at the sample's own footprint, so one gathered list serves every footprint at or
+//     above the one it was gathered at (a brick's stitched and coarser samples).
+//   - Depth: an edge is dropped when both ends lie deeper below the bake than the level's meshed
+//     depth (CaveDepthM up to footprint CaveDeepCellM, CaveShallowDepthM above). Exact per edge,
+//     with no slope cost; the bake rather than the land, so it is smooth. K1: tested at
+//     evaluation too (FVoxelCavePrim::Depth), for the same reason.
+//   - Cover: a primitive closes toward the land's surface (slope CaveCoverSlope, shut CaveCoverM
+//     below it) unless its node is a mouth (CaveMouthShare), a doline or a sea cave. So caves
+//     break the surface only at chosen places, and never reach the land surface cache's +-24 m
+//     column elsewhere.
+//   - Water: every cave floor stays CaveFloorClearM above sea level (v1: dry caves).
+//   - Face edges: the faces' lattices don't meet, so no node (karst or sea) is active within two
+//     cells of a face edge, and nothing reaches within about a cell of it.
+//
+// The two paths (K1):
+//   - Per sample (VoxelCaveDistance): the gather of the sample's own cell, then the evaluation.
+//     The density check's GPU pass and scattered CPU queries.
+//   - Per region (VoxelCaveGather once, VoxelCaveEvaluate per sample): exact for any sample of the
+//     region at or above its footprint. The mesher gathers each brick's lists in a pass of its own
+//     (VoxelCaveBoxRegion: up to VOXEL_CAVE_SLOTS faces a brick, VoxelTerrestrialMesher.usf
+//     CaveGatherCS) and its samples evaluate them (VoxelLandCaveCarve.ush); the CPU density keeps
+//     the last cell's list while its samples stay in it (FVoxelTerrestrialDensity).
+//
+// Shared subset (VoxelShaderCompat.h). Include after the land code (VoxelLandSample.ush: the face
+// frame and VoxelLandAxisAt) and declare as globals (shaders: VoxelCaveParameters.ush) or members
+// (CPU: FVoxelCaveConstants, VoxelLandCaves.h) the land's LandN, LandPad and LandTanTable; the
+// cave bake (CaveBake: two words per padded bake cell, VOXEL_CAVE_WORD below); and the Cave*
+// constants (FVoxelCaveConstants lists them with K0's values).
+
+#ifndef VOXEL_LAND_CAVES_USH
+#define VOXEL_LAND_CAVES_USH
+
+#include "VoxelLandAccess.ush"
+
+#ifndef VOXEL_LOOP
+#define VOXEL_LOOP [loop]
+#endif
+
+// The cave bake: per padded bake cell, the bake as the land chain sees it at that cell's column
+// (through the land's domain warp: VoxelLandWarpDF), so the water table, the coasts and the karst
+// line up with the valleys, shores and provinces the player sees. Two words a cell: the height (m,
+// a float), then the local base (the lowest such height, sea level for the sea, within
+// VoxelLandRelief's window: 14 bits of 0.5 m), the drainage (6 bits: log2 m^2 from 16 in halves),
+// the relief (6 bits: q^2 x VOXEL_CAVE_RELIEF_SCALE m) and the province (6 bits: q / 63)
+// (VoxelCavePackWord). Derived at load (FVoxelTerrestrialDensity::BuildCaves).
+#ifndef VOXEL_CAVE_WORD
+#define VOXEL_CAVE_WORD(I) CaveBake[I]
+#endif
+
+// Counters the harness can define (cost breakdowns); nothing elsewhere.
+#ifndef VOXEL_CAVE_COUNT
+#define VOXEL_CAVE_COUNT(Name)
+#endif
+
+#define VOXEL_CAVE_FAR 1.0e9f
+#define VOXEL_CAVE_KIND_NONE 0u
+#define VOXEL_CAVE_KIND_TUBE 1u
+#define VOXEL_CAVE_KIND_KEYHOLE 2u
+#define VOXEL_CAVE_KIND_CHAMBER 3u
+#define VOXEL_CAVE_KIND_SHAFT 4u
+#define VOXEL_CAVE_KIND_DOLINE 5u
+#define VOXEL_CAVE_KIND_SEA 6u
+#define VOXEL_CAVE_FLAG_ACTIVE 1u
+#define VOXEL_CAVE_FLAG_CHAMBER 2u
+#define VOXEL_CAVE_FLAG_SHAFT 4u
+#define VOXEL_CAVE_FLAG_DOLINE 8u
+#define VOXEL_CAVE_FLAG_MOUTH 16u
+#define VOXEL_CAVE_LAYER_SEA 12u
+#define VOXEL_CAVE_MAX_LEVELS 4u
+#define VOXEL_CAVE_NO_FACE 0xFFFFFFFFu
+#define VOXEL_CAVE_NO_BRICK 0xFFFFFFFFu
+
+// The cave bake's packing.
+#define VOXEL_CAVE_BASE_STEP 0.5f
+#define VOXEL_CAVE_FLOW_FROM 16.0f
+#define VOXEL_CAVE_FLOW_STEP 0.5f
+#define VOXEL_CAVE_RELIEF_SCALE (3000.0f / 3969.0f)
+
+// A region's largest extent in cells along each face axis (a brick's with its margin; the node
+// arrays hold the cells within two of it: VOXEL_CAVE_NODE_SIDE^2), and the sea lattice's cells
+// around it. The bake patch (4 x 4 texels) covers them while CaveCellsPerBake is at least 6.
+#define VOXEL_CAVE_REGION_MAX 8
+#define VOXEL_CAVE_NODE_SIDE 12
+#define VOXEL_CAVE_NODES 144
+#define VOXEL_CAVE_SEA_SIDE 7
+#define VOXEL_CAVE_SEA_NODES 49
+
+// ---------------------------------------------------------------------------------------------
+// Hashes and noise
+// ---------------------------------------------------------------------------------------------
+
+struct FVoxelCaveHash
+{
+    uint X;
+    uint Y;
+    uint Z;
+};
+
+/** PCG3D (Jarzynski & Olano 2020) of a cell and a key. */
+VOXEL_FUNC FVoxelCaveHash VoxelCaveHash3(int CX, int CY, uint Key)
+{
+    uint A = asuint(CX) * 1664525u + 1013904223u;
+    uint B = asuint(CY) * 1664525u + 1013904223u;
+    uint C = Key * 1664525u + 1013904223u;
+    A += B * C;
+    B += C * A;
+    C += A * B;
+    A ^= A >> 16u;
+    B ^= B >> 16u;
+    C ^= C >> 16u;
+    A += B * C;
+    B += C * A;
+    C += A * B;
+    FVoxelCaveHash H;
+    H.X = A;
+    H.Y = B;
+    H.Z = C;
+    return H;
+}
+
+/** A cheap one-word hash (the noises' lattices). */
+VOXEL_FUNC uint VoxelCaveQuick(int X, int Y, int Z, uint Seed)
+{
+    uint H = (asuint(X) * 0x8DA6B343u) ^ (asuint(Y) * 0xD8163841u) ^ (asuint(Z) * 0xCB1AB31Fu) ^ Seed;
+    H ^= H >> 15u;
+    H *= 0x2C1B3C6Du;
+    H ^= H >> 12u;
+    H *= 0x297A2D39u;
+    H ^= H >> 15u;
+    return H;
+}
+
+VOXEL_FUNC float VoxelCaveUnit(uint H)
+{
+    return float(H >> 8u) * (1.0f / 16777216.0f);
+}
+
+/** The key of a level's (or the sea caves') nodes on a face. */
+VOXEL_FUNC uint VoxelCaveKey(uint Face, uint Layer, uint Salt)
+{
+    return CaveSeed ^ (Face * 0x9E3779B9u) ^ (Layer * 0x85EBCA6Bu) ^ (Salt * 0xC2B2AE35u);
+}
+
+VOXEL_FUNC int VoxelCaveFloorDiv(int A, int B)
+{
+    return A >= 0 ? A / B : -((-A + B - 1) / B);
+}
+
+VOXEL_FUNC float VoxelCaveFade(float T)
+{
+    return T * T * T * (T * (T * 6.0f - 15.0f) + 10.0f);
+}
+
+/** Improved Perlin noise's gradient (Perlin 2002): one of 12 cube-edge directions. */
+VOXEL_FUNC float VoxelCaveGrad(uint H, float X, float Y, float Z)
+{
+    const uint K = H & 15u;
+    const float U = K < 8u ? X : Y;
+    const float V = K < 4u ? Y : ((K == 12u || K == 14u) ? X : Z);
+    return ((K & 1u) == 0u ? U : -U) + ((K & 2u) == 0u ? V : -V);
+}
+
+/** Gradient noise at lattice cell (IX, IY, IZ) plus (FX, FY, FZ) in [0, 1): about -1..1. */
+VOXEL_FUNC float VoxelCaveNoise(int IX, int IY, int IZ, float FX, float FY, float FZ, uint Seed)
+{
+    const float U = VoxelCaveFade(FX);
+    const float V = VoxelCaveFade(FY);
+    const float W = VoxelCaveFade(FZ);
+    const float N000 = VoxelCaveGrad(VoxelCaveQuick(IX, IY, IZ, Seed), FX, FY, FZ);
+    const float N100 = VoxelCaveGrad(VoxelCaveQuick(IX + 1, IY, IZ, Seed), FX - 1.0f, FY, FZ);
+    const float N010 = VoxelCaveGrad(VoxelCaveQuick(IX, IY + 1, IZ, Seed), FX, FY - 1.0f, FZ);
+    const float N110 = VoxelCaveGrad(VoxelCaveQuick(IX + 1, IY + 1, IZ, Seed), FX - 1.0f, FY - 1.0f, FZ);
+    const float N001 = VoxelCaveGrad(VoxelCaveQuick(IX, IY, IZ + 1, Seed), FX, FY, FZ - 1.0f);
+    const float N101 = VoxelCaveGrad(VoxelCaveQuick(IX + 1, IY, IZ + 1, Seed), FX - 1.0f, FY, FZ - 1.0f);
+    const float N011 = VoxelCaveGrad(VoxelCaveQuick(IX, IY + 1, IZ + 1, Seed), FX, FY - 1.0f, FZ - 1.0f);
+    const float N111 = VoxelCaveGrad(VoxelCaveQuick(IX + 1, IY + 1, IZ + 1, Seed), FX - 1.0f, FY - 1.0f, FZ - 1.0f);
+    const float X00 = lerp(N000, N100, U);
+    const float X10 = lerp(N010, N110, U);
+    const float X01 = lerp(N001, N101, U);
+    const float X11 = lerp(N011, N111, U);
+    return lerp(lerp(X00, X10, V), lerp(X01, X11, V), W);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Distances (the sample is the origin: every primitive is placed relative to it)
+// ---------------------------------------------------------------------------------------------
+
+/** Where the origin projects on segment A..B, clamped to 0..1. */
+VOXEL_FUNC float VoxelCaveAlong(float3 A, float3 B)
+{
+    const float3 BA = B - A;
+    const float L2 = max(dot(BA, BA), 1.0e-6f);
+    return saturate(dot(A * -1.0f, BA) / L2);
+}
+
+/** iq's round cone from A (radius RA) to B (radius RB), at the origin. Exact. */
+VOXEL_FUNC float VoxelCaveRoundCone(float3 A, float3 B, float RA, float RB)
+{
+    const float3 BA = B - A;
+    const float L2 = max(dot(BA, BA), 1.0e-6f);
+    const float RR = RA - RB;
+    const float A2 = L2 - RR * RR;
+    const float IL2 = 1.0f / L2;
+    const float3 PA = A * -1.0f;
+    const float Y = dot(PA, BA);
+    const float Z = Y - L2;
+    const float3 Q = PA * L2 - BA * Y;
+    const float X2 = dot(Q, Q);
+    const float Y2 = Y * Y * L2;
+    const float Z2 = Z * Z * L2;
+    const float K = (RR >= 0.0f ? 1.0f : -1.0f) * RR * RR * X2;
+    if ((Z >= 0.0f ? 1.0f : -1.0f) * A2 * Z2 > K) return sqrt(X2 + Z2) * IL2 - RB;
+    if ((Y >= 0.0f ? 1.0f : -1.0f) * A2 * Y2 < K) return sqrt(X2 + Y2) * IL2 - RA;
+    return (sqrt(X2 * A2 * IL2) + Y * RR) * IL2 - RA;
+}
+
+/** A passage from A to B: a round cone, its floor filled Fill x the radius below the axis; with
+ *  Canyon > 0 (a keyhole) a vadose slot Width x r wide cut Canyon x r below the axis instead. */
+VOXEL_FUNC float VoxelCavePassage(float3 A, float3 B, float RA, float RB, float3 Up, float Fill, float Width, float Canyon)
+{
+    const float Cone = VoxelCaveRoundCone(A, B, RA, RB);
+    const float T = VoxelCaveAlong(A, B);
+    const float3 Q = A + (B - A) * T;
+    const float R = lerp(RA, RB, T);
+    const float H = -dot(Q, Up);                 // the origin's height above the axis
+    if (Canyon <= 0.0f) return max(Cone, -Fill * R - H);
+    const float3 Off = (Q * -1.0f) - Up * H;
+    const float Hor = sqrt(max(dot(Off, Off), 0.0f));
+    const float Slot = max(Hor - Width * R, max(-Canyon * R - H, H));
+    return min(Cone, Slot);
+}
+
+/** An ellipsoid chamber at C, horizontal radius R, vertical R x Squash, its floor flattened at
+ *  0.55 of the vertical radius: the bound (|q / r| - 1) x min r (slope at most 1). */
+VOXEL_FUNC float VoxelCaveChamber(float3 C, float R, float Squash, float3 Up)
+{
+    const float3 Q = C * -1.0f;
+    const float H = dot(Q, Up);
+    const float3 Hv = Q - Up * H;
+    const float RZ = R * Squash;
+    const float K = sqrt(dot(Hv, Hv) / (R * R) + (H * H) / (RZ * RZ));
+    return max((K - 1.0f) * RZ, -0.55f * RZ - H);
+}
+
+/** The polynomial smooth maximum (k in the values' unit; the edits' smax). */
+VOXEL_FUNC float VoxelCaveSmax(float A, float B, float K)
+{
+    if (K <= 0.0f) return max(A, B);
+    const float H = saturate(0.5f + 0.5f * (A - B) / K);
+    return lerp(B, A, H) + K * H * (1.0f - H);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The cave bake
+// ---------------------------------------------------------------------------------------------
+
+/** One cell of the cave bake, unpacked. */
+struct FVoxelCaveTexel
+{
+    float Height;
+    float Base;
+    float Relief;
+    float Flow;
+    float Province;
+};
+
+VOXEL_FUNC FVoxelCaveTexel VoxelCaveTexelAt(VOXEL_LAND_ARGS_DECL uint I)
+{
+    const uint W = VOXEL_CAVE_WORD(2u * I + 1u);
+    const float Q = float((W >> 20u) & 63u);
+    FVoxelCaveTexel T;
+    T.Height = asfloat(VOXEL_CAVE_WORD(2u * I));
+    T.Base = float(W & 0x3FFFu) * VOXEL_CAVE_BASE_STEP;
+    T.Flow = VOXEL_CAVE_FLOW_FROM + float((W >> 14u) & 63u) * VOXEL_CAVE_FLOW_STEP;
+    T.Relief = Q * Q * VOXEL_CAVE_RELIEF_SCALE;
+    T.Province = float((W >> 26u) & 63u) * (1.0f / 63.0f);
+    return T;
+}
+
+/** The second word of a cell (the first is the height's bits): what VoxelCaveTexelAt unpacks,
+ *  each value rounded to its nearest step and held to its range. The bake's writer (CPU). */
+VOXEL_FUNC uint VoxelCavePackWord(float Base, float Flow, float Relief, float Province)
+{
+    const uint QB = uint(clamp(floor(Base / VOXEL_CAVE_BASE_STEP + 0.5f), 0.0f, 16383.0f));
+    const uint QF = uint(clamp(floor((Flow - VOXEL_CAVE_FLOW_FROM) / VOXEL_CAVE_FLOW_STEP + 0.5f), 0.0f, 63.0f));
+    const uint QR = uint(clamp(floor(sqrt(max(Relief, 0.0f) / VOXEL_CAVE_RELIEF_SCALE) + 0.5f), 0.0f, 63.0f));
+    const uint QP = uint(clamp(floor(Province * 63.0f + 0.5f), 0.0f, 63.0f));
+    return QB | (QF << 14u) | (QR << 20u) | (QP << 26u);
+}
+
+/** The 4 x 4 bake texels (centres J0.., K0..) under a region's cave cells and the two around
+ *  them: height, base, relief, drainage and province. Read once per gather (32 words). */
+struct FVoxelCavePatch
+{
+    int J0;
+    int K0;
+    float H[16];
+    float B[16];
+    float R[16];
+    float F[16];
+    float P[16];
+};
+
+VOXEL_FUNC FVoxelCavePatch VoxelCavePatchAt(VOXEL_LAND_ARGS_DECL uint Face, int IU, int IV)
+{
+    const int M = int(CaveCellsPerBake);
+    FVoxelCavePatch Out;
+    Out.J0 = VoxelCaveFloorDiv(IU - 2, M);
+    Out.K0 = VoxelCaveFloorDiv(IV - 2, M);
+    const uint Side = LandN + 2u * LandPad;
+    const uint Base = Face * Side * Side;
+    for (uint k = 0u; k < 4u; k++)
+    {
+        for (uint j = 0u; j < 4u; j++)
+        {
+            const int CJ = clamp(Out.J0 + int(j), -int(LandPad), int(LandN + LandPad) - 1);
+            const int CK = clamp(Out.K0 + int(k), -int(LandPad), int(LandN + LandPad) - 1);
+            const FVoxelCaveTexel T = VoxelCaveTexelAt(VOXEL_LAND_ARGS Base + uint(CK + int(LandPad)) * Side + uint(CJ + int(LandPad)));
+            const uint S = k * 4u + j;
+            Out.H[S] = T.Height;
+            Out.B[S] = T.Base;
+            Out.R[S] = T.Relief;
+            Out.F[S] = T.Flow;
+            Out.P[S] = T.Province;
+        }
+    }
+    return Out;
+}
+
+/** The patch's fields at a point (X, Y in texels from J0, K0: 0..3), bilinear, with the height's
+ *  slope (m per texel) along each axis. */
+struct FVoxelCaveBake
+{
+    float Height;
+    float Base;
+    float Relief;
+    float Flow;
+    float Province;
+    float DHX;
+    float DHY;
+};
+
+VOXEL_FUNC FVoxelCaveBake VoxelCavePatchLerp(FVoxelCavePatch Patch, float X, float Y)
+{
+    const int IX = clamp(int(floor(X)), 0, 2);
+    const int IY = clamp(int(floor(Y)), 0, 2);
+    const float FX = saturate(X - float(IX));
+    const float FY = saturate(Y - float(IY));
+    const uint S00 = uint(IY * 4 + IX);
+    const uint S10 = S00 + 1u;
+    const uint S01 = S00 + 4u;
+    const uint S11 = S00 + 5u;
+    const float W00 = (1.0f - FX) * (1.0f - FY);
+    const float W10 = FX * (1.0f - FY);
+    const float W01 = (1.0f - FX) * FY;
+    const float W11 = FX * FY;
+    FVoxelCaveBake Out;
+    Out.Height = Patch.H[S00] * W00 + Patch.H[S10] * W10 + Patch.H[S01] * W01 + Patch.H[S11] * W11;
+    Out.Base = Patch.B[S00] * W00 + Patch.B[S10] * W10 + Patch.B[S01] * W01 + Patch.B[S11] * W11;
+    Out.Relief = Patch.R[S00] * W00 + Patch.R[S10] * W10 + Patch.R[S01] * W01 + Patch.R[S11] * W11;
+    Out.Flow = Patch.F[S00] * W00 + Patch.F[S10] * W10 + Patch.F[S01] * W01 + Patch.F[S11] * W11;
+    Out.Province = Patch.P[S00] * W00 + Patch.P[S10] * W10 + Patch.P[S01] * W01 + Patch.P[S11] * W11;
+    Out.DHX = (Patch.H[S10] - Patch.H[S00]) * (1.0f - FY) + (Patch.H[S11] - Patch.H[S01]) * FY;
+    Out.DHY = (Patch.H[S01] - Patch.H[S00]) * (1.0f - FX) + (Patch.H[S11] - Patch.H[S10]) * FX;
+    return Out;
+}
+
+/** The cave bake at a point of a face given in texel-centre units (X along u, Y along v),
+ *  bilinear from its 4 texels (a sample's province; nodes beyond the patch: the sea caves'). */
+VOXEL_FUNC FVoxelCaveBake VoxelCaveBakeAt(VOXEL_LAND_ARGS_DECL uint Face, float X, float Y)
+{
+    const uint Side = LandN + 2u * LandPad;
+    const uint Base = Face * Side * Side;
+    const float FX0 = floor(X);
+    const float FY0 = floor(Y);
+    const int J = clamp(int(FX0), -int(LandPad), int(LandN + LandPad) - 2);
+    const int K = clamp(int(FY0), -int(LandPad), int(LandN + LandPad) - 2);
+    FVoxelCavePatch P;
+    P.J0 = J;
+    P.K0 = K;
+    for (uint t = 0u; t < 16u; t++)
+    {
+        P.H[t] = 0.0f;
+        P.B[t] = 0.0f;
+        P.R[t] = 0.0f;
+        P.F[t] = 0.0f;
+        P.P[t] = 0.0f;
+    }
+    for (uint t = 0u; t < 4u; t++)
+    {
+        const FVoxelCaveTexel T = VoxelCaveTexelAt(VOXEL_LAND_ARGS Base + uint(K + int(t / 2u) + int(LandPad)) * Side + uint(J + int(t % 2u) + int(LandPad)));
+        const uint S = (t / 2u) * 4u + (t % 2u);
+        P.H[S] = T.Height;
+        P.B[S] = T.Base;
+        P.R[S] = T.Relief;
+        P.F[S] = T.Flow;
+        P.P[S] = T.Province;
+    }
+    return VoxelCavePatchLerp(P, X - float(J), Y - float(K));
+}
+
+/** The water table (m): the local base plus CaveTableShare of the height above it, kept
+ *  CaveFloorClearM above the sea. */
+VOXEL_FUNC float VoxelCaveTableOf(float Height, float Base)
+{
+    return max(Base + CaveTableShare * max(Height - Base, 0.0f), CaveFloorClearM);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Samples and nodes
+// ---------------------------------------------------------------------------------------------
+
+/** A sample: its face, cave cell and place in it, altitude (m about sea level), the local frame
+ *  (metres per cave cell along u and v, and up), the land's height (the surface carved), the
+ *  bake's, the province (0..1), and the footprint (m: the level's cell). */
+struct FVoxelCaveSample
+{
+    uint Face;
+    int IU;
+    int IV;
+    float FU;
+    float FV;
+    float Z;
+    float3 EU;
+    float3 EV;
+    float3 Up;
+    float Land;
+    float Bake;
+    float Province;
+    float Footprint;
+};
+
+/** The cube face a direction is most along (each face's cave lattice is its own). Every caller
+ *  (a sample, a brick's corners) decides with this, on the same floats. */
+VOXEL_FUNC uint VoxelCaveFaceOf(float X, float Y, float Z)
+{
+    const float AX = abs(X);
+    const float AY = abs(Y);
+    const float AZ = abs(Z);
+    if (AX >= AY && AX >= AZ) return X < 0.0f ? 1u : 0u;
+    if (AY >= AZ) return Y < 0.0f ? 3u : 2u;
+    return Z < 0.0f ? 5u : 4u;
+}
+
+/** A sample at the double-float point (PX, PY, PZ) (cm, planet frame) of radius Radius, the
+ *  sea-level sphere's radius SeaRadius (cm), the land's and the bake's heights there (m about sea
+ *  level) and the footprint (m). Its cell and fraction come from the land's exact face
+ *  coordinates (VoxelLandAxisAt: about 1e-7 of a bake cell at any planet size). */
+VOXEL_FUNC FVoxelCaveSample VoxelCaveSampleDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 Radius, float2 SeaRadius, float LandM, float BakeM, float FootprintM)
+{
+    FVoxelCaveSample S;
+    S.Face = VoxelCaveFaceOf(PX.x, PY.x, PZ.x);
+    const float2 PN = VoxelLandPick(PX, PY, PZ, S.Face / 2u);
+    const float2 Den = (S.Face & 1u) != 0u ? float2(-PN.x, -PN.y) : PN;
+    const float2 AU = VoxelDFDiv(VoxelLandPick(PX, PY, PZ, VoxelCubeUAxis(S.Face)), Den);
+    const float2 AV = VoxelDFDiv(VoxelLandPick(PX, PY, PZ, VoxelCubeVAxis(S.Face)), Den);
+    const FVoxelLandAxis XU = VoxelLandAxisAt(VOXEL_LAND_ARGS AU, atan(AU.x) * VOXEL_LAND_INV_QUARTER_PI);
+    const FVoxelLandAxis XV = VoxelLandAxisAt(VOXEL_LAND_ARGS AV, atan(AV.x) * VOXEL_LAND_INV_QUARTER_PI);
+    const int M = int(CaveCellsPerBake);
+    const float TU = XU.Frac * float(M);
+    const float TV = XV.Frac * float(M);
+    const float TU0 = floor(TU);
+    const float TV0 = floor(TV);
+    S.IU = XU.Cell * M + int(TU0);
+    S.IV = XV.Cell * M + int(TV0);
+    S.FU = TU - TU0;
+    S.FV = TV - TV0;
+    const float2 Alt = VoxelDFSub(Radius, SeaRadius);
+    S.Z = (Alt.x + Alt.y) * 0.01f;
+    // Metres per cave cell: the face's tangents per radian (VoxelLandFaceFrameAt) times the
+    // radius over the cells per radian.
+    const FVoxelLandFaceFrame Frame = VoxelLandFaceFrameAt(S.Face, AU.x, AV.x);
+    const float Scale = (Radius.x + Radius.y) * 0.01f * (VOXEL_LAND_HALF_PI / float(LandN)) / float(M);
+    S.EU = Frame.TU * Scale;
+    S.EV = Frame.TV * Scale;
+    S.Up = normalize(float3(PX.x, PY.x, PZ.x));
+    S.Land = LandM;
+    S.Bake = BakeM;
+    S.Footprint = FootprintM;
+    S.Province = VoxelCaveBakeAt(VOXEL_LAND_ARGS S.Face, float(XU.Cell) + XU.Frac, float(XV.Cell) + XV.Frac).Province;
+    return S;
+}
+
+struct FVoxelCaveNode
+{
+    float U;        // cells from the region's origin cell
+    float V;
+    float Z;        // m about sea level
+    float R;        // the passage radius (m)
+    float Ref;      // the bake's height (m)
+    float Phi;      // the potential the tree descends (m)
+    float Hash;     // spare unit hashes (the meander, sizes)
+    float Size;
+    float Flow;     // the bake's drainage and province there
+    float Province;
+    uint Flags;
+};
+
+// Where the gather keeps its node grid (VOXEL_CAVE_NODES a region). By default a local array; the
+// GPU gather pass (VOXEL_CAVE_GATHER_BUFFERS 1, VoxelTerrestrialMesher.usf CaveGatherCS) keeps it
+// in a scratch buffer, VOXEL_CAVE_NODES per thread from CaveGatherNodeBase: a thread-local array
+// of 144 nodes (and the 64-primitive list below) is ~10 KB of scratch per GPU thread, which the
+// GPU did not survive.
+#if defined(VOXEL_CAVE_GATHER_BUFFERS) && VOXEL_CAVE_GATHER_BUFFERS
+RWStructuredBuffer<FVoxelCaveNode> CaveNodesOut;
+static uint CaveGatherNodeBase;
+#define VOXEL_CAVE_NODES_DECL
+#define VOXEL_CAVE_NODE_GET(N) CaveNodesOut[CaveGatherNodeBase + uint(N)]
+#define VOXEL_CAVE_NODE_SET(N, V) CaveNodesOut[CaveGatherNodeBase + uint(N)] = (V)
+#else
+#define VOXEL_CAVE_NODES_DECL FVoxelCaveNode CaveNodes[VOXEL_CAVE_NODES];
+#define VOXEL_CAVE_NODE_GET(N) CaveNodes[N]
+#define VOXEL_CAVE_NODE_SET(N, V) CaveNodes[N] = (V)
+#endif
+
+/** A node that is nothing (unused slots). */
+VOXEL_FUNC FVoxelCaveNode VoxelCaveNodeNone()
+{
+    FVoxelCaveNode N;
+    N.U = 0.0f;
+    N.V = 0.0f;
+    N.Z = 0.0f;
+    N.R = 0.0f;
+    N.Ref = 0.0f;
+    N.Phi = VOXEL_CAVE_FAR;
+    N.Hash = 0.0f;
+    N.Size = 0.0f;
+    N.Flow = 0.0f;
+    N.Province = 0.0f;
+    N.Flags = 0u;
+    return N;
+}
+
+/** The potential's coherent noise around a region: the value noise's lattice values (6 x 6, on
+ *  a unit lattice VoxelCaveWave() cells apart) under its nodes, hashed once per level. */
+struct FVoxelCaveLattice
+{
+    int X0;
+    int Y0;
+    float V[36];
+};
+
+VOXEL_FUNC float VoxelCaveWave()
+{
+    return max(CavePhiWaveCells, 3.0f);
+}
+
+/** The value noise's lattice at a region's origin (Key: VoxelCaveRegionKey). */
+VOXEL_FUNC FVoxelCaveLattice VoxelCaveLatticeAt(FVoxelCaveSample Key, uint Layer)
+{
+    const float Wave = VoxelCaveWave();
+    FVoxelCaveLattice L;
+    L.X0 = int(floor((float(Key.IU) - 1.7f) / Wave));
+    L.Y0 = int(floor((float(Key.IV) - 1.7f) / Wave));
+    const uint Seed = CaveSeed ^ (Layer * 0x27D4EB2Fu);
+    for (int i = 0; i < 36; i++) L.V[i] = VoxelCaveUnit(VoxelCaveQuick(L.X0 + i % 6, L.Y0 + i / 6, 0, Seed));
+    return L;
+}
+
+/** The value noise from the lattice's values (bilinear, quintic fade). */
+VOXEL_FUNC float VoxelCaveLatticeValue(FVoxelCaveLattice L, float X, float Y)
+{
+    const float FX0 = floor(X);
+    const float FY0 = floor(Y);
+    const int IX = clamp(int(FX0) - L.X0, 0, 4);
+    const int IY = clamp(int(FY0) - L.Y0, 0, 4);
+    const float U = VoxelCaveFade(X - FX0);
+    const float V = VoxelCaveFade(Y - FY0);
+    const int I = IY * 6 + IX;
+    return lerp(lerp(L.V[I], L.V[I + 1], U), lerp(L.V[I + 6], L.V[I + 7], U), V);
+}
+
+/** Where the node of level Layer in cell (Key.IU + DU, Key.IV + DV) lies, and its potential: what
+ *  the tree needs (the passage's radius and the flags come with VoxelCaveDress). */
+VOXEL_FUNC FVoxelCaveNode VoxelCavePlace(FVoxelCavePatch Patch, FVoxelCaveLattice Lat, FVoxelCaveSample Key, int DU, int DV, uint Layer)
+{
+    const int M = int(CaveCellsPerBake);
+    const int CU = Key.IU + DU;
+    const int CV = Key.IV + DV;
+    const FVoxelCaveHash H1 = VoxelCaveHash3(CU, CV, VoxelCaveKey(Key.Face, Layer, 1u));
+    const float JU = 0.3f + 0.4f * VoxelCaveUnit(H1.X);
+    const float JV = 0.3f + 0.4f * VoxelCaveUnit(H1.Y);
+    const FVoxelCaveBake B = VoxelCavePatchLerp(Patch, (float(CU - Patch.J0 * M) + JU) / float(M), (float(CV - Patch.K0 * M) + JV) / float(M));
+    const float Table = VoxelCaveTableOf(B.Height, B.Base);
+    // The potential's coherent part (m): convergent sub-km drainage the bake is too coarse for.
+    // Its amplitude follows the water table's drop over the noise's wavelength (times
+    // CavePhiNoiseSlope), so the tree converges into the noise's troughs while still running
+    // downhill; a flat table gets CavePhiNoiseM.
+    const float Wave = VoxelCaveWave();
+    const float Drop = CaveTableShare * sqrt(B.DHX * B.DHX + B.DHY * B.DHY) * Wave / float(M);
+    const float Amp = CavePhiNoiseM + CavePhiNoiseSlope * Drop;
+    const float Coherent = (VoxelCaveLatticeValue(Lat, (float(CU) + JU) / Wave, (float(CV) + JV) / Wave) - 0.5f) * 2.0f * Amp;
+    FVoxelCaveNode N = VoxelCaveNodeNone();
+    N.U = float(DU) + JU;
+    N.V = float(DV) + JV;
+    N.Ref = B.Height;
+    N.Phi = Table + Coherent + (VoxelCaveUnit(H1.Z) - 0.5f) * CavePhiJitterM;
+    N.Z = max(N.Phi + float(Layer) * CaveLevelM, CaveFloorClearM);
+    N.Flow = B.Flow;
+    N.Province = B.Province;
+    return N;
+}
+
+/** Whether cell (CU, CV) lies two cells or more inside its face (the faces' lattices don't meet:
+ *  both sides of an edge stay clear of it). */
+VOXEL_FUNC bool VoxelCaveInside(int CU, int CV)
+{
+    const int M = int(CaveCellsPerBake);
+    const int First = 2 - M / 2;
+    const int Last = int(LandN) * M - M / 2 - 3;
+    return CU >= First && CU <= Last && CV >= First && CV <= Last;
+}
+
+/** A placed node's passage radius (log-normal about the median, larger under the main drainage:
+ *  the trunks) and flags (active where the rock is soluble, chambers, shafts, mouths, dolines). */
+VOXEL_FUNC FVoxelCaveNode VoxelCaveDress(FVoxelCaveNode Placed, FVoxelCaveSample Key, int DU, int DV, uint Layer)
+{
+    const int CU = Key.IU + DU;
+    const int CV = Key.IV + DV;
+    FVoxelCaveNode N = Placed;
+    const FVoxelCaveHash H2 = VoxelCaveHash3(CU, CV, VoxelCaveKey(Key.Face, Layer, 2u));
+    const float Gauss = (VoxelCaveUnit(H2.X) + VoxelCaveUnit(H2.Y) + VoxelCaveUnit(H2.Z) - 1.5f) * 2.0f;   // about N(0, 1)
+    const float Trunk = saturate((N.Flow - CaveTrunkFlowLo) / max(CaveTrunkFlowHi - CaveTrunkFlowLo, 1.0e-3f));
+    N.R = min(CaveRadiusM * exp(CaveRadiusSpread * Gauss) * (1.0f + CaveTrunkGain * Trunk), CaveRadiusMaxM);
+    N.Z = max(N.Z, CaveFloorClearM + N.R);
+    const FVoxelCaveHash H3 = VoxelCaveHash3(CU, CV, VoxelCaveKey(Key.Face, Layer, 3u));
+    N.Hash = VoxelCaveUnit(H3.X);
+    N.Size = VoxelCaveUnit(H3.Y);
+    // Active where the province is over the karst threshold: CaveActiveShare of the nodes, more
+    // on trunks; none within two cells of a face edge.
+    const float Karst = saturate((N.Province - CaveKarstLo) / max(CaveKarstHi - CaveKarstLo, 1.0e-3f));
+    const float Share = min(CaveActiveShare + CaveTrunkActive * Trunk, 1.0f) * Karst;
+    N.Flags = 0u;
+    if (VoxelCaveInside(CU, CV) && VoxelCaveUnit(H3.Z) < Share)
+    {
+        N.Flags = VOXEL_CAVE_FLAG_ACTIVE;
+        const FVoxelCaveHash H4 = VoxelCaveHash3(CU, CV, VoxelCaveKey(Key.Face, Layer, 4u));
+        if (VoxelCaveUnit(H4.X) < CaveChamberShare * (1.0f + Trunk)) N.Flags |= VOXEL_CAVE_FLAG_CHAMBER;
+        if (VoxelCaveUnit(H4.Y) < CaveShaftShare) N.Flags |= VOXEL_CAVE_FLAG_SHAFT;
+        if (VoxelCaveUnit(H4.Z) < CaveMouthShare) N.Flags |= VOXEL_CAVE_FLAG_MOUTH;
+        if (Layer + 1u == CaveLevels && VoxelCaveUnit(H2.X ^ H3.Y) < CaveDolineShare) N.Flags |= VOXEL_CAVE_FLAG_DOLINE;
+    }
+    return N;
+}
+
+/** The LOD rule (the edits'): radius R at footprint C. */
+VOXEL_FUNC float VoxelCaveLod(float R, float C)
+{
+    return R - max(0.0f, 2.0f * C - R);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The distance's parts
+// ---------------------------------------------------------------------------------------------
+
+/** The cover gate's offset for a primitive of radius R at depth Depth (m below the land): slope
+ *  CaveCoverSlope, reaching R plus the detail (shut) at CaveCoverM plus the blend below the
+ *  surface. */
+VOXEL_FUNC float VoxelCaveCover(float R, float Depth, float Detail)
+{
+    const float Top = CaveCoverM + CaveBlendM + (R + Detail) / max(CaveCoverSlope, 1.0e-3f);
+    return CaveCoverSlope * max(0.0f, Top - Depth);
+}
+
+/** The meshed depth below the bake at footprint C (m). */
+VOXEL_FUNC float VoxelCaveDepthGate(float C)
+{
+    return C <= CaveDeepCellM ? CaveDepthM : CaveShallowDepthM;
+}
+
+/** The wall detail at the sample (m), and its amplitude bound at the footprint. */
+struct FVoxelCaveDetail
+{
+    float Value;
+    float Bound;
+};
+
+VOXEL_FUNC FVoxelCaveDetail VoxelCaveDetailAt(FVoxelCaveSample S, bool bEvaluate)
+{
+    FVoxelCaveDetail Out;
+    Out.Value = 0.0f;
+    Out.Bound = 0.0f;
+    float Amp = CaveRoughM;
+    uint Cells = max(CaveRoughCells, 1u);
+    for (uint o = 0u; o < CaveRoughOctaves; o++)
+    {
+        const float Wave = CaveCellM / float(Cells);
+        const float Fade = saturate(Wave / (2.0f * S.Footprint) - 1.0f);
+        if (Fade > 0.0f)
+        {
+            Out.Bound += Amp * Fade;
+            if (bEvaluate)
+            {
+                const float XU = S.FU * float(Cells);
+                const float XV = S.FV * float(Cells);
+                const float FXU = floor(XU);
+                const float FXV = floor(XV);
+                const float ZZ = S.Z / Wave;
+                const float FZ = floor(ZZ);
+                Out.Value += Amp * Fade * VoxelCaveNoise(S.IU * int(Cells) + int(FXU), S.IV * int(Cells) + int(FXV), int(FZ), XU - FXU, XV - FXV, ZZ - FZ, CaveSeed ^ (o * 0x165667B1u));
+            }
+        }
+        Amp *= CaveRoughGain;
+        Cells *= 2u;
+    }
+    // Bedding: coarse along the beds, fine across them (ledges).
+    if (CaveBeddingM > 0.0f)
+    {
+        const float Fade = saturate(CaveBeddingWaveM / (2.0f * S.Footprint) - 1.0f);
+        if (Fade > 0.0f)
+        {
+            Out.Bound += CaveBeddingM * Fade;
+            if (bEvaluate)
+            {
+                const uint BC = max(CaveRoughCells / 2u, 1u);
+                const float XU = S.FU * float(BC);
+                const float XV = S.FV * float(BC);
+                const float FXU = floor(XU);
+                const float FXV = floor(XV);
+                const float ZZ = S.Z / CaveBeddingWaveM;
+                const float FZ = floor(ZZ);
+                Out.Value += CaveBeddingM * Fade * VoxelCaveNoise(S.IU * int(BC) + int(FXU), S.IV * int(BC) + int(FXV), int(FZ), XU - FXU, XV - FXV, ZZ - FZ, CaveSeed ^ 0x7F4A7C15u);
+            }
+        }
+    }
+    return Out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gathering: the primitives that can touch a region of cells (a sample's cell, or a brick's)
+// ---------------------------------------------------------------------------------------------
+
+#define VOXEL_CAVE_MAX_PRIMS 64
+#define VOXEL_CAVE_PRIM_OPEN 1u      // no cover gate (mouths, dolines, sea caves)
+#define VOXEL_CAVE_PRIM_FILL 2u      // a sediment floor (level 0)
+#define VOXEL_CAVE_PRIM_CANYON 4u    // a vadose canyon under the tube (keyholes)
+#define VOXEL_CAVE_PRIM_BOWL 8u      // a doline's bowl at the surface
+#define VOXEL_CAVE_PRIM_TALL 16u     // taller than wide (sea caves)
+
+/** A primitive, placed in cells from the region's origin cell (U, V) and altitude (Z, m), with
+ *  its radii before the LOD rule (VoxelCaveEvalPrim applies it at the sample's footprint):
+ *    - a passage A - M - B (radii RA, RB; the midpoint's is their mean);
+ *    - a chamber at node A (RB: its vertical radius; its centre and horizontal radius follow);
+ *    - a straight cone A - B, M halfway (shafts, dolines; RA);
+ *    - a sea cave A - B (RA; its altitude follows the radius).
+ *  Depth: how deep below the bake its shallower end lies (the depth gate), -VOXEL_CAVE_FAR for
+ *  none. 64 bytes (FVoxelCavePrimGPU, VoxelLandGPU.h). */
+struct FVoxelCavePrim
+{
+    float AU;
+    float AV;
+    float AZ;
+    float MU;
+    float MV;
+    float MZ;
+    float BU;
+    float BV;
+    float BZ;
+    float RA;
+    float RM;
+    float RB;
+    float Depth;
+    uint Kind;
+    uint Flags;
+    uint Pad;
+};
+
+struct FVoxelCaveList
+{
+    int OU;          // the origin cell
+    int OV;
+    uint Face;
+    uint Count;
+    uint Overflow;   // primitives that didn't fit
+    uint Stage;      // 0: nothing near, 1: the patch read, 2: nodes
+    float Footprint; // the footprint it was gathered at (m): valid at it and above
+#if !(defined(VOXEL_CAVE_GATHER_BUFFERS) && VOXEL_CAVE_GATHER_BUFFERS)
+    FVoxelCavePrim Prims[VOXEL_CAVE_MAX_PRIMS];
+#endif
+};
+
+// Where the gather puts primitive I of list L. By default the list's own array; the GPU gather
+// pass writes its output buffer directly (CavePrimsOut, VOXEL_CAVE_MAX_PRIMS per thread from
+// CaveGatherPrimBase), and the list has no array of its own.
+#if defined(VOXEL_CAVE_GATHER_BUFFERS) && VOXEL_CAVE_GATHER_BUFFERS
+RWStructuredBuffer<FVoxelCavePrim> CavePrimsOut;
+static uint CaveGatherPrimBase;
+#define VOXEL_CAVE_LIST_PUT(L, I, P) CavePrimsOut[CaveGatherPrimBase + (I)] = (P)
+#else
+#define VOXEL_CAVE_LIST_PUT(L, I, P) L.Prims[I] = (P)
+#endif
+
+/** A region: NU x NV cells (1..VOXEL_CAVE_REGION_MAX) from (OU, OV) on Face, altitudes
+ *  ZMin..ZMax (m), at footprint Footprint (m) and above. Margin: how far beyond the region (m)
+ *  the levels' bands are taken, so the distance is exact that far vertically past a wall (it is
+ *  at least 0.12 of a cell horizontally: the nodes within one cell of the region); beyond, a
+ *  primitive may be missed and the distance read as larger (the density stays solid there: its
+ *  sign is right, its value too deep). Reach: how far (m) from the region a primitive is kept
+ *  (VOXEL_CAVE_FAR: every one gathered; a brick's lists keep those that can change its density
+ *  above -Reach, VoxelCaveBoxRegion). Valid: 0 when there is no such region (a brick's unused
+ *  face slot, or too large). */
+struct FVoxelCaveRegion
+{
+    uint Face;
+    int OU;
+    int OV;
+    int NU;
+    int NV;
+    float ZMin;
+    float ZMax;
+    float Footprint;
+    float Margin;
+    float Reach;
+    uint Valid;
+};
+
+VOXEL_FUNC FVoxelCavePrim VoxelCavePrimNone()
+{
+    FVoxelCavePrim P;
+    P.AU = 0.0f;
+    P.AV = 0.0f;
+    P.AZ = 0.0f;
+    P.MU = 0.0f;
+    P.MV = 0.0f;
+    P.MZ = 0.0f;
+    P.BU = 0.0f;
+    P.BV = 0.0f;
+    P.BZ = 0.0f;
+    P.RA = 0.0f;
+    P.RM = 0.0f;
+    P.RB = 0.0f;
+    P.Depth = -VOXEL_CAVE_FAR;
+    P.Kind = VOXEL_CAVE_KIND_NONE;
+    P.Flags = 0u;
+    P.Pad = 0u;
+    return P;
+}
+
+/** The levels' bands' margin at footprint C (m): four cells and the blend (the mesher's crossings,
+ *  edge ends and gradient points lie within a few cells of the surface). */
+VOXEL_FUNC float VoxelCaveMargin(float C)
+{
+    return 4.0f * C + CaveBlendM;
+}
+
+/** A region of one cell (a sample's), altitudes ZMin..ZMax, every primitive kept. */
+VOXEL_FUNC FVoxelCaveRegion VoxelCaveCellRegion(FVoxelCaveSample S, float ZMin, float ZMax)
+{
+    FVoxelCaveRegion R;
+    R.Face = S.Face;
+    R.OU = S.IU;
+    R.OV = S.IV;
+    R.NU = 1;
+    R.NV = 1;
+    R.ZMin = ZMin;
+    R.ZMax = ZMax;
+    R.Footprint = S.Footprint;
+    R.Margin = VoxelCaveMargin(S.Footprint);
+    R.Reach = VOXEL_CAVE_FAR;
+    R.Valid = 1u;
+    return R;
+}
+
+/** A sample-like key for the node functions: the region's origin cell. */
+VOXEL_FUNC FVoxelCaveSample VoxelCaveRegionKey(FVoxelCaveRegion R)
+{
+    FVoxelCaveSample S;
+    S.Face = R.Face;
+    S.IU = R.OU;
+    S.IV = R.OV;
+    S.FU = 0.0f;
+    S.FV = 0.0f;
+    S.Z = 0.5f * (R.ZMin + R.ZMax);
+    S.EU = float3(0.0f, 0.0f, 0.0f);
+    S.EV = float3(0.0f, 0.0f, 0.0f);
+    S.Up = float3(0.0f, 0.0f, 0.0f);
+    S.Land = 0.0f;
+    S.Bake = 0.0f;
+    S.Province = 0.0f;
+    S.Footprint = R.Footprint;
+    return S;
+}
+
+/** Whether a primitive can change a sample of the region by more than its density below -Reach
+ *  (VoxelCaveRegion's Reach): a lower bound of its distance from the region's box (cells at
+ *  half the face centre's metres, the least a cave cell spans anywhere on a face) against its
+ *  largest reach (radii before the LOD rule, canyons, chambers, bowls, the detail and the
+ *  blend). */
+VOXEL_FUNC bool VoxelCaveKeep(FVoxelCaveRegion R, FVoxelCavePrim P, float Detail)
+{
+    if (R.Reach >= VOXEL_CAVE_FAR * 0.5f) return true;
+    const float RMax = max(max(P.RA, P.RB), P.RM);
+    float Across = RMax;
+    float Below = RMax;
+    float Above = RMax;
+    if (P.Kind == VOXEL_CAVE_KIND_KEYHOLE) Below = RMax * (1.0f + CaveCanyonDepth);
+    else if (P.Kind == VOXEL_CAVE_KIND_CHAMBER)
+    {
+        Across = P.RB / max(CaveChamberSquash, 1.0e-3f);
+        Below = 0.7f * P.RB;
+        Above = 1.3f * P.RB;
+    }
+    else if (P.Kind == VOXEL_CAVE_KIND_DOLINE) Across = RMax + CaveDolineFunnel * CaveDolineBowlM;
+    else if (P.Kind == VOXEL_CAVE_KIND_SEA)
+    {
+        Below = RMax * CaveSeaTall;
+        Above = RMax * CaveSeaTall * 1.5f + 2.0f;
+    }
+    const float Pad = Detail + CaveBlendM + R.Reach;
+    const float CellM = 0.5f * CaveCellM;
+    const float GU = max(max(min(min(P.AU, P.MU), P.BU) - float(R.NU), -max(max(P.AU, P.MU), P.BU)), 0.0f) * CellM - Across;
+    const float GV = max(max(min(min(P.AV, P.MV), P.BV) - float(R.NV), -max(max(P.AV, P.MV), P.BV)), 0.0f) * CellM - Across;
+    const float GZ = max(max(min(min(P.AZ, P.MZ), P.BZ) - Below - R.ZMax, R.ZMin - max(max(P.AZ, P.MZ), P.BZ) - Above), 0.0f);
+    return max(max(GU, GV), GZ) <= Pad;
+}
+
+// Adds primitive P to list L if it can matter to region R (Detail: the detail's bound), in place.
+#define VOXEL_CAVE_ADD(L, R, P, Detail) \
+    if (VoxelCaveKeep(R, P, Detail)) \
+    { \
+        if (L.Count < uint(VOXEL_CAVE_MAX_PRIMS)) \
+        { \
+            VOXEL_CAVE_LIST_PUT(L, L.Count, P); \
+            L.Count += 1u; \
+        } \
+        else L.Overflow += 1u; \
+    }
+
+/** Every primitive that can touch the region: per level the nodes of the cells within one of it
+ *  (their edges, chambers, shafts and dolines), the tree from the nodes within two; then the
+ *  sea caves. Exact for any sample in the region at its footprint or above (the reach bound:
+ *  this file's head; the LOD and depth gates are applied again per sample). */
+VOXEL_FUNC FVoxelCaveList VoxelCaveGather(VOXEL_LAND_ARGS_DECL FVoxelCaveRegion R)
+{
+    FVoxelCaveList List;
+    List.OU = R.OU;
+    List.OV = R.OV;
+    List.Face = R.Face;
+    List.Count = 0u;
+    List.Overflow = 0u;
+    List.Stage = 0u;
+    List.Footprint = R.Footprint;
+#if !(defined(VOXEL_CAVE_GATHER_BUFFERS) && VOXEL_CAVE_GATHER_BUFFERS)
+    for (uint p = 0u; p < uint(VOXEL_CAVE_MAX_PRIMS); p++) List.Prims[p] = VoxelCavePrimNone();
+#endif
+    if (R.Valid == 0u || R.Face == VOXEL_CAVE_NO_FACE) return List;
+
+    // The coarse gates, from the bake under the region and around it: karst within reach, or a
+    // coast.
+    const FVoxelCaveSample Key = VoxelCaveRegionKey(R);
+    const FVoxelCavePatch Patch = VoxelCavePatchAt(VOXEL_LAND_ARGS R.Face, R.OU, R.OV);
+    List.Stage = 1u;
+    float ProvinceHi = 0.0f;
+    float CoastLo = VOXEL_CAVE_FAR;
+    for (uint t = 0u; t < 16u; t++)
+    {
+        ProvinceHi = max(ProvinceHi, Patch.P[t]);
+        CoastLo = min(CoastLo, abs(Patch.H[t]));
+    }
+    const bool bKarstNear = ProvinceHi >= CaveKarstLo - CaveKarstSlack;
+    const bool bCoastNear = CaveSeaShare > 0.0f && CoastLo < CaveSeaCoastM + CaveBandSlackM && R.ZMin < CaveSeaZM + CaveSeaRadiusM * 3.0f + 20.0f + R.Margin;
+    if (!bKarstNear && !bCoastNear) return List;
+
+    const float C = R.Footprint;
+    const int M = int(CaveCellsPerBake);
+    const float Gate = VoxelCaveDepthGate(C);
+    const float Detail = VoxelCaveDetailAt(Key, false).Bound;
+    const int NU = clamp(R.NU, 1, VOXEL_CAVE_REGION_MAX);
+    const int NV = clamp(R.NV, 1, VOXEL_CAVE_REGION_MAX);
+    const int Side = VOXEL_CAVE_NODE_SIDE;
+
+    if (bKarstNear)
+    {
+        // The levels' altitudes over the patch (bilinear stays within its texels' range), and
+        // the potential noise's largest amplitude there.
+        float TableLo = VOXEL_CAVE_FAR;
+        float TableHi = -VOXEL_CAVE_FAR;
+        for (uint t = 0u; t < 16u; t++)
+        {
+            const float T = VoxelCaveTableOf(Patch.H[t], Patch.B[t]);
+            TableLo = min(TableLo, T);
+            TableHi = max(TableHi, T);
+        }
+        float Steep = 0.0f;
+        for (uint t = 0u; t < 12u; t++) Steep = max(Steep, abs(Patch.H[t + 4u] - Patch.H[t]));
+        for (uint t = 0u; t < 16u; t++) if (t % 4u != 3u) Steep = max(Steep, abs(Patch.H[t + 1u] - Patch.H[t]));
+        const float Noise = CavePhiNoiseM + CavePhiNoiseSlope * CaveTableShare * Steep * 1.42f * VoxelCaveWave() / float(M) + CavePhiJitterM;
+        const float Reach = CaveRadiusMaxM * (1.0f + CaveCanyonDepth) + CaveMeanderZM + CaveChamberRadiusM * 1.5f * CaveChamberSquash + Detail + CaveBlendM + R.Margin;
+        VOXEL_LOOP
+        for (uint Layer = 0u; Layer < CaveLevels; Layer++)
+        {
+            const bool bTop = Layer + 1u == CaveLevels;
+            const float Lo = max(TableLo - Noise, CaveFloorClearM) + float(Layer) * CaveLevelM - Reach;
+            const float Hi = TableHi + Noise + float(Layer) * CaveLevelM + Reach + (bTop ? 0.0f : CaveLevelM + 2.0f * Noise);
+            // Above the top level and under the land only the dolines reach.
+            const bool bDolines = bTop && CaveDolineShare > 0.0f && R.ZMax > Lo;
+            if ((R.ZMax < Lo || R.ZMin > Hi) && !bDolines) continue;
+            List.Stage = 2u;
+            VOXEL_CAVE_COUNT(Levels);
+            // The centre nodes first (the cells within one of the region): their altitudes
+            // bound everything the level carves here. Then, only near them, the outer ring's
+            // potentials for the tree. Nodes are indexed (DV + 2) x Side + (DU + 2).
+            const FVoxelCaveLattice Lat = VoxelCaveLatticeAt(Key, Layer);
+            VOXEL_CAVE_NODES_DECL
+            float ZLo = VOXEL_CAVE_FAR;
+            float ZHi = -VOXEL_CAVE_FAR;
+            float RHi = 0.0f;
+            bool bChambers = false;
+            bool bShafts = false;
+            bool bDolineNodes = false;
+            // (Only the region's cells and the two around it are used: (NU + 4) x (NV + 4).)
+            const int Used = (NV + 4) * Side;
+            VOXEL_LOOP
+            for (int n = 0; n < Used; n++)
+            {
+                const int DU = n % Side - 2;
+                const int DV = n / Side - 2;
+                if (DU > NU + 1) continue;
+                FVoxelCaveNode Node = VoxelCaveNodeNone();
+                if (DU >= -1 && DU <= NU && DV >= -1 && DV <= NV)
+                    Node = VoxelCaveDress(VoxelCavePlace(Patch, Lat, Key, DU, DV, Layer), Key, DU, DV, Layer);
+                VOXEL_CAVE_NODE_SET(n, Node);
+                if ((Node.Flags & VOXEL_CAVE_FLAG_ACTIVE) == 0u) continue;
+                ZLo = min(ZLo, Node.Z);
+                ZHi = max(ZHi, Node.Z);
+                RHi = max(RHi, Node.R);
+                bChambers = bChambers || (Node.Flags & VOXEL_CAVE_FLAG_CHAMBER) != 0u;
+                bShafts = bShafts || (Node.Flags & VOXEL_CAVE_FLAG_SHAFT) != 0u;
+                bDolineNodes = bDolineNodes || (Node.Flags & VOXEL_CAVE_FLAG_DOLINE) != 0u;
+            }
+            if (ZHi < ZLo) continue;
+            const float Canyon = Layer == 0u ? 0.0f : CaveCanyonDepth;
+            const float Chamber = bChambers ? CaveChamberRadiusM * 1.5f * CaveChamberSquash * 1.3f : 0.0f;
+            const float Below = RHi * (1.0f + Canyon) + CaveMeanderZM + Chamber + Detail + CaveBlendM + R.Margin;
+            const float Above = RHi + CaveMeanderZM + Chamber + Detail + CaveBlendM + R.Margin;
+            const bool bNear = R.ZMax >= ZLo - Below && R.ZMin <= ZHi + Above;
+            const float ShaftR = CaveShaftRadiusM * 1.4f + Detail + CaveBlendM + R.Margin;
+            const bool bShaftBand = bShafts && !bTop && R.ZMax >= ZLo - ShaftR && R.ZMin <= ZHi + CaveLevelM + 2.0f * Noise + ShaftR;
+            const bool bDolineBand = bDolineNodes && R.ZMax > ZLo - CaveDolineRadiusM * 1.4f - Detail - CaveBlendM - R.Margin;
+            if (!bNear && !bShaftBand && !bDolineBand) continue;
+            if (bNear)
+            {
+                VOXEL_CAVE_COUNT(Near);
+                VOXEL_LOOP
+                for (int n = 0; n < Used; n++)
+                {
+                    const int DU = n % Side - 2;
+                    const int DV = n / Side - 2;
+                    if (DU > NU + 1 || DV > NV + 1) continue;
+                    if (DU < -1 || DU > NU || DV < -1 || DV > NV) VOXEL_CAVE_NODE_SET(n, VoxelCavePlace(Patch, Lat, Key, DU, DV, Layer));
+                }
+            }
+            VOXEL_LOOP
+            for (int c = Side; c < Used - Side; c++)
+            {
+                const int DU = c % Side - 2;
+                const int DV = c / Side - 2;
+                if (DU < -1 || DU > NU || DV < -1 || DV > NV) continue;
+                const FVoxelCaveNode A = VOXEL_CAVE_NODE_GET(c);
+                if ((A.Flags & VOXEL_CAVE_FLAG_ACTIVE) == 0u) continue;
+                const bool bMouth = (A.Flags & VOXEL_CAVE_FLAG_MOUTH) != 0u;
+                const float DepthA = A.Ref - A.Z;
+                if (bNear)
+                {
+                    // The steepest descent among the 8 neighbours (the drop per cell of run).
+                    float BestDrop = 0.0f;
+                    int Down = -1;
+                    for (int k = 0; k < 9; k++)
+                    {
+                        if (k == 4) continue;
+                        const int KU = DU + k % 3 - 1;
+                        const int KV = DV + k / 3 - 1;
+                        const float Run = (k % 2 == 0) ? 1.41421356f : 1.0f;
+                        const float Drop = (A.Phi - VOXEL_CAVE_NODE_GET((KV + 2) * Side + (KU + 2)).Phi) / Run;
+                        if (Drop > BestDrop)
+                        {
+                            BestDrop = Drop;
+                            Down = k;
+                        }
+                    }
+                    if (Down >= 0)
+                    {
+                        const int BU = DU + Down % 3 - 1;
+                        const int BV = DV + Down / 3 - 1;
+                        // Kept when the downstream node is a centre node too (any other edge is
+                        // out of reach), an end is inside the meshed depth, and it isn't closed.
+                        if (BU >= -1 && BU <= NU && BV >= -1 && BV <= NV)
+                        {
+                            const FVoxelCaveNode B = VOXEL_CAVE_NODE_GET((BV + 2) * Side + (BU + 2));
+                            const float DepthMin = min(DepthA, B.Ref - B.Z);
+                            if (DepthMin <= Gate && max(A.R, B.R) > C)
+                            {
+                                // The meander: the midpoint moved sideways (cells) and up or down.
+                                const float DX = B.U - A.U;
+                                const float DY = B.V - A.V;
+                                const float L = max(sqrt(DX * DX + DY * DY), 1.0e-3f);
+                                const float Side2 = (A.Hash - 0.5f) * 2.0f * CaveMeander;
+                                FVoxelCavePrim P = VoxelCavePrimNone();
+                                P.AU = A.U;
+                                P.AV = A.V;
+                                P.AZ = A.Z;
+                                P.BU = B.U;
+                                P.BV = B.V;
+                                P.BZ = B.Z;
+                                P.MU = 0.5f * (A.U + B.U) - DY / L * Side2;
+                                P.MV = 0.5f * (A.V + B.V) + DX / L * Side2;
+                                P.MZ = 0.5f * (A.Z + B.Z) + (A.Size - 0.5f) * 2.0f * CaveMeanderZM;
+                                P.RA = A.R;
+                                P.RB = B.R;
+                                P.RM = 0.5f * (A.R + B.R);
+                                P.Depth = DepthMin;
+                                P.Kind = Layer == 0u ? VOXEL_CAVE_KIND_TUBE : VOXEL_CAVE_KIND_KEYHOLE;
+                                P.Flags = (bMouth ? VOXEL_CAVE_PRIM_OPEN : 0u) | (Layer == 0u ? VOXEL_CAVE_PRIM_FILL : VOXEL_CAVE_PRIM_CANYON);
+                                VOXEL_CAVE_ADD(List, R, P, Detail)
+                            }
+                        }
+                    }
+                    // A chamber at the node (the two-cell rule on its vertical radius).
+                    if ((A.Flags & VOXEL_CAVE_FLAG_CHAMBER) != 0u && DepthA <= Gate)
+                    {
+                        const float RZ = CaveChamberRadiusM * (0.5f + A.Size) * CaveChamberSquash;
+                        if (VoxelCaveLod(RZ, C) > 0.0f)
+                        {
+                            FVoxelCavePrim P = VoxelCavePrimNone();
+                            P.AU = A.U;
+                            P.AV = A.V;
+                            P.AZ = A.Z;
+                            P.BU = A.U;
+                            P.BV = A.V;
+                            P.BZ = A.Z;
+                            P.MU = A.U;
+                            P.MV = A.V;
+                            P.MZ = A.Z;
+                            P.RA = RZ / CaveChamberSquash;
+                            P.RB = RZ;
+                            P.RM = P.RA;
+                            P.Depth = DepthA;
+                            P.Kind = VOXEL_CAVE_KIND_CHAMBER;
+                            P.Flags = bMouth ? VOXEL_CAVE_PRIM_OPEN : 0u;
+                            VOXEL_CAVE_ADD(List, R, P, Detail)
+                        }
+                    }
+                }
+                // A shaft up to the next level's node in the same cell.
+                if (bShaftBand && (A.Flags & VOXEL_CAVE_FLAG_SHAFT) != 0u && DepthA <= Gate)
+                {
+                    const FVoxelCaveNode U = VoxelCaveDress(VoxelCavePlace(Patch, VoxelCaveLatticeAt(Key, Layer + 1u), Key, DU, DV, Layer + 1u), Key, DU, DV, Layer + 1u);
+                    const float RS = CaveShaftRadiusM * (0.6f + 0.8f * A.Size);
+                    if ((U.Flags & VOXEL_CAVE_FLAG_ACTIVE) != 0u && VoxelCaveLod(RS, C) > 0.0f)
+                    {
+                        FVoxelCavePrim P = VoxelCavePrimNone();
+                        P.AU = A.U;
+                        P.AV = A.V;
+                        P.AZ = A.Z;
+                        P.BU = U.U;
+                        P.BV = U.V;
+                        P.BZ = U.Z;
+                        P.MU = 0.5f * (A.U + U.U);
+                        P.MV = 0.5f * (A.V + U.V);
+                        P.MZ = 0.5f * (A.Z + U.Z);
+                        P.RA = RS;
+                        P.RM = RS;
+                        P.RB = RS;
+                        P.Depth = DepthA;
+                        P.Kind = VOXEL_CAVE_KIND_SHAFT;
+                        VOXEL_CAVE_ADD(List, R, P, Detail)
+                    }
+                }
+                // A doline: a shaft from the top level to above the land, widening into a bowl
+                // within CaveDolineBowlM of the surface.
+                if (bDolineBand && (A.Flags & VOXEL_CAVE_FLAG_DOLINE) != 0u)
+                {
+                    const float RD = CaveDolineRadiusM * (0.6f + 0.8f * A.Size);
+                    if (VoxelCaveLod(RD, C) > 0.0f)
+                    {
+                        FVoxelCavePrim P = VoxelCavePrimNone();
+                        P.AU = A.U;
+                        P.AV = A.V;
+                        P.AZ = A.Z;
+                        P.BU = A.U;
+                        P.BV = A.V;
+                        P.BZ = A.Z + max(DepthA, 0.0f) + CaveDolineHeadM;
+                        P.MU = A.U;
+                        P.MV = A.V;
+                        P.MZ = 0.5f * (P.AZ + P.BZ);
+                        P.RA = RD;
+                        P.RM = RD;
+                        P.RB = RD;
+                        P.Kind = VOXEL_CAVE_KIND_DOLINE;
+                        P.Flags = VOXEL_CAVE_PRIM_OPEN | VOXEL_CAVE_PRIM_BOWL;
+                        VOXEL_CAVE_ADD(List, R, P, Detail)
+                    }
+                }
+            }
+        }
+    }
+
+    // Sea caves, on their own coarser lattice (CaveSeaCells cave cells): a passage per chosen
+    // node where the cave bake's coast has relief, at sea level, running from well out to sea to
+    // well inland along the bake's uphill direction (turned a little); where it meets the land's
+    // real cliff is decided per sample (VoxelCaveEvalPrim's roof and depth gates), since the
+    // land's coast wanders from the bake's by the hills and peaks. Each passage stays within
+    // 1.2 of its cells of its node, so the cells within two of the region's cover it; none comes
+    // within two cave cells of a face edge.
+    if (bCoastNear)
+    {
+        const int SC = max(int(CaveSeaCells), 1);
+        const int SU0 = VoxelCaveFloorDiv(R.OU, SC);
+        const int SV0 = VoxelCaveFloorDiv(R.OV, SC);
+        const int SU1 = VoxelCaveFloorDiv(R.OU + NU - 1, SC);
+        const int SV1 = VoxelCaveFloorDiv(R.OV + NV - 1, SC);
+        const float Half = 1.2f * float(SC);
+        const float First = float(2 - M / 2);
+        const float Last = float(int(LandN) * M - M / 2 - 2);
+        VOXEL_LOOP
+        for (int c = 0; c < VOXEL_CAVE_SEA_NODES; c++)
+        {
+            const int CU = SU0 - 2 + c % VOXEL_CAVE_SEA_SIDE;
+            const int CV = SV0 - 2 + c / VOXEL_CAVE_SEA_SIDE;
+            if (CU > SU1 + 2 || CV > SV1 + 2) continue;
+            const FVoxelCaveHash H = VoxelCaveHash3(CU, CV, VoxelCaveKey(R.Face, VOXEL_CAVE_LAYER_SEA, 1u));
+            if (VoxelCaveUnit(H.Z) >= CaveSeaShare) continue;
+            // The node in cave cells on the face, and from the region's origin.
+            const float XU = (float(CU) + 0.3f + 0.4f * VoxelCaveUnit(H.X)) * float(SC);
+            const float XV = (float(CV) + 0.3f + 0.4f * VoxelCaveUnit(H.Y)) * float(SC);
+            if (XU - Half < First || XU + Half > Last || XV - Half < First || XV + Half > Last) continue;
+            const float NUf = XU - float(R.OU);
+            const float NVf = XV - float(R.OV);
+            const FVoxelCaveBake B = VoxelCaveBakeAt(VOXEL_LAND_ARGS R.Face, XU / float(M), XV / float(M));
+            if (abs(B.Height) > CaveSeaCoastM || B.Relief < CaveSeaReliefM) continue;
+            const float G = sqrt(B.DHX * B.DHX + B.DHY * B.DHY);
+            if (G < 1.0e-3f) continue;
+            const FVoxelCaveHash H2 = VoxelCaveHash3(CU, CV, VoxelCaveKey(R.Face, VOXEL_CAVE_LAYER_SEA, 2u));
+            const float Turn = (VoxelCaveUnit(H2.X) - 0.5f) * 0.9f;
+            const float GX = B.DHX / G;
+            const float GY = B.DHY / G;
+            const float DX = GX * cos(Turn) - GY * sin(Turn);
+            const float DY = GX * sin(Turn) + GY * cos(Turn);
+            const float Size = 0.5f + VoxelCaveUnit(H2.Z);
+            const float R0 = CaveSeaRadiusM * Size;
+            if (VoxelCaveLod(R0, C) <= 0.0f) continue;
+            FVoxelCavePrim P = VoxelCavePrimNone();
+            P.AU = NUf - DX * Half;
+            P.AV = NVf - DY * Half;
+            P.AZ = CaveSeaZM;
+            P.BU = NUf + DX * Half;
+            P.BV = NVf + DY * Half;
+            P.BZ = CaveSeaZM + 2.0f;
+            P.MU = 0.5f * (P.AU + P.BU);
+            P.MV = 0.5f * (P.AV + P.BV);
+            P.MZ = 0.5f * (P.AZ + P.BZ);
+            P.RA = R0;
+            P.RB = R0;
+            P.RM = R0;
+            P.Kind = VOXEL_CAVE_KIND_SEA;
+            P.Flags = VOXEL_CAVE_PRIM_OPEN | VOXEL_CAVE_PRIM_TALL;
+            VOXEL_CAVE_ADD(List, R, P, Detail)
+        }
+    }
+    return List;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Evaluating gathered primitives at a sample
+// ---------------------------------------------------------------------------------------------
+
+/** The caves' distance at a sample (m, positive outside), the kind of the nearest primitive, and
+ *  how far the evaluation went (0: skipped by the gates, 1: the patch read, 2: nodes). */
+struct FVoxelCaveResult
+{
+    float Distance;
+    uint Kind;
+    uint Stage;
+    uint Open;       // 1 when the nearest primitive breaks the surface freely (a mouth)
+};
+
+/** An evaluation under way: the result so far, the sample in its list's cells, its depth below
+ *  the land, the detail's bound, the cut (beyond it nothing changes the carved density) and the
+ *  depth gate at its footprint. */
+struct FVoxelCaveEval
+{
+    FVoxelCaveResult Out;
+    float SU;
+    float SV;
+    float Depth;
+    float Detail;
+    float Cut;
+    float Gate;
+};
+
+VOXEL_FUNC FVoxelCaveEval VoxelCaveEvalBegin(FVoxelCaveSample S, int OU, int OV, uint Stage)
+{
+    FVoxelCaveEval E;
+    E.Out.Distance = VOXEL_CAVE_FAR;
+    E.Out.Kind = VOXEL_CAVE_KIND_NONE;
+    E.Out.Stage = Stage;
+    E.Out.Open = 0u;
+    E.SU = float(S.IU - OU) + S.FU;
+    E.SV = float(S.IV - OV) + S.FV;
+    E.Depth = S.Land - S.Z;
+    E.Detail = VoxelCaveDetailAt(S, false).Bound;
+    E.Cut = E.Depth + CaveBlendM;
+    E.Gate = VoxelCaveDepthGate(S.Footprint);
+    return E;
+}
+
+/** Whether a gathered primitive is there at footprint C: not closed by the LOD rule, nor below
+ *  the depth gate (VoxelCaveEvalPrim applies the same). */
+VOXEL_FUNC bool VoxelCavePrimOpen(FVoxelCavePrim P, float C)
+{
+    if (P.Depth > VoxelCaveDepthGate(C)) return false;
+    if (P.Kind == VOXEL_CAVE_KIND_TUBE || P.Kind == VOXEL_CAVE_KIND_KEYHOLE) return max(P.RA, P.RB) > C;
+    return VoxelCaveLod(P.Kind == VOXEL_CAVE_KIND_CHAMBER ? P.RB : P.RA, C) > 0.0f;
+}
+
+/** One primitive at the sample: the LOD rule and the depth gate at its footprint, the cover gate
+ *  and the bowl; skipped when a lower bound shows it can't beat the nearest so far or can't change
+ *  the carved density (beyond the land's depth plus the blend): exact for the density. */
+VOXEL_FUNC FVoxelCaveEval VoxelCaveEvalPrim(FVoxelCaveEval E, FVoxelCavePrim P, FVoxelCaveSample S)
+{
+    FVoxelCaveEval Out = E;
+    if (P.Depth > E.Gate) return Out;
+    const float C = S.Footprint;
+    float RA = 0.0f;
+    float RM = 0.0f;
+    float RB = 0.0f;
+    float AZ = P.AZ;
+    float MZ = P.MZ;
+    float BZ = P.BZ;
+    if (P.Kind == VOXEL_CAVE_KIND_TUBE || P.Kind == VOXEL_CAVE_KIND_KEYHOLE)
+    {
+        if (max(P.RA, P.RB) <= C) return Out;
+        RA = VoxelCaveLod(P.RA, C);
+        RB = VoxelCaveLod(P.RB, C);
+        RM = 0.5f * (RA + RB);
+    }
+    else if (P.Kind == VOXEL_CAVE_KIND_CHAMBER)
+    {
+        const float RZ = VoxelCaveLod(P.RB, C);
+        if (RZ <= 0.0f) return Out;
+        AZ = P.AZ + RZ * 0.3f;
+        MZ = AZ;
+        BZ = AZ;
+        RA = RZ / CaveChamberSquash;
+        RB = RZ;
+        RM = RA;
+    }
+    else if (P.Kind == VOXEL_CAVE_KIND_SEA)
+    {
+        const float R0 = VoxelCaveLod(P.RA, C);
+        if (R0 <= 0.0f) return Out;
+        AZ = CaveSeaZM + 0.5f * R0 * CaveSeaTall;
+        BZ = AZ + 2.0f;
+        MZ = 0.5f * (AZ + BZ);
+        RA = R0;
+        RB = R0;
+        RM = R0;
+    }
+    else
+    {
+        const float R1 = VoxelCaveLod(P.RA, C);
+        if (R1 <= 0.0f) return Out;
+        RA = R1;
+        RB = R1;
+        RM = R1;
+    }
+    float3 A = S.EU * (P.AU - E.SU) + S.EV * (P.AV - E.SV) + S.Up * (AZ - S.Z);
+    float3 B = S.EU * (P.BU - E.SU) + S.EV * (P.BV - E.SV) + S.Up * (BZ - S.Z);
+    const float3 Mid = S.EU * (P.MU - E.SU) + S.EV * (P.MV - E.SV) + S.Up * (MZ - S.Z);
+    const bool bOpen = (P.Flags & VOXEL_CAVE_PRIM_OPEN) != 0u;
+    const float RMax = max(max(RA, RB), RM);
+    const float Cover = bOpen ? 0.0f : VoxelCaveCover(RMax, E.Depth, E.Detail);
+    const float Bowl = (P.Flags & VOXEL_CAVE_PRIM_BOWL) != 0u ? CaveDolineFunnel * max(0.0f, CaveDolineBowlM - max(E.Depth, 0.0f)) : 0.0f;
+    const float Canyon = (P.Flags & VOXEL_CAVE_PRIM_CANYON) != 0u ? CaveCanyonDepth : 0.0f;
+    // The lower bound: the straight segment, less the midpoint's offset, the radius (and
+    // canyon), the bowl and the detail.
+    const float3 Off = Mid - (A + B) * 0.5f;
+    const float3 Q = A + (B - A) * VoxelCaveAlong(A, B);
+    const float Lower = sqrt(dot(Q, Q)) - sqrt(dot(Off, Off)) - RMax * (1.0f + Canyon) - Bowl - E.Detail + Cover;
+    if (Lower >= min(E.Out.Distance, E.Cut)) return Out;
+    VOXEL_CAVE_COUNT(Edges);
+    float D = VOXEL_CAVE_FAR;
+    if (P.Kind == VOXEL_CAVE_KIND_CHAMBER) D = VoxelCaveChamber(A, RA, RB / RA, S.Up);
+    else if (P.Kind == VOXEL_CAVE_KIND_TUBE || P.Kind == VOXEL_CAVE_KIND_KEYHOLE)
+    {
+        const float Fill = (P.Flags & VOXEL_CAVE_PRIM_FILL) != 0u ? CaveFloorFill : 0.0f;
+        D = min(VoxelCavePassage(A, Mid, RA, RM, S.Up, Fill, CaveCanyonWidth, Canyon), VoxelCavePassage(Mid, B, RM, RB, S.Up, Fill, CaveCanyonWidth, Canyon));
+    }
+    else if ((P.Flags & VOXEL_CAVE_PRIM_TALL) != 0u)
+    {
+        // Taller than wide: vertical offsets shrunk by 1 / CaveSeaTall (a linear map with
+        // norm at most 1: the slope stays 1); a floor CaveSeaFloorM above the sea.
+        const float Squeeze = 1.0f - 1.0f / CaveSeaTall;
+        A = A - S.Up * (dot(A, S.Up) * Squeeze);
+        B = B - S.Up * (dot(B, S.Up) * Squeeze);
+        D = max(VoxelCaveRoundCone(A, B, RA, RB), CaveSeaFloorM - S.Z);
+        // The cliff: closed (slope CaveCoverSlope) where the roof would be thinner than
+        // CaveSeaRoofM (beaches, gentle shores) and beyond CaveSeaCoverM of overburden (how
+        // far the cave runs into the cliff).
+        const float Roof = E.Depth - (AZ + RA * CaveSeaTall - S.Z);
+        D += CaveCoverSlope * (max(0.0f, CaveSeaRoofM - Roof) + max(0.0f, E.Depth - CaveSeaCoverM));
+    }
+    else D = VoxelCaveRoundCone(A, B, RA, RB);
+    D = D + Cover - Bowl;
+    if (D < Out.Out.Distance)
+    {
+        Out.Out.Distance = D;
+        Out.Out.Kind = P.Kind;
+        Out.Out.Open = bOpen ? 1u : 0u;
+    }
+    return Out;
+}
+
+/** The evaluation's result: the wall detail added near a wall. */
+VOXEL_FUNC FVoxelCaveResult VoxelCaveEvalEnd(FVoxelCaveEval E, FVoxelCaveSample S)
+{
+    FVoxelCaveResult Out = E.Out;
+    if (Out.Distance < 3.0f * E.Detail + 2.0f * S.Footprint + CaveBlendM)
+    {
+        VOXEL_CAVE_COUNT(Detail);
+        Out.Distance += VoxelCaveDetailAt(S, true).Value;
+    }
+    return Out;
+}
+
+#if !(defined(VOXEL_CAVE_GATHER_BUFFERS) && VOXEL_CAVE_GATHER_BUFFERS)
+/** The distance at sample S (in a cell of the list's region, at its footprint or above) to the
+ *  list's primitives. (Not with VOXEL_CAVE_GATHER_BUFFERS: the list's array is unused there.) */
+VOXEL_FUNC FVoxelCaveResult VoxelCaveEvaluate(FVoxelCaveList List, FVoxelCaveSample S)
+{
+    FVoxelCaveEval E = VoxelCaveEvalBegin(S, List.OU, List.OV, List.Stage);
+    VOXEL_LOOP
+    for (uint p = 0u; p < List.Count; p++) E = VoxelCaveEvalPrim(E, List.Prims[p], S);
+    return VoxelCaveEvalEnd(E, S);
+}
+#endif
+
+/** The per-sample gates before any gather: in the air above the land (beyond the blend and two
+ *  cells), deeper below the bake than any level is meshed, at a footprint every cave is closed at
+ *  (CaveMaxRadiusM), or neither near karst nor near a coast. */
+VOXEL_FUNC bool VoxelCaveSkip(FVoxelCaveSample S)
+{
+    if (CaveOn == 0u) return true;
+    if (S.Z - S.Land > 2.0f * S.Footprint + CaveBlendM + 1.0f) return true;
+    if (S.Bake - S.Z > max(CaveDepthM, CaveShallowDepthM) + CaveBandSlackM) return true;
+    if (S.Footprint >= CaveMaxRadiusM) return true;
+    const bool bKarst = S.Province >= CaveKarstLo - CaveKarstSlack;
+    const bool bCoast = CaveSeaShare > 0.0f && abs(S.Bake) < CaveSeaCoastM + CaveBandSlackM && S.Z < CaveSeaZM + CaveSeaRadiusM * 3.0f + 20.0f;
+    return !bKarst && !bCoast;
+}
+
+#if !(defined(VOXEL_CAVE_GATHER_BUFFERS) && VOXEL_CAVE_GATHER_BUFFERS)
+/** The caves' distance at one sample: the gates, then the gather of its own cell and the
+ *  evaluation. A region (a brick, or the CPU density's last cell) gathers once and evaluates
+ *  each of its samples. */
+VOXEL_FUNC FVoxelCaveResult VoxelCaveDistance(VOXEL_LAND_ARGS_DECL FVoxelCaveSample S)
+{
+    FVoxelCaveResult Out;
+    Out.Distance = VOXEL_CAVE_FAR;
+    Out.Kind = VOXEL_CAVE_KIND_NONE;
+    Out.Stage = 0u;
+    Out.Open = 0u;
+    if (VoxelCaveSkip(S)) return Out;
+    return VoxelCaveEvaluate(VoxelCaveGather(VOXEL_LAND_ARGS VoxelCaveCellRegion(S, S.Z, S.Z)), S);
+}
+#endif
+
+/** The density (positive in air) with the caves carved: the polynomial smooth maximum of the
+ *  land's and the caves' complement, in metres (Scale 1) or centimetres (Scale 100: the
+ *  density's unit; CaveDistance is always metres). */
+VOXEL_FUNC float VoxelCaveCarve(float LandDensity, float CaveDistance, float Scale)
+{
+    if (CaveDistance >= VOXEL_CAVE_FAR * 0.5f) return LandDensity;
+    return VoxelCaveSmax(LandDensity, -CaveDistance * Scale, CaveBlendM * Scale);
+}
+
+// ---------------------------------------------------------------------------------------------
+// A brick's regions (the GPU mesher's gather pass)
+// ---------------------------------------------------------------------------------------------
+
+/** What a brick's gather leaves for its samples, per face slot (VOXEL_CAVE_SLOTS a brick):
+ *  its region and list's head; the list's primitives follow in their own buffer
+ *  (VOXEL_CAVE_MAX_PRIMS a slot). 48 bytes (FVoxelCaveListHeadGPU, VoxelLandGPU.h). */
+struct FVoxelCaveListHead
+{
+    uint Face;
+    int OU;
+    int OV;
+    int NU;
+    int NV;
+    float ZMin;
+    float ZMax;
+    float Footprint;
+    uint Count;
+    uint Stage;
+    uint Valid;
+    uint Overflow;
+};
+
+#define VOXEL_CAVE_SLOTS 3u
+
+/** The margin (the brick's cells) about a brick's own cells that its samples can reach: its
+ *  neighbours' cells, the coarser targets' and their gradient points (VoxelBrickMesherPasses.ush). */
+#define VOXEL_CAVE_BRICK_MARGIN 12
+
+/** The region of face slot Slot of the box MinX..MaxX (cm, double-float, planet frame) at
+ *  footprint FootprintM (m): the Slot-th face its corners lie on (in corner order), the cave cells
+ *  their projections span (the face coordinate along each axis is a ratio of linear functions, so
+ *  over a box its extremes lie at corners) and the altitudes its radius spans. Valid 0 when there
+ *  is no such face, or the region spans more than VOXEL_CAVE_REGION_MAX cells while caves are
+ *  open at the footprint. Margin: four footprints and the blend (VoxelCaveMargin). Reach:
+ *  primitives are kept while they can change a density above -(12 footprints + the blend): the
+ *  crossings, edge ends and gradient points the mesher reads lie within a few cells of the
+ *  surface. */
+VOXEL_FUNC FVoxelCaveRegion VoxelCaveBoxRegion(VOXEL_LAND_ARGS_DECL float2 MinX, float2 MinY, float2 MinZ, float2 MaxX, float2 MaxY, float2 MaxZ,
+    float2 SeaRadius, float FootprintM, uint Slot)
+{
+    FVoxelCaveRegion R;
+    R.Face = VOXEL_CAVE_NO_FACE;
+    R.OU = 0;
+    R.OV = 0;
+    R.NU = 0;
+    R.NV = 0;
+    R.ZMin = 0.0f;
+    R.ZMax = 0.0f;
+    R.Footprint = FootprintM;
+    R.Margin = VoxelCaveMargin(FootprintM);
+    R.Reach = 12.0f * FootprintM + CaveBlendM;
+    R.Valid = 0u;
+    uint F0 = VOXEL_CAVE_NO_FACE;
+    uint F1 = VOXEL_CAVE_NO_FACE;
+    uint F2 = VOXEL_CAVE_NO_FACE;
+    for (uint c = 0u; c < 8u; c++)
+    {
+        const uint F = VoxelCaveFaceOf((c & 1u) != 0u ? MaxX.x : MinX.x, (c & 2u) != 0u ? MaxY.x : MinY.x, (c & 4u) != 0u ? MaxZ.x : MinZ.x);
+        if (F == F0 || F == F1 || F == F2) continue;
+        if (F0 == VOXEL_CAVE_NO_FACE) F0 = F;
+        else if (F1 == VOXEL_CAVE_NO_FACE) F1 = F;
+        else if (F2 == VOXEL_CAVE_NO_FACE) F2 = F;
+    }
+    const uint Face = Slot == 0u ? F0 : (Slot == 1u ? F1 : F2);
+    if (Face == VOXEL_CAVE_NO_FACE) return R;
+    R.Face = Face;
+    const float M = float(CaveCellsPerBake);
+    const float N = float(LandN);
+    float UMin = VOXEL_CAVE_FAR;
+    float UMax = -VOXEL_CAVE_FAR;
+    float VMin = VOXEL_CAVE_FAR;
+    float VMax = -VOXEL_CAVE_FAR;
+    for (uint c = 0u; c < 8u; c++)
+    {
+        const float2 X = (c & 1u) != 0u ? MaxX : MinX;
+        const float2 Y = (c & 2u) != 0u ? MaxY : MinY;
+        const float2 Z = (c & 4u) != 0u ? MaxZ : MinZ;
+        const float2 PN = VoxelLandPick(X, Y, Z, Face / 2u);
+        const float2 Den = (Face & 1u) != 0u ? float2(-PN.x, -PN.y) : PN;
+        if (Den.x <= 0.0f) return R;
+        const float A = VoxelDFDiv(VoxelLandPick(X, Y, Z, VoxelCubeUAxis(Face)), Den).x;
+        const float B = VoxelDFDiv(VoxelLandPick(X, Y, Z, VoxelCubeVAxis(Face)), Den).x;
+        const float U = ((atan(A) * VOXEL_LAND_INV_QUARTER_PI + 1.0f) * 0.5f * N - 0.5f) * M;
+        const float V = ((atan(B) * VOXEL_LAND_INV_QUARTER_PI + 1.0f) * 0.5f * N - 0.5f) * M;
+        UMin = min(UMin, U);
+        UMax = max(UMax, U);
+        VMin = min(VMin, V);
+        VMax = max(VMax, V);
+    }
+    R.OU = int(floor(UMin - 1.0e-3f));
+    R.OV = int(floor(VMin - 1.0e-3f));
+    R.NU = int(floor(UMax + 1.0e-3f)) - R.OU + 1;
+    R.NV = int(floor(VMax + 1.0e-3f)) - R.OV + 1;
+    // The altitudes: the centre's radius, less and plus half the diagonal.
+    const float2 CX = VoxelDFMulFloat(VoxelDFAdd(MinX, MaxX), 0.5f);
+    const float2 CY = VoxelDFMulFloat(VoxelDFAdd(MinY, MaxY), 0.5f);
+    const float2 CZ = VoxelDFMulFloat(VoxelDFAdd(MinZ, MaxZ), 0.5f);
+    const float2 CR = VoxelDFSqrt(VoxelDFAdd(VoxelDFAdd(VoxelDFMul(CX, CX), VoxelDFMul(CY, CY)), VoxelDFMul(CZ, CZ)));
+    const float2 Alt = VoxelDFSub(CR, SeaRadius);
+    const float DX = (MaxX.x - MinX.x) + (MaxX.y - MinX.y);
+    const float DY = (MaxY.x - MinY.x) + (MaxY.y - MinY.y);
+    const float DZ = (MaxZ.x - MinZ.x) + (MaxZ.y - MinZ.y);
+    const float HalfDiagonal = 0.5f * sqrt(DX * DX + DY * DY + DZ * DZ) * 0.01f;
+    R.ZMin = (Alt.x + Alt.y) * 0.01f - HalfDiagonal - 1.0f;
+    R.ZMax = (Alt.x + Alt.y) * 0.01f + HalfDiagonal + 1.0f;
+    const bool bFits = R.NU <= VOXEL_CAVE_REGION_MAX && R.NV <= VOXEL_CAVE_REGION_MAX;
+    R.Valid = bFits || FootprintM >= CaveMaxRadiusM ? 1u : 0u;
+    return R;
+}
+
+/** Whether the caves may hold surface inside the box MinX..MaxX (cm, double-float, planet frame) at
+ *  footprint FootprintM (m): a primitive there at that footprint (VoxelCavePrimOpen) within the
+ *  box (its reach, the detail and the blend). For a region a sample proved solid: the brick
+ *  tree's, the collision bricks' and the CPU mesher's empty tests (the caves' distance is exact
+ *  only near them). Conservative: true when a face slot is too large to gather, or overflows. */
+#if !(defined(VOXEL_CAVE_GATHER_BUFFERS) && VOXEL_CAVE_GATHER_BUFFERS)
+VOXEL_FUNC bool VoxelCaveBoxMayHold(VOXEL_LAND_ARGS_DECL float2 MinX, float2 MinY, float2 MinZ, float2 MaxX, float2 MaxY, float2 MaxZ,
+    float2 SeaRadius, float FootprintM)
+{
+    if (CaveOn == 0u || FootprintM >= CaveMaxRadiusM) return false;
+    for (uint Slot = 0u; Slot < VOXEL_CAVE_SLOTS; Slot++)
+    {
+        FVoxelCaveRegion R = VoxelCaveBoxRegion(VOXEL_LAND_ARGS MinX, MinY, MinZ, MaxX, MaxY, MaxZ, SeaRadius, FootprintM, Slot);
+        if (R.Face == VOXEL_CAVE_NO_FACE) break;
+        if (R.Valid == 0u) return true;
+        R.Margin = 0.0f;
+        R.Reach = 0.0f;
+        const FVoxelCaveList L = VoxelCaveGather(VOXEL_LAND_ARGS R);
+        if (L.Overflow > 0u) return true;
+        for (uint p = 0u; p < L.Count; p++)
+            if (VoxelCavePrimOpen(L.Prims[p], FootprintM)) return true;
+    }
+    return false;
+}
+#endif
+
+/** A region and its list as the brick's samples read them. */
+VOXEL_FUNC FVoxelCaveListHead VoxelCaveHeadOf(FVoxelCaveRegion R, FVoxelCaveList L)
+{
+    FVoxelCaveListHead H;
+    H.Face = R.Face;
+    H.OU = R.OU;
+    H.OV = R.OV;
+    H.NU = R.NU;
+    H.NV = R.NV;
+    H.ZMin = R.ZMin;
+    H.ZMax = R.ZMax;
+    H.Footprint = R.Footprint;
+    H.Count = L.Count;
+    H.Stage = L.Stage;
+    H.Valid = R.Valid;
+    H.Overflow = L.Overflow;
+    return H;
+}
+
+#endif // VOXEL_LAND_CAVES_USH

@@ -1,0 +1,82 @@
+// VoxelLandCaveCarve.ush - The caves at a density sample on the GPU (Design/EditsAndCaves.md, "K1 as
+// built"): the sample (VoxelCaveSampleDF) from the density's own double-float position, the land's
+// height and the bake's, and its distance from the caves by one of two paths:
+//   - VOXEL_CAVE_STORED 1 (the mesher, VoxelTerrestrialMesher.usf): the lists the brick's gather
+//     pass left (CaveGatherCS: VOXEL_CAVE_SLOTS heads a brick in CaveHeads, VOXEL_CAVE_MAX_PRIMS
+//     primitives a head in CavePrims);
+//   - otherwise (the density check, VoxelDensityGPU.usf): one gather per sample
+//     (VoxelCaveDistance).
+// VoxelDensitySample.ush carves it (VoxelCaveCarve) where VOXEL_DENSITY_CAVES is 1.
+//
+// Shared subset (VoxelShaderCompat.h). Include after VoxelLandCaves.ush, and with
+// VOXEL_CAVE_STORED after declaring the lists' buffers (or defining VOXEL_CAVE_HEAD and
+// VOXEL_CAVE_PRIM).
+
+#ifndef VOXEL_LAND_CAVE_CARVE_USH
+#define VOXEL_LAND_CAVE_CARVE_USH
+
+#include "VoxelLandCaves.ush"
+
+#if defined(VOXEL_CAVE_STORED) && VOXEL_CAVE_STORED
+
+#ifndef VOXEL_CAVE_HEAD
+#define VOXEL_CAVE_HEAD(I) CaveHeads[I]
+#endif
+#ifndef VOXEL_CAVE_PRIM
+#define VOXEL_CAVE_PRIM(I) CavePrims[I]
+#endif
+
+/** The caves' distance at sample S of brick Brick, from the brick's gathered lists: the slot of
+ *  the sample's face. Nothing when the brick has no list there (a face it doesn't reach, or a
+ *  region too large to gather: VoxelCaveBoxRegion), or the sample falls outside the region (it
+ *  can't, by the region's margin). */
+VOXEL_FUNC FVoxelCaveResult VoxelCaveStoredDistance(uint Brick, FVoxelCaveSample S)
+{
+    FVoxelCaveResult Out;
+    Out.Distance = VOXEL_CAVE_FAR;
+    Out.Kind = VOXEL_CAVE_KIND_NONE;
+    Out.Stage = 0u;
+    Out.Open = 0u;
+    if (Brick == VOXEL_CAVE_NO_BRICK || VoxelCaveSkip(S)) return Out;
+    for (uint s = 0u; s < VOXEL_CAVE_SLOTS; s++)
+    {
+        const uint Slot = Brick * VOXEL_CAVE_SLOTS + s;
+        const FVoxelCaveListHead H = VOXEL_CAVE_HEAD(Slot);
+        if (H.Valid == 0u || H.Face != S.Face) continue;
+        if (S.IU < H.OU || S.IU >= H.OU + H.NU || S.IV < H.OV || S.IV >= H.OV + H.NV || S.Z < H.ZMin || S.Z > H.ZMax || S.Footprint < H.Footprint)
+            return Out;
+        FVoxelCaveEval E = VoxelCaveEvalBegin(S, H.OU, H.OV, H.Stage);
+        const uint First = Slot * uint(VOXEL_CAVE_MAX_PRIMS);
+        const uint Count = min(H.Count, uint(VOXEL_CAVE_MAX_PRIMS));
+        VOXEL_LOOP
+        for (uint p = 0u; p < Count; p++) E = VoxelCaveEvalPrim(E, VOXEL_CAVE_PRIM(First + p), S);
+        return VoxelCaveEvalEnd(E, S);
+    }
+    return Out;
+}
+
+#endif // VOXEL_CAVE_STORED
+
+/** The caves' distance (m; VOXEL_CAVE_FAR: none) at the density sample (PX, PY, PZ) (cm,
+ *  double-float, planet frame) of radius Radius, on the planet whose sea-level sphere has radius
+ *  SeaRadius (cm), where the land's height is LandM and the bake's BakeM (m about sea level),
+ *  at footprint FootprintM (m). Brick: the mesher's brick (VOXEL_CAVE_STORED), else ignored.
+ *  The cheap gates (in the air, below every level's meshed depth, every cave closed at the
+ *  footprint) come before the face coordinates. */
+VOXEL_FUNC float VoxelCaveDistanceDF(VOXEL_LAND_ARGS_DECL float2 PX, float2 PY, float2 PZ, float2 Radius, float2 SeaRadius,
+    float LandM, float BakeM, float FootprintM, uint Brick)
+{
+    if (CaveOn == 0u || FootprintM >= CaveMaxRadiusM) return VOXEL_CAVE_FAR;
+    const float2 Alt = VoxelDFSub(Radius, SeaRadius);
+    const float Z = (Alt.x + Alt.y) * 0.01f;
+    if (Z - LandM > 2.0f * FootprintM + CaveBlendM + 1.0f) return VOXEL_CAVE_FAR;
+    if (BakeM - Z > max(CaveDepthM, CaveShallowDepthM) + CaveBandSlackM) return VOXEL_CAVE_FAR;
+    const FVoxelCaveSample S = VoxelCaveSampleDF(VOXEL_LAND_ARGS PX, PY, PZ, Radius, SeaRadius, LandM, BakeM, FootprintM);
+#if defined(VOXEL_CAVE_STORED) && VOXEL_CAVE_STORED
+    return VoxelCaveStoredDistance(Brick, S).Distance;
+#else
+    return VoxelCaveDistance(VOXEL_LAND_ARGS S).Distance;
+#endif
+}
+
+#endif // VOXEL_LAND_CAVE_CARVE_USH

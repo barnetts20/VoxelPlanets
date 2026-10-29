@@ -1,0 +1,9 @@
+detail layer from the generated set: 4 scales from 20000 m (texel 312.50 m), A mean 0.5158 std 0.1066, bound 3.58; hard 11.45 soft 13.68 texels
+rivers from 200 km^2 (the GPU build, 1 build): 45660 segments, 10021 chains, 962 mouths, 270 lake inlets, 222 outlets; 98398 entries (max 41 a tile, overflow 0)
+planet n512: R 1000 km, N 512, cell 3068 m, lambda0 6136 m, 0 gully octaves, gully reach 0 m, heights -7629..8737 m, lattice finest 102 cm; hills 150 m, 8 octaves; peaks 1.00, spacing 6000 m (texel 93.8 m, set relief 2643 m), relief up to 5782 m
+caves: cell 192 m (16 per bake cell), 3 levels 40 m apart from the water table (share 0.20), radius 3.0 m (spread 0.35, trunks x2.5, max 24 m)
+       karst above province 0.404 (25% of the land); active 0.70 (+0.30 trunks); chambers 0.05 (22 m), shafts 0.12, mouths 0.00, dolines 0.00
+       depth 500 m at cells to 4 m, 150 m above; cover 24 m (slope 0.40); detail 0.70 m at 8.0 m (3 octaves, gain 0.45), bedding 0.25 m at 1.6 m; blend 1.5 m
+       sea caves 0.35 a 4-cell node at |h| < 60 m, relief > 150 m: radius 6.0 m (x1.5 tall), roof 5 m, into the cliff to 45 m of overburden
+probe valley: 300 columns, band 48067 m: stages 0/0/48067, cave 113 m (0.24%), min distance -5.90 m
+probe upland: 300 columns, band 53216 m: stages 0/0/53216, cave 100 m (0.19%), min distance -3.98 m

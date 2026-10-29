@@ -222,17 +222,7 @@ VOXEL_FUNC FVoxelFbmState VoxelLayerOctave(FVoxelFbmState S, uint Kind, FVoxelNo
     return VoxelFbmAdd(S, N, Amplitude);
 }
 
-// Signed distance-like value of the cave layer: negative inside a cave. Placeholder until the
-// cave layer exists: no caves anywhere.
-VOXEL_FUNC float VoxelCaveDensity()
-{
-    return 1.0e30f;
-}
-
-// Terrain density from the surface and cave terms (negative = solid). Caves subtract.
-VOXEL_FUNC float VoxelComposeTerrain(float Surface, float Cave)
-{
-    return max(Surface, -Cave);
-}
+// (K1: the caves are VoxelLandCaves.ush's, carved by VoxelDensitySample.ush and
+// FVoxelTerrestrialDensity; the placeholder cave slot that was here is gone.)
 
 #endif // VOXEL_DENSITY_CORE_USH

@@ -1,6 +1,6 @@
 // VoxelPlanetDensity.h - The planet densities' shared base: the voxel engine's density source
 // (IVoxelDensitySource) as a planet makes it, a heightfield above the planet radius sampled
-// in double (VoxelDensityCore.ush's composition: surface term, cave slot), with the GPU twin
+// in double (FVoxelTerrestrialDensity adds the caves, K1), with the GPU twin
 // (FVoxelDensityGPUSource) built once from BuildGPUData. The two surfaces are
 // FVoxelNoiseSurfaceDensity (the noise surface) and FVoxelTerrestrialDensity (the land bake);
 // VoxelDensity.h's factories build the compositor around one of them.
@@ -15,8 +15,9 @@ class FDensitySampleCompositor;
 struct FSampleInput;
 struct FVoxelDensityGPUData;
 
-/** A planet's density without edits: the surface height in a direction (HeightAt), composed
- *  with the cave slot into the engine's density (Sample). Positions are double and each noise
+/** A planet's density without edits: the surface height in a direction (HeightAt) as the
+ *  engine's density (Sample; the terrestrial density carves its caves into it). Positions are
+ *  double and each noise
  *  octave is evaluated on an integer lattice split in double, so results are precise at any
  *  radius. Immutable after construction; safe to call from any thread. */
 class VOXELPLANETS_API FVoxelPlanetDensity : public IVoxelDensitySource
@@ -61,6 +62,11 @@ protected:
     /** InMinFootprint (cm) is the smallest footprint any sample is evaluated at: octaves finer
      *  than it are always left out, whatever footprint a caller passes (0 keeps all). */
     FVoxelPlanetDensity(double InPlanetRadius, double InNoiseAmplitude, double InMinFootprint);
+
+    /** Samples Begin..End of Input at Footprint (already raised to MinFootprint) into DensityOut:
+     *  one thread's share of Sample, in order. This base: the height field (SampleOne).
+     *  FVoxelTerrestrialDensity: with its caves (K1). */
+    virtual void SampleRange(const FSampleInput& Input, int32 Begin, int32 End, double Footprint, float* DensityOut) const;
 
     /** The 2^31 lattice warning, for BuildGPUData: the GPU converts lattice coordinates to int32
      *  before wrapping; the CPU wraps through int64. They agree while every coordinate (at most
